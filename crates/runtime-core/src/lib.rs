@@ -7,7 +7,7 @@ mod port_scanner;
 pub mod process;
 mod runtime;
 
-pub use alwith_api::{
+pub use alwith_runtime_protocol::{
     AgentMetadata, AttachInfo, FrameDirection, PendingAgentRequest, ResponseError, RunState, RuntimeEvent,
     SessionEventFrame, SessionLifecycleFrame, SessionRunState, SessionTask,
 };

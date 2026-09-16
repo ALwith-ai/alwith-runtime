@@ -1,4 +1,4 @@
-use alwith_api::{AgentMetadata, ResponseError, RuntimeEvent};
+use alwith_runtime_protocol::{AgentMetadata, ResponseError, RuntimeEvent};
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

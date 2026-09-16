@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use alwith_runtime_core::{AgentMetadata, Journal, ResponseError, Runtime};
 use alwith_runtime_modules::{ModuleExtension, ModuleHost};
-use alwith_runtime_ws::{AgentLauncher, Extension, NoExtension, RuntimeCommand, RuntimeServer, execute};
+use alwith_runtime_ws::{AgentLauncher, RuntimeCommand, RuntimeServer, execute};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
@@ -63,7 +63,8 @@ struct StartParams {
 struct TableLauncher {
     engines: HashMap<String, EngineSpec>,
     version: String,
-    services: Arc<alwith_runtime_services::ServiceExtension>,
+    modules: Arc<ModuleHost>,
+    launch_resolver: Option<String>,
 }
 
 impl TableLauncher {
@@ -79,8 +80,18 @@ impl AgentLauncher for TableLauncher {
     async fn prepare(
         &self, _agent_id: &str, owner_id: &str, params: Value,
     ) -> Result<(Command, AgentMetadata), String> {
-        let params: StartParams = serde_json::from_value(self.services.resolve_launch(params)?)
-            .map_err(|error| format!("start params: {error}"))?;
+        let params = if params.get("providerConfig").is_some() {
+            let resolver = self.launch_resolver.as_ref().ok_or(
+                "providerConfig requires a configured ALWITH_RUNTIME_LAUNCH_RESOLVER module; raw engine launches need no module"
+            )?;
+            self.modules
+                .call_module(resolver, "_runtime/resolveLaunch", params)
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            params
+        };
+        let params: StartParams = serde_json::from_value(params).map_err(|error| format!("start params: {error}"))?;
         let spec = self
             .engines
             .get(&params.engine)
@@ -175,7 +186,7 @@ enum Listen {
     Ws(SocketAddr),
 }
 
-const USAGE: &str = "usage: alwith-runtime [--listen stdio://|ws://IP:PORT] [--version]";
+const USAGE: &str = "usage: alwith-runtime [--listen stdio://|ws://IP:PORT] [--version] [--export-protocol rust]";
 
 fn parse_listen(args: &[String]) -> Result<Listen, String> {
     let mut listen = None;
@@ -204,6 +215,10 @@ fn parse_listen(args: &[String]) -> Result<Listen, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = env::args().skip(1).collect();
+    if args == ["--export-protocol", "rust"] {
+        print!("{}", include_str!("../../../crates/runtime-protocol/src/lib.rs"));
+        return Ok(());
+    }
     if args.iter().any(|argument| argument == "--version") {
         println!("alwith-runtime {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -225,19 +240,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // 模块:`ALWITH_MODULES_DIR`(应用的 node_modules)里每个带 alwith-module.json 的包一个子进程。
     let modules_dir = env::var_os("ALWITH_MODULES_DIR").map(std::path::PathBuf::from);
-    let module_host = modules_dir.as_ref().map(|_| ModuleHost::new(Arc::clone(&runtime), env!("CARGO_PKG_VERSION")));
-    let extension: Arc<dyn Extension> = match &module_host {
-        Some(host) => Arc::new(ModuleExtension(Arc::clone(host))),
-        None => Arc::new(NoExtension),
-    };
-    let extension = Arc::new(alwith_runtime_services::ServiceExtension::from_env(extension)?);
+    let module_host = ModuleHost::new(Arc::clone(&runtime), env!("CARGO_PKG_VERSION"));
+    let extension = Arc::new(ModuleExtension(Arc::clone(&module_host)));
+    let launch_resolver = env::var("ALWITH_RUNTIME_LAUNCH_RESOLVER").ok();
     let launcher = Arc::new(TableLauncher {
         engines,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        services: Arc::clone(&extension),
+        modules: Arc::clone(&module_host),
+        launch_resolver: launch_resolver.clone(),
     });
     let server = RuntimeServer::new(runtime, launcher, extension, token);
-    if let (Some(host), Some(dir)) = (&module_host, &modules_dir) {
+    if let Some(dir) = &modules_dir {
+        let host = &module_host;
         let dispatch_server = server.clone();
         host.set_dispatch(Arc::new(move |owner, method, params| {
             let server = dispatch_server.clone();
@@ -257,6 +271,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 status.persistent
             );
         }
+    }
+    if let Some(resolver) = launch_resolver {
+        if !module_host.list().iter().any(|module| module.name == resolver && module.alive) {
+            return Err(format!("configured launch resolver module {resolver} is not running").into());
+        }
+        // A round trip proves the optional resolver has initialized before clients can start agents.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            module_host.call_module(&resolver, "_runtime/ready", Value::Null),
+        )
+        .await
+        .map_err(|_| format!("launch resolver module {resolver} did not become ready"))??;
     }
     match listen {
         Listen::Stdio => alwith_runtime_stdio::serve_stdio(server, shutdown_signal()).await?,
@@ -300,5 +326,57 @@ mod tests {
         assert!(parse_listen(&args(&["--listen", "unix://x"])).is_err());
         assert!(parse_listen(&args(&["--bogus"])).is_err());
         assert!(parse_listen(&args(&["--listen"])).is_err());
+    }
+
+    #[tokio::test]
+    async fn arbitrary_engines_and_providers_work_without_any_module_or_sdk() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(root.path()).unwrap()));
+        let launcher = TableLauncher {
+            engines: [(
+                "company-agent".into(),
+                EngineSpec {
+                    command: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                    args: vec!["--acp".into()],
+                    env: [("REMOVE_THIS".into(), "old".into())].into(),
+                },
+            )]
+            .into(),
+            version: "test".into(),
+            modules: ModuleHost::new(runtime, "test"),
+            launch_resolver: None,
+        };
+        let (command, metadata) = launcher
+            .prepare(
+                "agent",
+                "app",
+                serde_json::json!({
+                    "engine":"company-agent", "provider":"custom-provider", "model":"custom-model",
+                    "args":["--extra"], "env":{"CUSTOM_KEY":"test-key"}, "envRemove":["REMOVE_THIS"]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.owner_id, "app");
+        assert_eq!(metadata.provider, "custom-provider");
+        assert_eq!(metadata.model, "custom-model");
+        let command = command.as_std();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["--acp", "--extra"]);
+        let environment: HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(environment[std::ffi::OsStr::new("REMOVE_THIS")], None);
+        assert_eq!(environment[std::ffi::OsStr::new("CUSTOM_KEY")], Some(std::ffi::OsStr::new("test-key")));
+        assert!(
+            launcher
+                .prepare(
+                    "agent",
+                    "app",
+                    serde_json::json!({
+                        "providerConfig":{"engine":"company-agent"}
+                    })
+                )
+                .await
+                .unwrap_err()
+                .contains("ALWITH_RUNTIME_LAUNCH_RESOLVER")
+        );
     }
 }

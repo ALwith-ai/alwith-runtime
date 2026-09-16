@@ -13,7 +13,7 @@
 //! 只记录不拦截)。发现规则:`<dir>/*/alwith-module.json` 与 `<dir>/@*/*/alwith-module.json`,
 //! 也就是应用的 `node_modules`。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -49,6 +49,9 @@ pub struct ModuleManifest {
     pub persistent: bool,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Optional RPC namespaces served by this module, not compiled into Runtime.
+    #[serde(default)]
+    pub routes: Vec<String>,
 }
 
 impl ModuleManifest {
@@ -167,6 +170,7 @@ struct Subscriber {
     id: u64,
     events: mpsc::Sender<String>,
     disconnect: Arc<Notify>,
+    routed_modules: HashSet<String>,
 }
 
 pub struct ModuleHost {
@@ -234,6 +238,24 @@ impl ModuleHost {
     }
 
     pub async fn spawn(self: &Arc<Self>, module_dir: &Path, manifest: ModuleManifest) -> Result<(), String> {
+        {
+            let modules = self.modules.lock().expect("modules lock poisoned");
+            if modules.contains_key(&manifest.name) {
+                return Err(format!("duplicate module {}", manifest.name));
+            }
+            let mut routes = HashSet::new();
+            for route in &manifest.routes {
+                if route.is_empty()
+                    || route.contains('/')
+                    || route.starts_with('_')
+                    || route == "modules"
+                    || !routes.insert(route)
+                    || modules.values().any(|module| module.manifest.routes.contains(route))
+                {
+                    return Err(format!("invalid or duplicate module route {route}"));
+                }
+            }
+        }
         if let Some(requirement) = &manifest.runtime
             && !runtime_satisfies(&self.runtime_version, requirement)?
         {
@@ -305,6 +327,11 @@ impl ModuleHost {
                 }
             }
             alive.store(false, Ordering::Relaxed);
+            for subscriber in host.subscribers.lock().expect("subscribers lock poisoned").iter() {
+                if subscriber.routed_modules.contains(&name) {
+                    subscriber.disconnect.notify_one();
+                }
+            }
             host.runtime.remove_sink(sink_id);
             host.runtime.detach_owners_under(&format!("module:{name}"));
             let pending: Vec<_> = pending.lock().expect("pending lock poisoned").drain().collect();
@@ -317,6 +344,23 @@ impl ModuleHost {
     }
 
     fn broadcast(&self, module: &str, event: Value) {
+        if matches!(event.get("type").and_then(Value::as_str), Some("_runtime/service" | "_runtime/disconnect")) {
+            let Some(id) = event.get("connectionId").and_then(Value::as_u64) else { return };
+            let subscribers = self.subscribers.lock().expect("subscribers lock poisoned");
+            if let Some(subscriber) =
+                subscribers.iter().find(|subscriber| subscriber.id == id && subscriber.routed_modules.contains(module))
+            {
+                if event["type"] == "_runtime/disconnect" {
+                    subscriber.disconnect.notify_one();
+                } else if let Some(payload) = event.get("event") {
+                    let frame = serde_json::json!({"type":"service", "event":payload}).to_string();
+                    if subscriber.events.try_send(frame).is_err() {
+                        subscriber.disconnect.notify_one();
+                    }
+                }
+            }
+            return;
+        }
         let payload = serde_json::json!({ "type": "module", "module": module, "event": event }).to_string();
         let mut subscribers = self.subscribers.lock().expect("subscribers lock poisoned");
         subscribers.retain(|subscriber| match subscriber.events.try_send(payload.clone()) {
@@ -400,6 +444,7 @@ impl RuntimeEventSink for ModuleEventSink {
 struct Subscription {
     id: u64,
     host: Arc<ModuleHost>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Subscription {
@@ -416,34 +461,92 @@ impl Extension for ModuleExtension {
     fn connect(&self, _owner_id: &str, events: mpsc::Sender<String>, disconnect: Arc<Notify>) -> ConnectionState {
         let host = &self.0;
         let id = host.next_subscriber.fetch_add(1, Ordering::Relaxed);
-        host.subscribers.lock().expect("subscribers lock poisoned").push(Subscriber { id, events, disconnect });
-        Box::new(Subscription { id, host: Arc::clone(host) })
+        host.subscribers.lock().expect("subscribers lock poisoned").push(Subscriber {
+            id,
+            events,
+            disconnect,
+            routed_modules: HashSet::new(),
+        });
+        Box::new(Subscription { id, host: Arc::clone(host), closed: std::sync::atomic::AtomicBool::new(false) })
     }
 
     async fn call(
-        &self, _owner_id: &str, _connection: &ConnectionState, method: &str, params: Value,
+        &self, owner_id: &str, connection: &ConnectionState, method: &str, params: Value,
     ) -> Result<Option<Value>, ResponseError> {
         if method == LIST_METHOD {
             return serde_json::to_value(self.0.list())
                 .map(Some)
                 .map_err(|error| ResponseError::runtime(error.to_string()));
         }
-        let Some(rest) = method.strip_prefix(METHOD_PREFIX) else { return Ok(None) };
+        let subscription = connection.downcast_ref::<Subscription>().expect("module subscription");
+        if subscription.closed.load(Ordering::Acquire) {
+            return Err(ResponseError::connection_lost("module connection closed"));
+        }
+        let Some(rest) = method.strip_prefix(METHOD_PREFIX) else {
+            let namespace = method.split_once('/').map(|(namespace, _)| namespace);
+            let module = self
+                .0
+                .modules
+                .lock()
+                .expect("modules lock poisoned")
+                .values()
+                .find(|module| {
+                    namespace.is_some_and(|namespace| module.manifest.routes.iter().any(|route| route == namespace))
+                })
+                .map(|module| module.manifest.name.clone());
+            let Some(module) = module else { return Ok(None) };
+            {
+                let mut subscribers = self.0.subscribers.lock().expect("subscribers lock poisoned");
+                let subscriber = subscribers
+                    .iter_mut()
+                    .find(|subscriber| subscriber.id == subscription.id)
+                    .ok_or_else(|| ResponseError::connection_lost("module connection closed"))?;
+                subscriber.routed_modules.insert(module.clone());
+            }
+            return self
+                .0
+                .call_module(
+                    &module,
+                    "_runtime/call",
+                    serde_json::json!({
+                        "connectionId":subscription.id, "owner":owner_id, "method":method, "params":params
+                    }),
+                )
+                .await
+                .map(Some);
+        };
         let Some((module, module_method)) = rest.split_once('/') else {
             return Err(ResponseError::invalid_params(format!(
                 "module method must look like modules/<name>/<method>, got {method}"
             )));
         };
+        if module_method.starts_with("_runtime/") {
+            return Err(ResponseError::method_not_found(method));
+        }
         self.0.call_module(module, module_method, params).await.map(Some)
     }
 
     async fn disconnect(&self, connection: &ConnectionState) {
         let subscription = connection.downcast_ref::<Subscription>().expect("module subscription");
-        self.0
-            .subscribers
-            .lock()
-            .expect("subscribers lock poisoned")
-            .retain(|subscriber| subscriber.id != subscription.id);
+        subscription.closed.store(true, Ordering::Release);
+        let modules = {
+            let mut subscribers = self.0.subscribers.lock().expect("subscribers lock poisoned");
+            let modules = subscribers
+                .iter()
+                .find(|subscriber| subscriber.id == subscription.id)
+                .map(|subscriber| subscriber.routed_modules.clone())
+                .unwrap_or_default();
+            subscribers.retain(|subscriber| subscriber.id != subscription.id);
+            modules
+        };
+        for module in modules {
+            // A dead module must not prevent the transport from releasing the remaining resources.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.0.call_module(&module, "_runtime/disconnect", serde_json::json!({"connectionId":subscription.id})),
+            )
+            .await;
+        }
     }
 
     async fn shutdown(&self) {
@@ -659,5 +762,54 @@ for line in sys.stdin:
         let host = ModuleHost::new(runtime, "0.3.0");
         let statuses = host.load_dir(root.path()).await;
         assert!(statuses.is_empty(), "{statuses:?}");
+    }
+
+    #[tokio::test]
+    async fn private_module_operations_are_not_public_rpc() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(root.path()).unwrap()));
+        let extension = ModuleExtension(ModuleHost::new(runtime, "0.4.0"));
+        let (events, _receiver) = mpsc::channel(8);
+        let connection = extension.connect("client", events, Arc::new(Notify::new()));
+        for method in ["_runtime/resolveLaunch", "_runtime/call", "_runtime/disconnect", "_runtime/ready"] {
+            let error = extension
+                .call("client", &connection, &format!("modules/example/{method}"), Value::Null)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ResponseError::METHOD_NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_events_only_reach_the_connection_routed_to_that_module() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(root.path()).unwrap()));
+        let host = ModuleHost::new(runtime, "0.4.0");
+        let extension = ModuleExtension(Arc::clone(&host));
+        let (first, mut first_events) = mpsc::channel(8);
+        let (second, mut second_events) = mpsc::channel(8);
+        let disconnect = Arc::new(Notify::new());
+        let first = extension.connect("first", first, Arc::clone(&disconnect));
+        let _second = extension.connect("second", second, Arc::new(Notify::new()));
+        let id = first.downcast_ref::<Subscription>().unwrap().id;
+        host.subscribers
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|subscriber| subscriber.id == id)
+            .unwrap()
+            .routed_modules
+            .insert("files".into());
+        let event = serde_json::json!({"type":"_runtime/service","connectionId":id,"event":{"type":"fsChanged"}});
+        host.broadcast("unrelated", event.clone());
+        assert!(first_events.try_recv().is_err());
+        host.broadcast("files", event);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first_events.try_recv().unwrap()).unwrap(),
+            serde_json::json!({"type":"service","event":{"type":"fsChanged"}})
+        );
+        assert!(second_events.try_recv().is_err());
+        host.broadcast("files", serde_json::json!({"type":"_runtime/disconnect","connectionId":id}));
+        tokio::time::timeout(std::time::Duration::from_secs(1), disconnect.notified()).await.unwrap();
     }
 }

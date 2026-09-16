@@ -51,17 +51,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: alwith-runtime
-      # 私有构建依赖按同级路径检出;BUILD_TOKEN 需要这些源码仓的只读权限。
-      - uses: actions/checkout@v4
-        with:
-          repository: nyssance/alwith-api
-          path: alwith-api
-          token: ${{ secrets.BUILD_TOKEN }}
-      - uses: actions/checkout@v4
-        with:
-          repository: nyssance/alwith-modules
-          path: alwith-modules
-          token: ${{ secrets.BUILD_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -75,7 +64,7 @@ jobs:
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           [ "$tag" = "v$version" ] || { echo "tag $tag != workspace version $version"; exit 1; }
-      - run: cargo test --workspace --target ${{ matrix.target }}
+      - run: cargo test --locked --workspace --target ${{ matrix.target }}
         if: ${{ !contains(matrix.target, 'x86_64-apple') }}
       - run: cargo build --release --locked -p alwith-runtime --target ${{ matrix.target }}
       - name: Package

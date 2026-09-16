@@ -11,7 +11,6 @@ name = "alwith-runtime"
 path = "src/main.rs"
 
 [dependencies]
-alwith-runtime-services = { path = "../../crates/runtime-services" }
 alwith-runtime-core = { path = "../../crates/runtime-core" }
 alwith-runtime-modules = { path = "../../crates/runtime-modules" }
 alwith-runtime-stdio = { path = "../../crates/runtime-stdio" }
@@ -26,3 +25,6 @@ tokio = { version = "1", features = ["full"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

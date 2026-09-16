@@ -3,17 +3,16 @@
 Private. ALwith Runtime: ownership of ACP agent processes, session run states, the
 per-session event journal, and the `alwith-runtime-v1` frame protocol over stdio or WebSocket.
 Ships as the `alwith-runtime` binary; source stays here. Every ALwith application (U, Desktop,
-Board, connectors) spawns or connects to this executable. Optional native services are built in;
-there is no separate Web-only host executable or dependency on Desktop source.
+Board, connectors) spawns or connects to this executable. Concrete capabilities are optional module
+processes. Building Runtime requires no other ALwith repository.
 
 | Crate | What |
 | --- | --- |
-| `alwith-api` (sibling repository) | Protocol types and Rust client; TypeScript client is `@alwith/api` |
+| `crates/runtime-protocol` | Runtime-owned wire types; exported bindings are consumed by client SDKs |
 | `crates/runtime-core` | `Runtime` (spawn / generations / lanes / batching), `RuntimeRegistry` (run states, `done` + `mark_read`, attach with pending-permission replay), `Journal` (sequenced per-session jsonl) |
 | `crates/runtime-ws` | The frame protocol and its WebSocket entry: token handshake, request envelopes, global event fan-out, `Extension` hook for host-specific methods |
 | `crates/runtime-stdio` | The stdio entry: one connection over stdin/stdout, same frames, bounded event queue with a `lagged` notice instead of a disconnect |
 | `crates/runtime-modules` | Module host: scans `ALWITH_MODULES_DIR` (the app's `node_modules`) for packages carrying `alwith-module.json`, spawns each entry as a subprocess speaking the same frames, routes `modules/<name>/<method>` and broadcasts module events as `{type:"module"}` |
-| `crates/runtime-services` | Built-in fs, store, shell, git and QA RPC adapters; shared capability libraries live in private `alwith-modules`. Services are opt-in and use the same implementation over both transports |
 | `apps/runtime` | The `alwith-runtime` binary. Engines come from `ALWITH_RUNTIME_ENGINES`; `--listen stdio://` (default) or `--listen ws://IP:PORT` |
 
 ## alwith-runtime
@@ -39,71 +38,57 @@ ALWITH_RUNTIME_TOKEN=secret ALWITH_RUNTIME_ENGINES='{...}' alwith-runtime --list
 `ALWITH_RUNTIME_PARENT_PID` (exit when the parent goes away), `ALWITH_MODULES_DIR` (load modules from
 there; see `crates/runtime-modules`). Logs go to stderr only; stdout carries nothing but protocol frames.
 
-## Optional native services
+## Independent build
 
-Resource services are configured independently with `ALWITH_RUNTIME_SERVICES`:
+Only this repository and registry dependencies are required:
 
-```json
-{"schemaVersion":1,"fs":{"roots":["/srv/work"]},"store":{"dataDir":"/srv/app/data","cacheDir":"/srv/app/cache"}}
+```sh
+cargo build --release --locked -p alwith-runtime
+cargo test --workspace --locked
 ```
 
-Omitted capabilities are disabled. `fs`, `git`, `shell` and `qa` each accept their own nonempty
-absolute `roots`; `store` requires distinct absolute `dataDir` and `cacheDir`. Unknown fields
-and unsupported schema versions are rejected. No resource service requires another service.
-`services/capabilities` returns `{schemaVersion:1,enabled:[...] }` (sorted capability names).
-`services/ping` and provider management remain available with no resource services enabled.
-`ALWITH_FS_ROOTS` separately constrains provider-launch cwd; it does not enable resource services.
-`ALWITH_SETTINGS_PATH` selects provider settings, not the store data directory.
+There are no sibling source dependencies, Git submodules or private dependency checkouts.
+CI and release jobs check out only this repository. The dependency-boundary test rejects
+path dependencies outside this repository, including dev dependencies.
 
-The same binary exposes `fs/*`, `store/*`, `git/*`, `shell/exec`, `qa/*` and `engines/status`
-over stdio or authenticated WebSocket. These are built-in services, not module subprocesses.
-Application modules still use `modules/<name>/<method>`.
+Protocol ownership is `crates/runtime-protocol`. A client can obtain its Rust bindings from
+`alwith-runtime --export-protocol rust`; the API repository imports this generated snapshot.
+The Runtime never imports a client implementation. Client integration tests live in the API
+repository and run against a separately built Runtime executable.
 
-Service events use `{"type":"service","event":{...}}`. File watchers belong to a connection,
-not a global watcher-id map: equal IDs on different connections do not collide, and disconnect
-releases watchers even if a long-running operation remains. Long service calls do not hold a
-connection-wide lock, so cancellation can run concurrently. Slow event consumers are disconnected;
-after reconnect, re-register watchers and reload store/QA snapshots. `storeInvalidated` means the
-specified scope needs reloading after a store broadcast gap; it is not a normal key mutation.
+## Optional capabilities
 
-Provider management is native and independent of these optional resource services:
-set `ALWITH_SETTINGS_PATH` to use `launch:{providerConfig:{engine,providerId,modelId,...}}`.
-Runtime rereads settings for each launch, resolves credentials and delegates CLI translation to
-`alwith-cli-adapters`. Desktop and browser use this same path. `engines/probeCapabilities`
-also works without fs/store/QA services. Raw `launch:{engine,args,env,cwd}` remains available
-for arbitrary third-party CLIs. Engine names are arbitrary: declare `providerAdapter` in each
-engine specification (`raw`, `alwith`, `dsh`, or declarative `environment`); see the protocol.
-`engines/capabilities` lists configured engines and adapter kinds without exposing credentials.
+Filesystem, Git, Shell, Store, QA and ALwith-specific provider translation live in the
+optional `@alwith/services` module bundle, built in `alwith-modules`, not in Runtime.
+Desktop selects that bundle; U's raw Codex engine launch does not need it.
+The same Runtime executable supports both applications and a standalone server.
 
-Optional `overrides:{args,env,envRemove,cwd}` appends execution policy or application environment
-to a provider-based launch; other override keys are rejected. Environment removals survive the
-protocol and are applied before explicit environment values. Existing configured filesystem roots
-also constrain launch cwd, but are not an OS sandbox.
+A module may declare `routes:["namespace"]` in its manifest. Runtime forwards that namespace
+through the module's private pipe, retaining connection identity and disconnect cleanup.
+It does not know the module's domain types, settings or implementation. Duplicate namespaces
+are rejected. Existing module calls still use `modules/<name>/<method>`.
 
-ALwith.dev itself reads its executor defaults and adds its tool/plugin policy. Runtime does not
-special-case its business methods or return credential-bearing launch templates via an RPC.
-`ALWITH_CLI_PATH`, `ALWITH_BUN_PATH`, `ALWITH_DSH_ENTRY` select installed engine paths;
-`ALWITH_AI_GATEWAY_BASE_URL` and `ALWITH_PROJECTS_DIR` configure gateway/project locations.
-With provider translation, keep the engine table's args free of adapter-owned args such as `--acp`
-or the dsh entry; the adapter supplies these once.
+For optional provider translation, set `ALWITH_RUNTIME_LAUNCH_RESOLVER` to the installed
+module name. Runtime sends provider-based launches over the private pipe, then owns the
+actual engine spawn. Credentials resolved there are not exposed by a public preparation RPC.
+Raw `launch:{engine,args,env,envRemove,cwd,provider,model}` needs no module or ALwith account.
+The application remains responsible for its platform identity policy.
 
-QA execution requiring the Playwright reporter must set `ALWITH_QA_REPORTER_PATH`. Missing QA assets
-do not prevent an unrelated chat/fs client from starting. QA platform credentials intentionally remain provided by Desktop through its native adapter.
-Standalone Runtime explicitly rejects QA cases requiring a credential provider it does not have;
-a server that needs those cases must supply an appropriate provider. This is an accepted business
-boundary, not a requirement to move Desktop authentication into Runtime. This refactor does not claim unified login has shipped.
+Service configuration (including `ALWITH_RUNTIME_SERVICES`, provider settings and QA assets)
+is interpreted by the optional module. See its README. Modules inherit the configured process
+environment; this is not an OS sandbox or multi-tenant security boundary.
 
-Security: a Runtime token grants access as a trusted operator. Filesystem roots constrain file APIs,
-not arbitrary shell commands or Agent tools. This is not an OS sandbox or a multi-tenant server.
-Use protected transport/access control when deploying beyond localhost.
+Module-private operations (unavailable through public `modules/...` calls):
 
-Build source requires sibling `alwith-api` and `alwith-modules`; applications consuming the binary
-do not need their source. CI/release checkout requires `BUILD_TOKEN` with read access to both private
-repositories. No source is added to release archives.
+- `_runtime/call`: `{connectionId,owner,method,params}`.
+- `_runtime/disconnect`: `{connectionId}`; must release connection-owned resources.
+- `_runtime/ready`: resolves after initialization.
+- `_runtime/resolveLaunch`: optional private launch resolver.
 
-Verification: `crates/runtime-services/src/__tests__/services.rs` exercises real stdio and WebSocket
-service requests, denied paths, store events, watcher isolation and cleanup; runtime-ws tests prove
-same-connection cancellation does not wait for the long call. No real model sessions are needed.
+Module events `{type:"_runtime/service",connectionId,event}` become
+`{type:"service",event}` only on the originating connection. A
+`_runtime/disconnect` event requests that connection's shutdown. Runtime rejects private
+operation access from ordinary clients and disconnects affected clients if their module exits.
 
 ## Protocol
 

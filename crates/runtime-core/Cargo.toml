@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 # 核心只要协议类型,不要客户端(那是应用侧的事)
-alwith-api = { path = "../../../alwith-api/crates/api", default-features = false }
+alwith-runtime-protocol = { path = "../runtime-protocol" }
 command-group = { version = "5", features = ["with-tokio"] }
 dirs = "7"
 log = "0.4"

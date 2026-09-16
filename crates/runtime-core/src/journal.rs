@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use alwith_api::{FrameDirection, SessionEventFrame};
+use alwith_runtime_protocol::{FrameDirection, SessionEventFrame};
 
 /// 单个会话日志的字节上限。超过就只保留后半段(sequence 连续性不受影响,只是最早的帧没了)。
 pub const SESSION_JOURNAL_MAX_BYTES: u64 = 16 * 1024 * 1024;

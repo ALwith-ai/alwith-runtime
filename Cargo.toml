@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/runtime-core", "crates/runtime-ws", "crates/runtime-stdio", "crates/runtime-modules", "crates/runtime-services", "apps/runtime"]
+members = ["crates/runtime-protocol", "crates/runtime-core", "crates/runtime-ws", "crates/runtime-stdio", "crates/runtime-modules", "apps/runtime"]
 
 [workspace.package]
 version = "0.4.0"
