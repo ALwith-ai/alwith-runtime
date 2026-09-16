@@ -1,0 +1,28 @@
+[package]
+name = "alwith-runtime"
+description = "ALwith Runtime: the standalone Runtime process. Engines from a JSON table; stdio by default, WebSocket on request"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "alwith-runtime"
+path = "src/main.rs"
+
+[dependencies]
+alwith-runtime-services = { path = "../../crates/runtime-services" }
+alwith-runtime-core = { path = "../../crates/runtime-core" }
+alwith-runtime-modules = { path = "../../crates/runtime-modules" }
+alwith-runtime-stdio = { path = "../../crates/runtime-stdio" }
+alwith-runtime-ws = { path = "../../crates/runtime-ws" }
+async-trait = "0.1"
+axum = "0.8"
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,118 @@
+# Builds alwith-runtime for every target alwith-u and Desktop bundle, and publishes
+# the binaries as GitHub Release assets. Source stays private; only assets are public.
+#
+# Asset contract (consumed by alwith-u scripts/stage.ts):
+#   alwith-runtime-<rust-triple>.tar.gz   one file inside: alwith-runtime[.exe]
+#   SHA256SUMS                        sha256 of every archive, `sha256sum` format
+#
+# Trigger: push a tag `v<version>` matching the workspace version, or run manually.
+# Publishing to a different (public) repo: set the repository variable RELEASE_REPO to
+# `owner/name` and the secret RELEASE_TOKEN to a token with `contents: write` there.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (v<version>)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: alwith-runtime
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: alwith-runtime
+      # 私有构建依赖按同级路径检出;BUILD_TOKEN 需要这些源码仓的只读权限。
+      - uses: actions/checkout@v4
+        with:
+          repository: nyssance/alwith-api
+          path: alwith-api
+          token: ${{ secrets.BUILD_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          repository: nyssance/alwith-modules
+          path: alwith-modules
+          token: ${{ secrets.BUILD_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: alwith-runtime
+      - name: Check the tag matches the workspace version
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          [ "$tag" = "v$version" ] || { echo "tag $tag != workspace version $version"; exit 1; }
+      - run: cargo test --workspace --target ${{ matrix.target }}
+        if: ${{ !contains(matrix.target, 'x86_64-apple') }}
+      - run: cargo build --release --locked -p alwith-runtime --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=""; case "${{ matrix.target }}" in *windows*) exe=".exe";; esac
+          mkdir -p dist/stage
+          cp "target/${{ matrix.target }}/release/alwith-runtime$exe" dist/stage/
+          tar -C dist/stage -czf "dist/alwith-runtime-${{ matrix.target }}.tar.gz" "alwith-runtime$exe"
+          rm -r dist/stage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alwith-runtime-${{ matrix.target }}
+          path: alwith-runtime/dist/alwith-runtime-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum alwith-runtime-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          REPO: ${{ vars.RELEASE_REPO || github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$REPO" --title "alwith-runtime $TAG" --notes "alwith-runtime $TAG. Assets: alwith-runtime-<rust-triple>.tar.gz + SHA256SUMS."
+          fi

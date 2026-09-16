@@ -1,0 +1,27 @@
+[package]
+name = "alwith-runtime-core"
+description = "ACP agent process ownership, session run states and the session journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 核心只要协议类型,不要客户端(那是应用侧的事)
+alwith-api = { path = "../../../alwith-api/crates/api", default-features = false }
+command-group = { version = "5", features = ["with-tokio"] }
+dirs = "7"
+log = "0.4"
+netstat2 = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+specta = { version = "=2.0.0-rc.24", features = ["derive", "serde_json"] }
+sysinfo = "0.39"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

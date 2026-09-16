@@ -1,0 +1,19 @@
+[package]
+name = "alwith-runtime-stdio"
+description = "The Runtime stdio entry: one connection over stdin/stdout, same frames as the WebSocket protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+alwith-runtime-core = { path = "../runtime-core" }
+alwith-runtime-ws = { path = "../runtime-ws" }
+log = "0.4"
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"

@@ -1,0 +1,663 @@
+//! 模块宿主。模块是包:目录里一份 `alwith-module.json` 清单加一个可执行入口;Runtime 按清单
+//! spawn 入口为子进程,和它在 stdio 上说与应用相同的一行一帧协议。三种帧,按字段区分:
+//!
+//! - 模块 → Runtime 的请求 `{id, method, params}`:模块是一个客户端,能调 Runtime 的任何方法,
+//!   属主记为 `module:<name>`。Runtime 回 `{id, result | error}`。
+//! - Runtime → 模块的请求:应用调 `modules/<name>/<method>`,Runtime 原样转给模块
+//!   `{id, method, params}`,模块回 `{id, result | error}`。两个方向各自编 id。
+//! - 事件 `{type, ...}`:Runtime 的事件原样推给模块;模块发的事件包成
+//!   `{"type":"module","module":<name>,"event":{...}}` 广播给所有应用连接。
+//!
+//! 清单字段:`name`、`version`、`entry`(按 target triple 或 `default` 给相对路径)、`runtime`
+//! (最低 Runtime 版本,只记录)、`persistent`(要求 Runtime 常驻)、`capabilities`(声明会碰什么,
+//! 只记录不拦截)。发现规则:`<dir>/*/alwith-module.json` 与 `<dir>/@*/*/alwith-module.json`,
+//! 也就是应用的 `node_modules`。
+
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use alwith_runtime_core::{ResponseError, Runtime, RuntimeEvent, RuntimeEventSink};
+use alwith_runtime_ws::{ConnectionState, Extension};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc, oneshot};
+
+pub const MANIFEST_FILE: &str = "alwith-module.json";
+pub const METHOD_PREFIX: &str = "modules/";
+/// 应用查已加载模块的方法名。
+pub const LIST_METHOD: &str = "modules";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleManifest {
+    pub name: String,
+    pub version: String,
+    /// target triple → 入口相对路径;没有匹配项时取 `default`。
+    pub entry: BTreeMap<String, String>,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub persistent: bool,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl ModuleManifest {
+    /// 先按本机 target triple 找入口,没有(或文件不在,如开发态未打包)再取 `default`。
+    pub fn entry_path(&self, module_dir: &Path) -> Result<PathBuf, String> {
+        let triple = current_triple();
+        let candidates = [self.entry.get(&triple), self.entry.get("default")];
+        let mut tried = Vec::new();
+        for relative in candidates.into_iter().flatten() {
+            let path = module_dir.join(relative);
+            if path.is_file() {
+                return Ok(path);
+            }
+            tried.push(path.display().to_string());
+        }
+        if tried.is_empty() {
+            return Err(format!("module {} has no entry for {triple} and no default", self.name));
+        }
+        Err(format!("module {} entry missing: {}", self.name, tried.join(", ")))
+    }
+}
+
+pub fn current_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        other => other,
+    };
+    format!("{arch}-{os}")
+}
+
+/// 扫一个目录(通常是应用的 `node_modules`)里所有带清单的包。
+pub fn discover(modules_dir: &Path) -> Vec<(PathBuf, ModuleManifest)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(modules_dir) else { return found };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with('@')) {
+            if let Ok(scoped) = std::fs::read_dir(&path) {
+                for scoped_entry in scoped.flatten() {
+                    push_if_module(&mut found, &scoped_entry.path());
+                }
+            }
+            continue;
+        }
+        push_if_module(&mut found, &path);
+    }
+    found.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    found
+}
+
+fn push_if_module(found: &mut Vec<(PathBuf, ModuleManifest)>, dir: &Path) {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    if !manifest_path.is_file() {
+        return;
+    }
+    match std::fs::read_to_string(&manifest_path)
+        .map_err(|error| error.to_string())
+        .and_then(|text| serde_json::from_str::<ModuleManifest>(&text).map_err(|error| error.to_string()))
+    {
+        // node_modules 里常是符号链接(workspace / bun link):入口按真实目录解析,否则相对路径落空。
+        Ok(manifest) => found.push((dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()), manifest)),
+        Err(error) => log::warn!("[modules] {} unreadable: {error}", manifest_path.display()),
+    }
+}
+
+/// 清单 `runtime` 字段:`>=X.Y.Z`(或裸 `X.Y.Z`,同义)。只认这一种写法,别的写法报错而不是装作满足。
+pub fn runtime_satisfies(version: &str, requirement: &str) -> Result<bool, String> {
+    fn parse(text: &str) -> Result<(u64, u64, u64), String> {
+        let mut parts = text.trim().split('.').map(|part| part.parse::<u64>());
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => Ok((major, minor, patch)),
+            _ => Err(format!("not a X.Y.Z version: {text}")),
+        }
+    }
+    let required = requirement.trim().strip_prefix(">=").unwrap_or(requirement.trim());
+    Ok(parse(version)? >= parse(required)?)
+}
+
+/// 模块 → Runtime 请求的执行器,由 Runtime 主程序在建好 RuntimeServer 后接进来。
+pub type Dispatch = Arc<
+    dyn Fn(String, String, Value) -> Pin<Box<dyn Future<Output = Result<Value, ResponseError>> + Send>> + Send + Sync,
+>;
+
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ResponseError>>>>>;
+
+struct ModuleProcess {
+    manifest: ModuleManifest,
+    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    pending: Pending,
+    next_id: AtomicU64,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime 只持 sink 的弱引用;强引用挂在模块进程上,进程在事件就一直送。
+    _sink: Arc<dyn RuntimeEventSink>,
+    _child: Child,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleStatus {
+    pub name: String,
+    pub version: String,
+    pub persistent: bool,
+    pub capabilities: Vec<String>,
+    pub alive: bool,
+}
+
+/// 一条应用连接对模块事件的订阅:队列满就让协议层断开这条慢连接(与 Runtime 事件同一策略),
+/// 客户端重连后自己补;绝不静默丢掉订阅让连接以为自己还在收。
+struct Subscriber {
+    id: u64,
+    events: mpsc::Sender<String>,
+    disconnect: Arc<Notify>,
+}
+
+pub struct ModuleHost {
+    runtime: Arc<Runtime>,
+    /// 本 Runtime 的版本;清单 `runtime` 字段要求更高的模块不加载。
+    runtime_version: String,
+    modules: Mutex<HashMap<String, Arc<ModuleProcess>>>,
+    subscribers: Mutex<Vec<Subscriber>>,
+    next_subscriber: AtomicU64,
+    dispatch: OnceLock<Dispatch>,
+}
+
+impl ModuleHost {
+    pub fn new(runtime: Arc<Runtime>, runtime_version: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            runtime,
+            runtime_version: runtime_version.into(),
+            modules: Mutex::new(HashMap::new()),
+            subscribers: Mutex::new(Vec::new()),
+            next_subscriber: AtomicU64::new(1),
+            dispatch: OnceLock::new(),
+        })
+    }
+
+    /// 接上模块 → Runtime 请求的执行器。在 RuntimeServer 建好后调一次。
+    pub fn set_dispatch(&self, dispatch: Dispatch) {
+        let _ = self.dispatch.set(dispatch);
+    }
+
+    /// 加载目录里的全部模块;单个模块起不来只记日志,不影响其他模块。
+    pub async fn load_dir(self: &Arc<Self>, modules_dir: &Path) -> Vec<ModuleStatus> {
+        for (dir, manifest) in discover(modules_dir) {
+            if let Err(error) = self.spawn(&dir, manifest.clone()).await {
+                log::error!("[modules] {} failed to start: {error}", manifest.name);
+            }
+        }
+        self.list()
+    }
+
+    pub fn list(&self) -> Vec<ModuleStatus> {
+        let mut statuses: Vec<ModuleStatus> = self
+            .modules
+            .lock()
+            .expect("modules lock poisoned")
+            .values()
+            .map(|module| ModuleStatus {
+                name: module.manifest.name.clone(),
+                version: module.manifest.version.clone(),
+                persistent: module.manifest.persistent,
+                capabilities: module.manifest.capabilities.clone(),
+                alive: module.alive.load(Ordering::Relaxed),
+            })
+            .collect();
+        statuses.sort_by(|a, b| a.name.cmp(&b.name));
+        statuses
+    }
+
+    /// 是否有活着的常驻模块(Runtime 退出策略据此决定要不要留着)。
+    pub fn has_persistent(&self) -> bool {
+        self.modules
+            .lock()
+            .expect("modules lock poisoned")
+            .values()
+            .any(|module| module.manifest.persistent && module.alive.load(Ordering::Relaxed))
+    }
+
+    pub async fn spawn(self: &Arc<Self>, module_dir: &Path, manifest: ModuleManifest) -> Result<(), String> {
+        if let Some(requirement) = &manifest.runtime
+            && !runtime_satisfies(&self.runtime_version, requirement)?
+        {
+            return Err(format!(
+                "module {} needs runtime {requirement}, this runtime is {}",
+                manifest.name, self.runtime_version
+            ));
+        }
+        let entry = manifest.entry_path(module_dir)?;
+        let mut command = Command::new(&entry);
+        command
+            .current_dir(module_dir)
+            .env("ALWITH_MODULE_NAME", &manifest.name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| format!("spawn {}: {error}", entry.display()))?;
+        let stdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take().expect("piped stdin")));
+        let stdout = child.stdout.take().expect("piped stdout");
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let name = manifest.name.clone();
+        log::info!("[modules] {name} {} started (pid {:?})", manifest.version, child.id());
+
+        // Runtime 事件 → 模块 stdin(模块是一个客户端)。
+        let sink: Arc<dyn RuntimeEventSink> =
+            Arc::new(ModuleEventSink { stdin: Arc::clone(&stdin), alive: Arc::clone(&alive) });
+        let sink_id = self.runtime.add_sink(&sink);
+
+        let process = Arc::new(ModuleProcess {
+            manifest,
+            stdin: Arc::clone(&stdin),
+            pending: Arc::clone(&pending),
+            next_id: AtomicU64::new(1),
+            alive: Arc::clone(&alive),
+            _sink: sink,
+            _child: child,
+        });
+        self.modules.lock().expect("modules lock poisoned").insert(name.clone(), Arc::clone(&process));
+
+        let host = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let text = line.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::warn!("[modules] {name}: unparseable frame: {error}");
+                        continue;
+                    }
+                };
+                if value.get("type").is_some() {
+                    host.broadcast(&name, value);
+                } else if value.get("method").is_some() {
+                    host.handle_module_request(&name, &stdin, value).await;
+                } else if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                    let response = match value.get("error") {
+                        Some(error) if !error.is_null() => Err(ResponseError::parse(error)),
+                        _ => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
+                    };
+                    if let Some(sender) = pending.lock().expect("pending lock poisoned").remove(&id) {
+                        let _ = sender.send(response);
+                    }
+                }
+            }
+            alive.store(false, Ordering::Relaxed);
+            host.runtime.remove_sink(sink_id);
+            host.runtime.detach_owners_under(&format!("module:{name}"));
+            let pending: Vec<_> = pending.lock().expect("pending lock poisoned").drain().collect();
+            for (_, sender) in pending {
+                let _ = sender.send(Err(ResponseError::connection_lost(format!("module {name} exited"))));
+            }
+            log::warn!("[modules] {name} exited");
+        });
+        Ok(())
+    }
+
+    fn broadcast(&self, module: &str, event: Value) {
+        let payload = serde_json::json!({ "type": "module", "module": module, "event": event }).to_string();
+        let mut subscribers = self.subscribers.lock().expect("subscribers lock poisoned");
+        subscribers.retain(|subscriber| match subscriber.events.try_send(payload.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                subscriber.disconnect.notify_one();
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+        });
+    }
+
+    async fn handle_module_request(&self, module: &str, stdin: &Arc<tokio::sync::Mutex<ChildStdin>>, value: Value) {
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let method = value.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let result = match self.dispatch.get() {
+            Some(dispatch) => dispatch(format!("module:{module}"), method, params).await,
+            None => Err(ResponseError::runtime("module host has no dispatcher")),
+        };
+        let response = match result {
+            Ok(result) => serde_json::json!({ "id": id, "result": result, "error": null }),
+            Err(error) => serde_json::json!({ "id": id, "result": null, "error": error }),
+        };
+        let mut line = response.to_string();
+        line.push('\n');
+        let mut stdin = stdin.lock().await;
+        let _ = stdin.write_all(line.as_bytes()).await;
+        let _ = stdin.flush().await;
+    }
+
+    /// 应用 → 模块的请求。
+    pub async fn call_module(&self, module: &str, method: &str, params: Value) -> Result<Value, ResponseError> {
+        let process = self
+            .modules
+            .lock()
+            .expect("modules lock poisoned")
+            .get(module)
+            .cloned()
+            .ok_or_else(|| ResponseError::runtime(format!("module {module} is not loaded")))?;
+        if !process.alive.load(Ordering::Relaxed) {
+            return Err(ResponseError::runtime(format!("module {module} is not running")));
+        }
+        let id = process.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        process.pending.lock().expect("pending lock poisoned").insert(id, sender);
+        let mut line = serde_json::json!({ "id": id, "method": method, "params": params }).to_string();
+        line.push('\n');
+        {
+            let mut stdin = process.stdin.lock().await;
+            if let Err(error) = stdin.write_all(line.as_bytes()).await.and(stdin.flush().await) {
+                process.pending.lock().expect("pending lock poisoned").remove(&id);
+                return Err(ResponseError::connection_lost(format!("module {module}: write failed: {error}")));
+            }
+        }
+        receiver.await.unwrap_or_else(|_| Err(ResponseError::connection_lost(format!("module {module} exited"))))
+    }
+}
+
+struct ModuleEventSink {
+    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RuntimeEventSink for ModuleEventSink {
+    fn publish(&self, event: RuntimeEvent) {
+        if !self.alive.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut line = serde_json::to_string(&event).expect("serialize runtime event");
+        line.push('\n');
+        let stdin = Arc::clone(&self.stdin);
+        tokio::spawn(async move {
+            let mut stdin = stdin.lock().await;
+            let _ = stdin.write_all(line.as_bytes()).await;
+            let _ = stdin.flush().await;
+        });
+    }
+}
+
+struct Subscription {
+    id: u64,
+    host: Arc<ModuleHost>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.host.subscribers.lock().expect("subscribers lock poisoned").retain(|subscriber| subscriber.id != self.id);
+    }
+}
+
+/// 把模块宿主挂进 RuntimeServer 的 `Extension` 插槽。
+pub struct ModuleExtension(pub Arc<ModuleHost>);
+
+#[async_trait]
+impl Extension for ModuleExtension {
+    fn connect(&self, _owner_id: &str, events: mpsc::Sender<String>, disconnect: Arc<Notify>) -> ConnectionState {
+        let host = &self.0;
+        let id = host.next_subscriber.fetch_add(1, Ordering::Relaxed);
+        host.subscribers.lock().expect("subscribers lock poisoned").push(Subscriber { id, events, disconnect });
+        Box::new(Subscription { id, host: Arc::clone(host) })
+    }
+
+    async fn call(
+        &self, _owner_id: &str, _connection: &ConnectionState, method: &str, params: Value,
+    ) -> Result<Option<Value>, ResponseError> {
+        if method == LIST_METHOD {
+            return serde_json::to_value(self.0.list())
+                .map(Some)
+                .map_err(|error| ResponseError::runtime(error.to_string()));
+        }
+        let Some(rest) = method.strip_prefix(METHOD_PREFIX) else { return Ok(None) };
+        let Some((module, module_method)) = rest.split_once('/') else {
+            return Err(ResponseError::invalid_params(format!(
+                "module method must look like modules/<name>/<method>, got {method}"
+            )));
+        };
+        self.0.call_module(module, module_method, params).await.map(Some)
+    }
+
+    async fn disconnect(&self, connection: &ConnectionState) {
+        let subscription = connection.downcast_ref::<Subscription>().expect("module subscription");
+        self.0
+            .subscribers
+            .lock()
+            .expect("subscribers lock poisoned")
+            .retain(|subscriber| subscriber.id != subscription.id);
+    }
+
+    async fn shutdown(&self) {
+        let modules: Vec<Arc<ModuleProcess>> =
+            self.0.modules.lock().expect("modules lock poisoned").values().cloned().collect();
+        for module in modules {
+            let mut stdin = module.stdin.lock().await;
+            let _ = stdin.shutdown().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alwith_runtime_core::{AgentMetadata, Journal};
+    use alwith_runtime_ws::{AgentLauncher, RuntimeCommand, RuntimeServer, execute};
+
+    struct NoLauncher;
+
+    #[async_trait]
+    impl AgentLauncher for NoLauncher {
+        async fn prepare(&self, _: &str, _: &str, _: Value) -> Result<(Command, AgentMetadata), String> {
+            Err("no engines in this test".into())
+        }
+        fn version(&self) -> String {
+            "0.0.0-test".into()
+        }
+    }
+
+    /// 一个用 python 写的模块:回答 echo / fail,启动时发一个事件并向 Runtime 发一次 ping。
+    const MODULE_SCRIPT: &str = r#"#!/usr/bin/env python3
+import json, sys
+print(json.dumps({"type": "hello", "pid": 1}), flush=True)
+print(json.dumps({"id": 1, "method": "ping"}), flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    value = json.loads(line)
+    if "method" in value:
+        if value["method"] == "echo":
+            print(json.dumps({"id": value["id"], "result": value.get("params")}), flush=True)
+        else:
+            print(json.dumps({"id": value["id"], "error": {"code": -32601, "message": "unknown " + value["method"]}}), flush=True)
+    elif "id" in value:
+        print(json.dumps({"type": "runtime-answered", "result": value.get("result")}), flush=True)
+    elif "type" in value:
+        print(json.dumps({"type": "saw-runtime-event", "event": value["type"]}), flush=True)
+"#;
+
+    fn write_module(root: &Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("entry.py");
+        std::fs::write(&entry, MODULE_SCRIPT).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::json!({ "name": name, "version": "0.0.1", "entry": { "default": "entry.py" }, "persistent": true, "capabilities": ["network"] }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn discovers_plain_and_scoped_packages() {
+        let root = tempfile::tempdir().unwrap();
+        write_module(root.path(), "b-mod");
+        write_module(&root.path().join("@alwith"), "a-mod");
+        std::fs::create_dir_all(root.path().join("not-a-module")).unwrap();
+        let found = discover(root.path());
+        let names: Vec<&str> = found.iter().map(|(_, manifest)| manifest.name.as_str()).collect();
+        assert_eq!(names, vec!["a-mod", "b-mod"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn modules_answer_app_requests_and_can_call_the_runtime() {
+        if !Path::new("/usr/bin/env").exists() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        write_module(root.path(), "echo");
+        let journal = tempfile::tempdir().unwrap().keep();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal).unwrap()));
+        let host = ModuleHost::new(Arc::clone(&runtime), "0.3.0");
+        let server = RuntimeServer::new(
+            runtime,
+            Arc::new(NoLauncher),
+            Arc::new(ModuleExtension(Arc::clone(&host))),
+            String::new(),
+        );
+        let dispatch_server = server.clone();
+        host.set_dispatch(Arc::new(move |owner, method, params| {
+            let server = dispatch_server.clone();
+            Box::pin(async move {
+                let envelope = serde_json::json!({ "method": method, "params": params });
+                let command: RuntimeCommand =
+                    serde_json::from_value(envelope).map_err(ResponseError::invalid_params)?;
+                execute(&server, &owner, command).await
+            })
+        }));
+        let statuses = host.load_dir(root.path()).await;
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].alive && statuses[0].persistent);
+        assert!(host.has_persistent());
+
+        // 一条应用连接经 stdio 入口。
+        let (client_reader, server_writer) = tokio::io::duplex(64 * 1024);
+        let (server_reader, mut client_writer) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            alwith_runtime_stdio::serve(server, BufReader::new(server_reader), server_writer, std::future::pending())
+                .await
+                .unwrap();
+        });
+        let mut reader = BufReader::new(client_reader);
+        let request =
+            serde_json::json!({ "id": 7, "method": "modules/echo/echo", "params": { "x": 1 } }).to_string() + "\n";
+        client_writer.write_all(request.as_bytes()).await.unwrap();
+        let listing = serde_json::json!({ "id": 8, "method": "modules" }).to_string() + "\n";
+        client_writer.write_all(listing.as_bytes()).await.unwrap();
+        let unknown = serde_json::json!({ "id": 9, "method": "modules/echo/nope" }).to_string() + "\n";
+        client_writer.write_all(unknown.as_bytes()).await.unwrap();
+
+        // Runtime 的事件要到模块:模块把收到的事件类型回报成自己的事件。
+        host.runtime.publish(RuntimeEvent::Stderr { agent_id: "probe".into(), line: "hello module".into() });
+
+        let mut echoed = None;
+        let mut listed = None;
+        let mut failed = None;
+        let mut hello = false;
+        let mut runtime_answered = false;
+        let mut saw_runtime_event = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while echoed.is_none()
+            || listed.is_none()
+            || failed.is_none()
+            || !hello
+            || !runtime_answered
+            || !saw_runtime_event
+        {
+            let mut line = String::new();
+            tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await.expect("frames in time").unwrap();
+            let value: Value = serde_json::from_str(line.trim()).unwrap();
+            match (value.get("id").and_then(Value::as_u64), value.get("type").and_then(Value::as_str)) {
+                (Some(7), _) => echoed = value.get("result").cloned(),
+                (Some(8), _) => listed = value.get("result").cloned(),
+                (Some(9), _) => failed = value.pointer("/error/message").and_then(Value::as_str).map(str::to_string),
+                (_, Some("module")) => match value.pointer("/event/type").and_then(Value::as_str) {
+                    Some("hello") => hello = true,
+                    Some("runtime-answered") => {
+                        assert_eq!(value.pointer("/event/result"), Some(&Value::String("pong".into())));
+                        runtime_answered = true;
+                    }
+                    Some("saw-runtime-event") => {
+                        assert_eq!(value.pointer("/event/event"), Some(&Value::String("stderr".into())));
+                        saw_runtime_event = true;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        assert_eq!(echoed, Some(serde_json::json!({ "x": 1 })));
+        assert_eq!(listed.unwrap()[0]["name"], "echo");
+        assert_eq!(failed.unwrap(), "unknown nope");
+    }
+
+    #[tokio::test]
+    async fn a_full_event_queue_disconnects_the_slow_connection_instead_of_dropping_its_subscription() {
+        let journal = tempfile::tempdir().unwrap().keep();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal).unwrap()));
+        let host = ModuleHost::new(runtime, "0.3.0");
+        let extension = ModuleExtension(Arc::clone(&host));
+        let (events, mut receiver) = mpsc::channel::<String>(1);
+        let disconnect = Arc::new(Notify::new());
+        let _connection = extension.connect("web-1", events, Arc::clone(&disconnect));
+
+        host.broadcast("m", serde_json::json!({ "type": "one" }));
+        host.broadcast("m", serde_json::json!({ "type": "two" }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), disconnect.notified())
+            .await
+            .expect("slow connection told to disconnect");
+        assert_eq!(host.subscribers.lock().unwrap().len(), 1, "subscription stays until the connection drops");
+        assert!(receiver.recv().await.unwrap().contains("\"one\""));
+        drop(_connection);
+        assert!(host.subscribers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manifest_runtime_requirement_is_a_minimum_version() {
+        assert!(runtime_satisfies("0.3.0", ">=0.3.0").unwrap());
+        assert!(runtime_satisfies("0.10.1", ">=0.3.0").unwrap());
+        assert!(!runtime_satisfies("0.2.9", ">=0.3.0").unwrap());
+        assert!(runtime_satisfies("1.0.0", "0.3.0").unwrap());
+        assert!(runtime_satisfies("0.3.0", "^0.3").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_module_that_needs_a_newer_runtime_is_not_loaded() {
+        let root = tempfile::tempdir().unwrap();
+        write_module(root.path(), "future");
+        let manifest_path = root.path().join("future").join(MANIFEST_FILE);
+        let mut manifest: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["runtime"] = Value::String(">=9.0.0".into());
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let journal = tempfile::tempdir().unwrap().keep();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal).unwrap()));
+        let host = ModuleHost::new(runtime, "0.3.0");
+        let statuses = host.load_dir(root.path()).await;
+        assert!(statuses.is_empty(), "{statuses:?}");
+    }
+}

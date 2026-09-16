@@ -1,0 +1,1142 @@
+use alwith_api::{AgentMetadata, ResponseError, RuntimeEvent};
+use std::collections::{BTreeMap, HashMap};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, Command};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
+
+use crate::process::AgentProcess;
+use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
+
+/// 缺省日志目录:系统缓存目录下,「设置 → 缓存 → 清理」能一次收回。
+pub fn default_journal_root() -> std::path::PathBuf {
+    dirs::cache_dir().expect("platform cache directory").join("alwith").join("Runtime").join("sessions")
+}
+
+/// 一次 `session_events` 最多返回多少帧;客户端按 `sequence` 翻页。
+pub const SESSION_EVENTS_PAGE: usize = 2_000;
+
+const OUTPUT_BATCH_WINDOW: Duration = Duration::from_millis(16);
+const PORT_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSnapshot {
+    pub agent_id: String,
+    pub pid: Option<u32>,
+    pub owner_id: String,
+    pub provider: String,
+    pub model: String,
+    pub connection: String,
+}
+
+pub trait RuntimeEventSink: Send + Sync {
+    fn publish(&self, event: RuntimeEvent);
+}
+
+struct AgentHandle {
+    stdin: Arc<AsyncMutex<ChildStdin>>,
+    child: AgentProcess,
+    metadata: AgentMetadata,
+    failure: Option<String>,
+    initialize_request_id: Option<Value>,
+    initialize_response: Option<Value>,
+    /// Runtime 自己发出的 ACP 请求(id 形如 `rt-<n>`),等 agent 的响应。
+    pending_acp: HashMap<String, oneshot::Sender<Result<Value, ResponseError>>>,
+    next_acp_id: u64,
+}
+
+/// Runtime 发出的 ACP 请求 id 的前缀;应用自己发的帧用数字 id,两边不会撞。
+const ACP_REQUEST_ID_PREFIX: &str = "rt-";
+/// Runtime 代应用握手时报的协议版本。
+pub const ACP_PROTOCOL_VERSION: u64 = 2;
+
+pub struct Runtime {
+    registry: Mutex<RuntimeRegistry>,
+    journal: Journal,
+    agents: Mutex<HashMap<String, AgentHandle>>,
+    // 同一 agent 的跨代创建、收发、退出串行；不同 agent 互不等待。
+    lanes: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    sinks: Mutex<BTreeMap<u64, Weak<dyn RuntimeEventSink>>>,
+    next_sink_id: AtomicU64,
+    slow_mode_delay_ms: AtomicU64,
+    port_scanner_started: AtomicBool,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        let root = default_journal_root();
+        Self::with_journal(
+            Journal::open(&root).unwrap_or_else(|error| panic!("open Runtime journal at {}: {error}", root.display())),
+        )
+    }
+}
+
+impl Runtime {
+    pub fn with_journal(journal: Journal) -> Self {
+        Self {
+            registry: Mutex::default(),
+            journal,
+            agents: Mutex::default(),
+            lanes: Mutex::default(),
+            sinks: Mutex::default(),
+            next_sink_id: AtomicU64::default(),
+            slow_mode_delay_ms: AtomicU64::default(),
+            port_scanner_started: AtomicBool::default(),
+        }
+    }
+
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// 把注册表刚判定出的日志动作落盘。日志写失败不拖垮 ACP 通道,但必须报出来。
+    fn commit_journal(&self) {
+        let ops = self.registry.lock().expect("runtime registry lock poisoned").take_journal_ops();
+        if let Err(error) = self.journal.apply(&ops, now_ms()) {
+            log::error!("Runtime journal: {error}");
+            self.publish(RuntimeEvent::Stderr { agent_id: String::new(), line: format!("Runtime journal: {error}") });
+        }
+    }
+
+    fn lane(&self, agent_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut lanes = self.lanes.lock().expect("Runtime lanes lock poisoned");
+        if let Some(lane) = lanes.get(agent_id).and_then(Weak::upgrade) {
+            return lane;
+        }
+        lanes.retain(|_, lane| lane.strong_count() > 0);
+        let lane = Arc::new(AsyncMutex::new(()));
+        lanes.insert(agent_id.to_string(), Arc::downgrade(&lane));
+        lane
+    }
+
+    fn fail_agent(&self, agent_id: &str, error: String) {
+        let message = {
+            let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
+            let Some(handle) = agents.get_mut(agent_id) else { return };
+            if handle.failure.is_some() {
+                return;
+            }
+            handle.failure = Some(error.clone());
+            match handle.child.start_kill() {
+                Ok(()) => error,
+                Err(kill_error) => format!("{error}; stop agent failed: {kill_error}"),
+            }
+        };
+        // 保持 stdout task 存活，排空管道并正常交付 Exit；不再执行新请求。
+        self.publish(RuntimeEvent::Stderr { agent_id: agent_id.to_string(), line: message.clone() });
+        self.publish_agent_lines(
+            agent_id,
+            vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0", "method": "_alwith/runtimeError", "params": { "message": message }
+                })
+                .to_string(),
+            ],
+        );
+    }
+    pub fn add_sink(&self, sink: &Arc<dyn RuntimeEventSink>) -> u64 {
+        let sink_id = self.next_sink_id.fetch_add(1, Ordering::Relaxed);
+        self.sinks.lock().expect("Runtime sink lock poisoned").insert(sink_id, Arc::downgrade(sink));
+        sink_id
+    }
+
+    pub fn remove_sink(&self, sink_id: u64) {
+        self.sinks.lock().expect("Runtime sink lock poisoned").remove(&sink_id);
+    }
+
+    pub fn set_slow_mode(&self, delay_ms: u64) {
+        self.slow_mode_delay_ms.store(delay_ms, Ordering::Relaxed);
+    }
+
+    /// 起一个 agent 进程。同名进程还活着就是调用方的 bug(换芯 = 先停、等退出、再起),直接报错。
+    pub async fn start(
+        self: &Arc<Self>, agent_id: String, metadata: AgentMetadata, command: &mut Command,
+    ) -> Result<(), String> {
+        let lane = self.lane(&agent_id);
+        let _operation = lane.lock().await;
+        // 同名进程还活着就直接拒。换芯是「先停,等它真的退出,再起」—— 不隐式替换,于是
+        // 「同一个 agentId 的两个进程」这种东西不存在,迟到的输出也就没有归属歧义。
+        // 句柄在收尾(pump 读到 EOF → 收尸 → 广播 Exit)之前一直在表里,所以这一条同时挡住
+        // 「进程已死但还在排最后几行」的空窗。
+        if self.agents.lock().map_err(|error| error.to_string())?.contains_key(&agent_id) {
+            return Err(format!(
+                "agent {agent_id} is still running; stop it and wait for its exit before starting again"
+            ));
+        }
+        let removed_sessions = self
+            .registry
+            .lock()
+            .map_err(|error| error.to_string())?
+            .begin_agent(agent_id.clone(), metadata.owner_id.clone());
+        if !removed_sessions.is_empty() {
+            self.publish_run_states();
+        }
+
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let mut child = AgentProcess::spawn(command).map_err(|error| format!("spawn ACP agent: {error}"))?;
+        let stdin = child.inner().stdin.take().ok_or("ACP agent has no stdin")?;
+        let stdout = child.inner().stdout.take().ok_or("ACP agent has no stdout")?;
+        let stderr = child.inner().stderr.take().ok_or("ACP agent has no stderr")?;
+        self.agents.lock().map_err(|error| error.to_string())?.insert(
+            agent_id.clone(),
+            AgentHandle {
+                stdin: Arc::new(AsyncMutex::new(stdin)),
+                child,
+                metadata,
+                failure: None,
+                initialize_request_id: None,
+                initialize_response: None,
+                pending_acp: HashMap::new(),
+                next_acp_id: 1,
+            },
+        );
+
+        let runtime = Arc::clone(self);
+        let stdout_agent_id = agent_id.clone();
+        tokio::spawn(async move {
+            runtime.pump_stdout(stdout_agent_id, stdout).await;
+        });
+
+        self.start_port_scanner();
+
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let lane = runtime.lane(&agent_id);
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _operation = lane.lock().await;
+                runtime.publish(RuntimeEvent::Stderr { agent_id: agent_id.clone(), line });
+            }
+        });
+
+        Ok(())
+    }
+
+    pub async fn send(self: &Arc<Self>, agent_id: &str, line: String) -> Result<(), String> {
+        if !self.agents.lock().map_err(|error| error.to_string())?.contains_key(agent_id) {
+            return Err(format!("no agent process {agent_id}"));
+        }
+        let runtime = Arc::clone(self);
+        let agent_id = agent_id.to_string();
+        // 接受的请求由 Runtime 持有到投递记账结束；连接断开不能在意图与结果之间取消它。
+        tokio::spawn(async move { runtime.send_inner(&agent_id, line).await })
+            .await
+            .map_err(|error| format!("Runtime send task failed: {error}"))?
+    }
+
+    async fn send_inner(&self, agent_id: &str, line: String) -> Result<(), String> {
+        self.slow_mode_wait().await;
+        let lane = self.lane(agent_id);
+        let _operation = lane.lock().await;
+        let stdin = {
+            let agents = self.agents.lock().map_err(|error| error.to_string())?;
+            let handle = agents.get(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
+            if let Some(error) = &handle.failure {
+                return Err(error.clone());
+            }
+            Arc::clone(&handle.stdin)
+        };
+        let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        // ACP v2 每连接只握手一次;新属主(重载、接管)再发 `initialize` 时 Runtime 从缓存回放原响应,不再打扰引擎。
+        let method = value.get("method").and_then(Value::as_str);
+        let cached_initialize = method == Some("initialize")
+            && self
+                .agents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(agent_id)
+                .expect("agent under lane")
+                .initialize_response
+                .is_some();
+        if cached_initialize {
+            let request_id = value.get("id").ok_or("initialize requires request id")?;
+            let response = self
+                .agents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(agent_id)
+                .expect("agent under lane")
+                .initialize_response
+                .clone()
+                .ok_or("agent has no successful initialize response")?;
+            self.publish_agent_lines(
+                agent_id,
+                vec![
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": request_id, "result": response
+                    })
+                    .to_string(),
+                ],
+            );
+            return Ok(());
+        }
+        if value.get("method").and_then(Value::as_str) == Some("session/resume") {
+            // 两芯同一句 session/resume:引擎自己读 ALwith 记录。Runtime 只在请求发出前占住记录身份,
+            // 另一颗芯或另一个进程不能同时恢复同一份记录;引擎应答后注册表转正或释放占用。
+            let session_id =
+                value.pointer("/params/sessionId").and_then(Value::as_str).ok_or("resume missing sessionId")?;
+            value.get("id").ok_or("resume requires request id")?;
+            if session_id.is_empty() || session_id.contains(['/', '\\']) {
+                return Err("invalid recordId".into());
+            }
+            self.registry.lock().map_err(|error| error.to_string())?.reserve_session(agent_id, session_id)?;
+        }
+        value.as_object().ok_or("ACP envelope must be an object")?;
+        let wire_line = value.to_string();
+        let write_result = async {
+            let mut writer = stdin.lock().await;
+            writer.write_all(wire_line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await
+        }
+        .await;
+        if let Err(error) = write_result {
+            let message = format!("send to agent {agent_id} failed: {error}");
+            self.fail_agent(agent_id, message.clone());
+            return Err(message);
+        }
+        if value.get("method").and_then(Value::as_str) == Some("initialize") {
+            self.agents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get_mut(agent_id)
+                .expect("agent under lane")
+                .initialize_request_id = value.get("id").cloned();
+        }
+        self.publish(RuntimeEvent::Wire { agent_id: agent_id.to_string(), outbound: true, lines: vec![wire_line] });
+        let changed =
+            self.registry.lock().map_err(|error| error.to_string())?.record_outbound(agent_id, &line, now_ms());
+        self.commit_journal();
+        if changed {
+            self.publish_run_states();
+        }
+        self.publish(RuntimeEvent::Outbound { agent_id: agent_id.to_string(), line });
+        Ok(())
+    }
+
+    pub fn stop(&self, agent_id: &str) -> Result<(), String> {
+        if let Some(handle) = self.agents.lock().map_err(|error| error.to_string())?.get_mut(agent_id) {
+            handle.child.start_kill().map_err(|error| format!("stop agent {agent_id}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn stop_session(&self, session_id: &str) -> Result<(), String> {
+        if let Some(agent_id) = self.agent_id_for_session(session_id) {
+            self.stop(&agent_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn kill_all(&self) {
+        self.agents.lock().expect("runtime agents lock poisoned").clear();
+    }
+
+    pub fn agent_snapshots(&self) -> Vec<AgentSnapshot> {
+        self.agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .iter()
+            .map(|(agent_id, handle)| AgentSnapshot {
+                agent_id: agent_id.clone(),
+                pid: handle.child.id(),
+                owner_id: handle.metadata.owner_id.clone(),
+                provider: handle.metadata.provider.clone(),
+                model: handle.metadata.model.clone(),
+                connection: handle.metadata.connection.clone(),
+            })
+            .collect()
+    }
+
+    /// 属主连接断开后 owner 置空 = 孤儿:任何连接可直接 stop(回收),或经 attach 认领
+    pub fn agent_orphaned(&self, agent_id: &str) -> bool {
+        self.agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .get(agent_id)
+            .is_some_and(|handle| handle.metadata.owner_id.is_empty())
+    }
+
+    pub fn owns_agent(&self, agent_id: &str, owner_id: &str) -> bool {
+        self.agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .get(agent_id)
+            .is_some_and(|handle| handle.metadata.owner_id == owner_id)
+    }
+
+    pub fn agent_id_for_session(&self, session_id: &str) -> Option<String> {
+        self.registry.lock().expect("runtime registry lock poisoned").agent_id_for_session(session_id)
+    }
+
+    /// 该 agent 当前的属主(空串 = 无主);没有这个 agent 返回 None。
+    pub fn agent_owner(&self, agent_id: &str) -> Option<String> {
+        self.agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .get(agent_id)
+            .map(|handle| handle.metadata.owner_id.clone())
+    }
+
+    /// 一条连接断开:它自己(`root`)和它名下所有子属主(`root:<label>`)一并改挂无主。
+    pub fn detach_owners_under(&self, root: &str) -> bool {
+        let prefix = format!("{root}:");
+        let mut owners: std::collections::BTreeSet<String> = self
+            .agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .values()
+            .map(|handle| handle.metadata.owner_id.clone())
+            .filter(|owner| owner.starts_with(&prefix))
+            .collect();
+        owners.extend(
+            self.run_states().into_iter().map(|state| state.owner_id).filter(|owner| owner.starts_with(&prefix)),
+        );
+        let mut changed = self.detach_owner(root);
+        for owner in owners {
+            changed |= self.detach_owner(&owner);
+        }
+        changed
+    }
+
+    pub fn run_states(&self) -> Vec<SessionRunState> {
+        self.registry.lock().expect("runtime registry lock poisoned").run_states()
+    }
+
+    /// 会话的全部帧原文(移动端 attach 回放用),已答过的权限请求剔除。
+    pub fn session_replay(&self, session_id: &str) -> Vec<String> {
+        self.session_events(session_id, None, usize::MAX).into_iter().map(|frame| frame.line).collect()
+    }
+
+    /// 生命周期帧(prompt / 权限请求 / 工具状态迁移),不含 AI 正文;agent 收尾后仍可查。
+    pub fn session_lifecycle(&self, session_id: &str) -> Vec<crate::SessionLifecycleFrame> {
+        self.session_events(session_id, None, usize::MAX)
+            .into_iter()
+            .filter(|frame| serde_json::from_str::<Value>(&frame.line).is_ok_and(|value| is_lifecycle_line(&value)))
+            .map(|frame| crate::SessionLifecycleFrame {
+                sequence: frame.sequence,
+                recorded_at: frame.recorded_at,
+                line: frame.line,
+            })
+            .collect()
+    }
+
+    /// `after_sequence` 之后的会话帧,最多 `limit` 条;晚加入的端靠它补齐。
+    /// 已答复的 `session/request_permission` 不再给出 —— 重放它就会被答两次。
+    pub fn session_events(
+        &self, session_id: &str, after_sequence: Option<u64>, limit: usize,
+    ) -> Vec<SessionEventFrame> {
+        let pending = self.registry.lock().expect("runtime registry lock poisoned").pending_permission_ids(session_id);
+        let frames = match self.journal.read_since(session_id, after_sequence, limit) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log::error!("Runtime journal: {error}");
+                return Vec::new();
+            }
+        };
+        filter_answered_permissions(frames, &pending)
+    }
+
+    pub fn mark_read(&self, session_id: &str) -> bool {
+        let changed = self.registry.lock().expect("runtime registry lock poisoned").mark_read(session_id);
+        if changed {
+            self.publish_run_states();
+        }
+        changed
+    }
+
+    /// 执行租约显式释放(见 `RuntimeRegistry::release_execution`),有变化即广播。
+    pub fn release_execution(&self, execution_id: &str) -> bool {
+        let changed = self.registry.lock().expect("runtime registry lock poisoned").release_execution(execution_id);
+        if changed {
+            self.publish_run_states();
+        }
+        changed
+    }
+
+    pub fn set_title(&self, session_id: &str, title: String) -> bool {
+        let changed = self.registry.lock().expect("runtime registry lock poisoned").set_title(session_id, title);
+        if changed {
+            self.publish_run_states();
+        }
+        changed
+    }
+
+    pub fn detach_owner(&self, owner_id: &str) -> bool {
+        for handle in self
+            .agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .values_mut()
+            .filter(|handle| handle.metadata.owner_id == owner_id)
+        {
+            handle.metadata.owner_id.clear();
+        }
+        let changed = self.registry.lock().expect("runtime registry lock poisoned").detach_owner(owner_id);
+        if changed {
+            self.publish_run_states();
+        }
+        changed
+    }
+
+    pub async fn attach(&self, session_id: &str, owner_id: String) -> Option<AttachInfo> {
+        loop {
+            let agent_id =
+                self.registry.lock().expect("runtime registry lock poisoned").agent_id_for_session(session_id)?;
+            let lane = self.lane(&agent_id);
+            let _operation = lane.lock().await;
+            let info = {
+                let mut registry = self.registry.lock().expect("runtime registry lock poisoned");
+                // 等待期间可能换了持有者；重新定位对应的 agent lane。
+                if registry.agent_id_for_session(session_id).as_deref() != Some(agent_id.as_str()) {
+                    continue;
+                }
+                let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
+                let handle = agents.get_mut(&agent_id)?;
+                let mut info = registry.attach(session_id, owner_id.clone())?;
+                handle.metadata.owner_id = owner_id.clone();
+                info.engine = handle.metadata.engine.clone();
+                info.provider = handle.metadata.provider.clone();
+                info
+            };
+            self.publish_run_states();
+            return Some(info);
+        }
+    }
+
+    pub fn release_session(&self, session_id: &str, owner_id: &str) -> bool {
+        let mut registry = self.registry.lock().expect("runtime registry lock poisoned");
+        let Some(agent_id) = registry.agent_id_for_session(session_id) else { return false };
+        if !registry.release_session(session_id, owner_id) {
+            return false;
+        }
+        if let Some(handle) = self.agents.lock().expect("runtime agents lock poisoned").get_mut(&agent_id) {
+            handle.metadata.owner_id.clear();
+        }
+        drop(registry);
+        self.publish_run_states();
+        true
+    }
+
+    /// 必须持有 agent lane。会话身份就是引擎报的 sessionId(两芯都以它命名 ALwith 记录),Runtime 不做翻译。
+    /// 返回 `None` 的帧是 Runtime 自己发出的请求的响应:记日志、不进 `inbound`(应用没发过它)。
+    fn accept_line(&self, agent_id: &str, line: String) -> Result<Option<String>, String> {
+        let value = serde_json::from_str::<Value>(&line).ok();
+        let mut answered_runtime_request = false;
+        {
+            let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
+            let handle = agents.get_mut(agent_id).ok_or("agent stopped while receiving")?;
+            if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
+                && let Some(id) = response.get("id").and_then(Value::as_str)
+                && let Some(sender) = handle.pending_acp.remove(id)
+            {
+                let outcome = match response.get("error") {
+                    Some(error) if !error.is_null() => Err(ResponseError::parse(error)),
+                    _ => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
+                };
+                let _ = sender.send(outcome);
+                answered_runtime_request = true;
+            }
+            // ACP v2 每连接只握手一次；后续窗口接管读取这份原始响应。
+            if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
+                && handle.initialize_request_id.is_some()
+                && response.get("id") == handle.initialize_request_id.as_ref()
+            {
+                handle.initialize_request_id = None;
+                if response.get("error").is_none() {
+                    handle.initialize_response =
+                        Some(response.get("result").ok_or("initialize response missing result")?.clone());
+                }
+            }
+        }
+        self.registry.lock().map_err(|error| error.to_string())?.record_inbound_batch(
+            agent_id,
+            std::slice::from_ref(&line),
+            now_ms(),
+        );
+        self.commit_journal();
+        Ok(if answered_runtime_request { None } else { Some(line) })
+    }
+
+    async fn pump_stdout(self: Arc<Self>, agent_id: String, stdout: tokio::process::ChildStdout) {
+        let mut reader = BufReader::new(stdout).lines();
+        let lane = self.lane(&agent_id);
+        loop {
+            let first = match reader.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    let _operation = lane.lock().await;
+                    self.fail_agent(&agent_id, format!("read agent stdout: {error}"));
+                    break;
+                }
+            };
+            let mut batch = vec![first];
+            let deadline = tokio::time::Instant::now() + OUTPUT_BATCH_WINDOW;
+            let mut reached_end = false;
+            loop {
+                match tokio::time::timeout_at(deadline, reader.next_line()).await {
+                    Ok(Ok(Some(line))) => batch.push(line),
+                    Ok(Ok(None)) => {
+                        reached_end = true;
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        let _operation = lane.lock().await;
+                        self.fail_agent(&agent_id, format!("read agent stdout: {error}"));
+                        reached_end = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            self.slow_mode_wait().await;
+            let _operation = lane.lock().await;
+            if !self.agents.lock().expect("runtime agents lock poisoned").contains_key(&agent_id) {
+                break;
+            }
+            self.publish(RuntimeEvent::Wire { agent_id: agent_id.clone(), outbound: false, lines: batch.clone() });
+            let active = self
+                .agents
+                .lock()
+                .expect("runtime agents lock poisoned")
+                .get(&agent_id)
+                .is_some_and(|handle| handle.failure.is_none());
+            if active {
+                let mut accepted = Vec::new();
+                for line in batch {
+                    match self.accept_line(&agent_id, line) {
+                        Ok(Some(line)) => accepted.push(line),
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.fail_agent(&agent_id, error);
+                            break;
+                        }
+                    }
+                }
+                if !accepted.is_empty() {
+                    self.publish_agent_lines(&agent_id, accepted);
+                }
+                self.publish_run_states();
+            }
+            if reached_end {
+                break;
+            }
+        }
+        let _operation = lane.lock().await;
+        // 旧进程已经由替换操作收尾；不能向新进程的订阅者交付旧 Exit。
+        let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
+        let mut handle = self.agents.lock().expect("runtime agents lock poisoned").remove(&agent_id);
+        if let Some(handle) = &mut handle {
+            for (_, sender) in handle.pending_acp.drain() {
+                let _ = sender.send(Err(ResponseError::runtime(format!("agent {agent_id} exited"))));
+            }
+            // stdout 关闭即 ACP 通道终止；不能等待仍存活的进程无限占住 agent lane。
+            if let Err(error) = handle.child.stop_and_wait().await {
+                self.publish(RuntimeEvent::Stderr {
+                    agent_id: agent_id.clone(),
+                    line: format!("stop and wait agent exit: {error}"),
+                });
+            }
+        }
+        if changed {
+            self.publish_run_states();
+        }
+        self.publish(RuntimeEvent::Exit { agent_id });
+    }
+
+    fn publish_agent_lines(&self, agent_id: &str, lines: Vec<String>) {
+        for line in &lines {
+            let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
+            let Some(method) = value.get("method").and_then(Value::as_str) else { continue };
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            match value.get("id") {
+                Some(id) if !id.is_null() => self.publish(RuntimeEvent::AcpAgentRequest {
+                    agent_id: agent_id.to_string(),
+                    id: id.clone(),
+                    method: method.to_string(),
+                    params,
+                }),
+                _ => self.publish(RuntimeEvent::AcpNotification {
+                    agent_id: agent_id.to_string(),
+                    method: method.to_string(),
+                    params,
+                }),
+            }
+        }
+        self.publish(RuntimeEvent::Inbound { agent_id: agent_id.to_string(), lines });
+    }
+
+    /// Runtime 代应用向 agent 发一条 ACP 请求并等响应。经 `send` 同一条路:信封、日志、运行态都照常。
+    /// 错误分两种:Runtime 自己的(没有该 agent、agent 中途退出,`ResponseError::RUNTIME`)和 agent 回的
+    /// ACP 错误(code / data 原样)。
+    /// `request_id`:应用自己选的 JSON-RPC id(字符串或数字),要发 `$/cancel_request` 撤回时才需要;
+    /// 不传由 Runtime 编(`rt-<n>`)。同一 agent 上还没答的 id 不能重用。
+    pub async fn acp_request(
+        self: &Arc<Self>, agent_id: &str, method: &str, params: Value, request_id: Option<Value>,
+    ) -> Result<Value, ResponseError> {
+        let (id, receiver) = {
+            let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
+            let handle = agents.get_mut(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
+            if method == "initialize"
+                && let Some(cached) = &handle.initialize_response
+            {
+                return Ok(cached.clone());
+            }
+            let id = match request_id {
+                Some(Value::String(id)) => id,
+                Some(Value::Number(id)) => id.to_string(),
+                Some(other) => {
+                    return Err(ResponseError::invalid_params(format!(
+                        "request id must be a string or number, got {other}"
+                    )));
+                }
+                None => {
+                    let id = format!("{ACP_REQUEST_ID_PREFIX}{}", handle.next_acp_id);
+                    handle.next_acp_id += 1;
+                    id
+                }
+            };
+            if handle.pending_acp.contains_key(&id) {
+                return Err(ResponseError::invalid_params(format!(
+                    "request id {id} is still pending on agent {agent_id}"
+                )));
+            }
+            let (sender, receiver) = oneshot::channel();
+            handle.pending_acp.insert(id.clone(), sender);
+            (id, receiver)
+        };
+        let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        if let Err(error) = self.send(agent_id, frame.to_string()).await {
+            if let Ok(mut agents) = self.agents.lock()
+                && let Some(handle) = agents.get_mut(agent_id)
+            {
+                handle.pending_acp.remove(&id);
+            }
+            return Err(error.into());
+        }
+        receiver.await.unwrap_or_else(|_| {
+            Err(ResponseError::runtime(format!("agent {agent_id} exited before answering {method}")))
+        })
+    }
+
+    /// 向 agent 发一条 ACP 通知(`session/cancel` 等)。
+    pub async fn acp_notify(
+        self: &Arc<Self>, agent_id: &str, method: &str, params: Value,
+    ) -> Result<(), ResponseError> {
+        let frame = serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        self.send(agent_id, frame.to_string()).await.map_err(ResponseError::runtime)
+    }
+
+    /// 回答 agent 发来的请求(`acpAgentRequest` 事件里的那个 `id`)。
+    pub async fn acp_respond(
+        self: &Arc<Self>, agent_id: &str, id: Value, result: Option<Value>, error: Option<Value>,
+    ) -> Result<(), ResponseError> {
+        let frame = match error {
+            Some(error) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+            None => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result.unwrap_or(Value::Null) }),
+        };
+        self.send(agent_id, frame.to_string()).await.map_err(ResponseError::runtime)
+    }
+
+    /// 握手一次;已握过(应用自己发过 `initialize`,或 Runtime 代发过)就用缓存。
+    /// 应用要声明自己的客户端能力(如 elicitation)就在第一次会话操作前先调 `initialize`。
+    pub async fn ensure_initialized(
+        self: &Arc<Self>, agent_id: &str, client_version: &str, info: Option<Value>, capabilities: Option<Value>,
+    ) -> Result<Value, ResponseError> {
+        self.acp_request(
+            agent_id,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": ACP_PROTOCOL_VERSION,
+                "info": info.unwrap_or_else(|| serde_json::json!({ "name": "alwith-runtime", "version": client_version })),
+                "capabilities": capabilities.unwrap_or_else(|| serde_json::json!({}))
+            }),
+            None,
+        )
+        .await
+    }
+
+    fn publish_run_states(&self) {
+        self.publish(RuntimeEvent::RunStates { sessions: self.run_states() });
+    }
+
+    fn start_port_scanner(self: &Arc<Self>) {
+        if self.port_scanner_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            loop {
+                runtime.scan_agent_ports().await;
+                tokio::time::sleep(PORT_SCAN_INTERVAL).await;
+            }
+        });
+    }
+
+    async fn scan_agent_ports(&self) {
+        let agents = self
+            .agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .iter()
+            .map(|(agent_id, handle)| (agent_id.clone(), handle.child.id().expect("running ACP agent has process id")))
+            .collect::<Vec<_>>();
+        if agents.is_empty() {
+            return;
+        }
+        let root_process_ids = agents.iter().map(|(_, process_id)| *process_id).collect::<Vec<_>>();
+        let ports_by_root =
+            match tokio::task::spawn_blocking(move || crate::port_scanner::listening_ports_by_root(&root_process_ids))
+                .await
+                .expect("port scanner task")
+            {
+                Ok(ports_by_root) => ports_by_root,
+                Err(error) => {
+                    // 跨平台系统 socket 表可能瞬时读取失败；保留上一份端口快照，下一轮重试。
+                    log::warn!("[Runtime] scan agent listening ports failed: {error}");
+                    return;
+                }
+            };
+        // 扫描期间进程可能换了(停掉又起了一个同名的):按 pid 认人,不是同一个就不记它的端口。
+        let current_process_ids = self
+            .agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .iter()
+            .map(|(agent_id, handle)| (agent_id.clone(), handle.child.id()))
+            .collect::<HashMap<_, _>>();
+        let mut changed = false;
+        let mut registry = self.registry.lock().expect("runtime registry lock poisoned");
+        for (agent_id, process_id) in agents {
+            if current_process_ids.get(&agent_id) == Some(&Some(process_id)) {
+                changed |= registry.set_agent_listening_ports(
+                    &agent_id,
+                    ports_by_root.get(&process_id).expect("scanned root process").clone(),
+                );
+            }
+        }
+        drop(registry);
+        if changed {
+            self.publish_run_states();
+        }
+    }
+
+    /// 向所有已注册的 sink 广播一条事件。Runtime 自己用它,宿主也可以用它注入事件(如 stderr 提示)。
+    pub fn publish(&self, event: RuntimeEvent) {
+        let sinks: Vec<Arc<dyn RuntimeEventSink>> = {
+            let mut registered = self.sinks.lock().expect("Runtime sink lock poisoned");
+            let sinks = registered.values().filter_map(Weak::upgrade).collect();
+            registered.retain(|_, sink| sink.strong_count() > 0);
+            sinks
+        };
+        for sink in sinks {
+            sink.publish(event.clone());
+        }
+    }
+
+    async fn slow_mode_wait(&self) {
+        let delay_ms = self.slow_mode_delay_ms.load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+}
+
+/// 只保留仍未答复的权限请求,其余帧原样。
+fn filter_answered_permissions(frames: Vec<SessionEventFrame>, pending_ids: &[String]) -> Vec<SessionEventFrame> {
+    frames
+        .into_iter()
+        .filter(|frame| {
+            let Ok(value) = serde_json::from_str::<Value>(&frame.line) else { return true };
+            if value.get("method").and_then(Value::as_str) != Some("session/request_permission") {
+                return true;
+            }
+            value.get("id").map(ToString::to_string).is_some_and(|id| pending_ids.contains(&id))
+        })
+        .collect()
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before UNIX epoch").as_millis() as i64
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn test_runtime() -> Runtime {
+        let root = tempfile::tempdir().expect("temp journal dir").keep();
+        Runtime::with_journal(Journal::open(root).expect("open test journal"))
+    }
+
+    struct ChannelSink {
+        sender: mpsc::UnboundedSender<RuntimeEvent>,
+    }
+
+    impl RuntimeEventSink for ChannelSink {
+        fn publish(&self, event: RuntimeEvent) {
+            self.sender.send(event).expect("runtime event receiver");
+        }
+    }
+
+    fn metadata(engine: &str) -> AgentMetadata {
+        AgentMetadata {
+            owner_id: "main".into(),
+            engine: engine.into(),
+            provider: "test".into(),
+            model: "test".into(),
+            connection: "test".into(),
+        }
+    }
+
+    // cat 阻塞在被持有的 piped stdin 上,进程存活到 runtime drop(kill_on_drop)
+    async fn dsh_runtime() -> Arc<Runtime> {
+        let runtime = Arc::new(test_runtime());
+        runtime.start("agent".into(), metadata("dsh"), &mut Command::new("cat")).await.unwrap();
+        runtime
+    }
+
+    #[tokio::test]
+    async fn resume_reserves_the_record_for_every_engine_until_the_engine_answers() {
+        for engine in ["alwith", "dsh"] {
+            let runtime = Arc::new(test_runtime());
+            runtime.start("agent".into(), metadata(engine), &mut Command::new("cat")).await.unwrap();
+            runtime.start("other".into(), metadata(engine), &mut Command::new("cat")).await.unwrap();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+            runtime.add_sink(&sink);
+            let request = r#"{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"record","cwd":"/p","replayFrom":{"type":"start"}}}"#;
+            runtime.send("agent", request.to_string()).await.unwrap();
+            // 引擎应答前记录身份就归这个 agent;另一颗芯或另一个进程不能同时恢复同一份记录。
+            assert_eq!(runtime.agent_id_for_session("record").as_deref(), Some("agent"));
+            let error = runtime.send("other", request.into()).await.unwrap_err();
+            assert!(error.contains("already active or opening"), "{error}");
+            assert!(runtime.agents.lock().unwrap()["other"].failure.is_none());
+            // 发给引擎的是标准 session/resume:replayFrom 原样透传,只剥 Runtime 信封。
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+                if let RuntimeEvent::Wire { outbound: true, lines, .. } = event {
+                    let wire: Value = serde_json::from_str(&lines[0]).unwrap();
+                    assert_eq!(wire["method"], "session/resume");
+                    assert_eq!(wire["params"]["replayFrom"]["type"], "start");
+                    assert!(wire.get("_alwithRuntime").is_none());
+                    break;
+                }
+            }
+            runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#.into()).unwrap();
+            assert_eq!(runtime.agent_id_for_session("record").as_deref(), Some("agent"));
+            // 同一进程再次接回自己的会话不算抢占。
+            runtime.send("agent", request.into()).await.unwrap();
+            runtime.stop("agent").unwrap();
+            runtime.stop("other").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_initialize_is_answered_from_cache_without_reaching_the_engine() {
+        let runtime = dsh_runtime().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        // 还没有成功的握手:initialize 照常送到引擎(与 initialize 不同,它是真握手)。
+        runtime.send("agent", r#"{"jsonrpc":"2.0","id":20,"method":"initialize","params":{}}"#.into()).await.unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+            if let RuntimeEvent::Wire { outbound: true, lines, .. } = event {
+                assert!(lines[0].contains(r#""id":20"#), "the first initialize reaches the engine");
+                break;
+            }
+        }
+        // 相同 id 的服务端请求不能冒充握手响应,失败的握手也不进缓存。
+        runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":20,"method":"test","params":{}}"#.into()).unwrap();
+        runtime
+            .accept_line("agent", r#"{"jsonrpc":"2.0","id":20,"error":{"code":-32602,"message":"rejected"}}"#.into())
+            .unwrap();
+        runtime.send("agent", r#"{"jsonrpc":"2.0","id":29,"method":"initialize","params":{}}"#.into()).await.unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+            if let RuntimeEvent::Wire { outbound: true, lines, .. } = event {
+                assert!(lines[0].contains(r#""id":29"#), "握手失败过就没有缓存,这一条照常送到引擎");
+                break;
+            }
+        }
+        runtime.send("agent", r#"{"jsonrpc":"2.0","id":21,"method":"initialize","params":{}}"#.into()).await.unwrap();
+        let response = serde_json::json!({"protocolVersion":2,"info":{"name":"test","version":"1"},"capabilities":{"session":{"resume":{},"fork":{}},"providers":{}}});
+        runtime
+            .accept_line("agent", serde_json::json!({"jsonrpc":"2.0","id":21,"result":response}).to_string())
+            .unwrap();
+        // 排空 id 21 那次真握手的出站帧,后面的断言只看缓存回放。
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+            if let RuntimeEvent::Wire { outbound: true, lines, .. } = event
+                && lines[0].contains(r#""id":21"#)
+            {
+                break;
+            }
+        }
+        for request_id in [30, 31] {
+            runtime
+                .send(
+                    "agent",
+                    serde_json::json!({"jsonrpc":"2.0","id":request_id,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"second","version":"1"}}})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+                assert!(
+                    !matches!(event, RuntimeEvent::Wire { outbound: true, .. }),
+                    "initialize state must not reach the engine"
+                );
+                if let RuntimeEvent::Inbound { lines, .. } = event {
+                    let result: Value = serde_json::from_str(&lines[0]).unwrap();
+                    if result["id"] == request_id && result.get("method").is_none() {
+                        assert_eq!(result["result"], response);
+                        break;
+                    }
+                }
+            }
+        }
+        runtime.stop("agent").unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_handshake_cache_does_not_survive_a_restart() {
+        let runtime = dsh_runtime().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        runtime.send("agent", r#"{"id":20,"method":"initialize","params":{}}"#.into()).await.unwrap();
+        runtime.accept_line("agent", r#"{"id":20,"result":{"protocolVersion":2,"capabilities":{}}}"#.into()).unwrap();
+        let metadata = runtime.agents.lock().unwrap().get("agent").unwrap().metadata.clone();
+        // 重起 = 先停、等它真的退出、再起。
+        runtime.stop("agent").unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+            if matches!(event, RuntimeEvent::Exit { .. }) {
+                break;
+            }
+        }
+        runtime.start("agent".into(), metadata, &mut Command::new("cat")).await.unwrap();
+        // 新进程没握过手:这一条送到引擎,不从缓存回答。
+        runtime.send("agent", r#"{"id":30,"method":"initialize","params":{}}"#.into()).await.unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+            if let RuntimeEvent::Wire { outbound: true, lines, .. } = event
+                && lines[0].contains(r#""id":30"#)
+            {
+                break;
+            }
+        }
+        runtime.stop("agent").unwrap();
+    }
+
+    /// 换芯 = 先停、等它退出、再起。进程还在就不许起同名的第二个 —— 这一条替掉了旧的代次机制:
+    /// 没有「同一个 agentId 的两个进程」,迟到的输出也就没有归属歧义。
+    #[tokio::test]
+    async fn starting_a_live_agent_again_is_refused_until_it_exits() {
+        let runtime = dsh_runtime().await;
+        let metadata = runtime.agents.lock().unwrap()["agent"].metadata.clone();
+        let error = runtime.start("agent".into(), metadata.clone(), &mut Command::new("cat")).await.unwrap_err();
+        assert!(error.contains("still running"), "{error}");
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        runtime.stop("agent").unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+            if matches!(event, RuntimeEvent::Exit { .. }) {
+                break;
+            }
+        }
+        // 收到 Exit 就是「它真的没了」:此刻起同名进程一定成功。
+        runtime.start("agent".into(), metadata, &mut Command::new("cat")).await.unwrap();
+        runtime.stop("agent").unwrap();
+    }
+
+    #[tokio::test]
+    async fn batches_stdout_and_removes_exited_process() {
+        let runtime = Arc::new(test_runtime());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%s\\n' first second"]);
+
+        runtime.start("agent-1".to_string(), metadata("alwith"), &mut command).await.expect("start test agent");
+
+        let mut received_lines = None;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("runtime event timeout")
+                .expect("runtime event channel");
+            match event {
+                RuntimeEvent::Inbound { lines, .. } => received_lines = Some(lines),
+                RuntimeEvent::Exit { agent_id } => {
+                    assert_eq!(agent_id, "agent-1");
+                    break;
+                }
+                RuntimeEvent::Wire { .. }
+                | RuntimeEvent::Outbound { .. }
+                | RuntimeEvent::Stderr { .. }
+                | RuntimeEvent::RunStates { .. }
+                | RuntimeEvent::AcpNotification { .. }
+                | RuntimeEvent::AcpAgentRequest { .. } => {}
+            }
+        }
+
+        assert_eq!(received_lines, Some(vec!["first".to_string(), "second".to_string()]));
+        assert!(runtime.agent_snapshots().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_returns_spawn_time_provider() {
+        let runtime = Arc::new(test_runtime());
+        let mut command = Command::new("cat");
+        runtime
+            .start(
+                "agent-1".to_string(),
+                AgentMetadata {
+                    owner_id: "main".to_string(),
+                    engine: "alwith".to_string(),
+                    provider: "kimi".to_string(),
+                    model: "test".to_string(),
+                    connection: "test".to_string(),
+                },
+                &mut command,
+            )
+            .await
+            .expect("start test agent");
+
+        {
+            let mut registry = runtime.registry.lock().expect("runtime registry lock poisoned");
+            registry.record_outbound(
+                "agent-1",
+                r#"{"jsonrpc":"2.0","id":1,"method":"session/resume","params":{"sessionId":"session-1","cwd":"/project"}}"#,
+                1,
+            );
+            registry.record_inbound_batch(
+                "agent-1",
+                &[r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-1"}}"#.into()],
+                2,
+            );
+        }
+
+        let info = runtime.attach("session-1", "browser".to_string()).await.expect("attach live agent");
+        // provider_id 必须是 spawn 时定死的 metadata.provider —— registry 层只填空串占位,
+        // 丢掉 runtime 层这次回填,空 providerId 会一路流到前端盖章
+        assert_eq!(info.provider, "kimi");
+    }
+}
