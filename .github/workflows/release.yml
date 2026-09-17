@@ -65,15 +65,9 @@ jobs:
       - run: cargo test --locked --workspace --target ${{ matrix.target }}
         if: ${{ !contains(matrix.target, 'x86_64-apple') }}
       - run: cargo build --release --locked -p alwith-runtime --target ${{ matrix.target }}
-      - name: Package
-        shell: bash
-        run: |
-          set -euo pipefail
-          exe=""; case "${{ matrix.target }}" in *windows*) exe=".exe";; esac
-          mkdir -p dist/stage
-          cp "target/${{ matrix.target }}/release/alwith-runtime$exe" dist/stage/
-          tar -C dist/stage -czf "dist/alwith-runtime-${{ matrix.target }}.tar.gz" "alwith-runtime$exe"
-          rm -r dist/stage
+      # 包里除了二进制还有 LICENSE、第三方许可原文、BUILD.json:应用的 stage 脚本缺一个就拒装。
+      - uses: oven-sh/setup-bun@v2
+      - run: bun scripts/package-release.ts ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: alwith-runtime-${{ matrix.target }}
