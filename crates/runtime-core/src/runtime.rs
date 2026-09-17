@@ -56,6 +56,17 @@ const ACP_REQUEST_ID_PREFIX: &str = "rt-";
 /// Runtime 代应用握手时报的协议版本。
 pub const ACP_PROTOCOL_VERSION: u64 = 2;
 
+/// agent 的一帧,连同它在会话日志里的位置(进了日志才有)。
+struct AcceptedLine {
+    line: String,
+    stamp: Option<(String, u64)>,
+}
+
+/// 一批日志动作里这一帧落在哪:一行最多进一次日志,取第一条即可。
+fn journal_stamp(stamps: Vec<(String, u64)>) -> Option<(String, u64)> {
+    stamps.into_iter().next()
+}
+
 pub struct Runtime {
     registry: Mutex<RuntimeRegistry>,
     journal: Journal,
@@ -95,12 +106,26 @@ impl Runtime {
         &self.journal
     }
 
-    /// 把注册表刚判定出的日志动作落盘。日志写失败不拖垮 ACP 通道,但必须报出来。
-    fn commit_journal(&self) {
+    /// 把注册表刚判定出的日志动作落盘,返回每条落盘帧的 `(sessionId, sequence)`(与 Append 动作同序),
+    /// 发活事件时盖在帧上。日志写失败不拖垮 ACP 通道,但必须报出来。
+    fn commit_journal(&self) -> Vec<(String, u64)> {
         let ops = self.registry.lock().expect("runtime registry lock poisoned").take_journal_ops();
-        if let Err(error) = self.journal.apply(&ops, now_ms()) {
-            log::error!("Runtime journal: {error}");
-            self.publish(RuntimeEvent::Stderr { agent_id: String::new(), line: format!("Runtime journal: {error}") });
+        match self.journal.apply(&ops, now_ms()) {
+            Ok(frames) => {
+                let appended = ops.iter().filter_map(|op| match op {
+                    crate::JournalOp::Append { session_id, .. } => Some(session_id.clone()),
+                    crate::JournalOp::Reset { .. } => None,
+                });
+                appended.zip(frames).map(|(session_id, frame)| (session_id, frame.sequence)).collect()
+            }
+            Err(error) => {
+                log::error!("Runtime journal: {error}");
+                self.publish(RuntimeEvent::Stderr {
+                    agent_id: String::new(),
+                    line: format!("Runtime journal: {error}"),
+                });
+                Vec::new()
+            }
         }
     }
 
@@ -132,12 +157,13 @@ impl Runtime {
         self.publish(RuntimeEvent::Stderr { agent_id: agent_id.to_string(), line: message.clone() });
         self.publish_agent_lines(
             agent_id,
-            vec![
-                serde_json::json!({
+            vec![AcceptedLine {
+                line: serde_json::json!({
                     "jsonrpc": "2.0", "method": "_alwith/runtimeError", "params": { "message": message }
                 })
                 .to_string(),
-            ],
+                stamp: None,
+            }],
         );
     }
     pub fn add_sink(&self, sink: &Arc<dyn RuntimeEventSink>) -> u64 {
@@ -267,12 +293,13 @@ impl Runtime {
                 .ok_or("agent has no successful initialize response")?;
             self.publish_agent_lines(
                 agent_id,
-                vec![
-                    serde_json::json!({
+                vec![AcceptedLine {
+                    line: serde_json::json!({
                         "jsonrpc": "2.0", "id": request_id, "result": response
                     })
                     .to_string(),
-                ],
+                    stamp: None,
+                }],
             );
             return Ok(());
         }
@@ -312,11 +339,16 @@ impl Runtime {
         self.publish(RuntimeEvent::Wire { agent_id: agent_id.to_string(), outbound: true, lines: vec![wire_line] });
         let changed =
             self.registry.lock().map_err(|error| error.to_string())?.record_outbound(agent_id, &line, now_ms());
-        self.commit_journal();
+        let stamp = journal_stamp(self.commit_journal());
         if changed {
             self.publish_run_states();
         }
-        self.publish(RuntimeEvent::Outbound { agent_id: agent_id.to_string(), line });
+        self.publish(RuntimeEvent::Outbound {
+            agent_id: agent_id.to_string(),
+            line,
+            session_id: stamp.as_ref().map(|(session_id, _)| session_id.clone()),
+            sequence: stamp.map(|(_, sequence)| sequence),
+        });
         Ok(())
     }
 
@@ -526,7 +558,8 @@ impl Runtime {
 
     /// 必须持有 agent lane。会话身份就是引擎报的 sessionId(两芯都以它命名 ALwith 记录),Runtime 不做翻译。
     /// 返回 `None` 的帧是 Runtime 自己发出的请求的响应:记日志、不进 `inbound`(应用没发过它)。
-    fn accept_line(&self, agent_id: &str, line: String) -> Result<Option<String>, String> {
+    /// 进了日志的帧带回 `(sessionId, sequence)`,发活事件时盖上,客户端据此发现漏帧。
+    fn accept_line(&self, agent_id: &str, line: String) -> Result<Option<AcceptedLine>, String> {
         let value = serde_json::from_str::<Value>(&line).ok();
         let mut answered_runtime_request = false;
         {
@@ -560,8 +593,8 @@ impl Runtime {
             std::slice::from_ref(&line),
             now_ms(),
         );
-        self.commit_journal();
-        Ok(if answered_runtime_request { None } else { Some(line) })
+        let stamp = journal_stamp(self.commit_journal());
+        Ok(if answered_runtime_request { None } else { Some(AcceptedLine { line, stamp }) })
     }
 
     async fn pump_stdout(self: Arc<Self>, agent_id: String, stdout: tokio::process::ChildStdout) {
@@ -651,25 +684,32 @@ impl Runtime {
         self.publish(RuntimeEvent::Exit { agent_id });
     }
 
-    fn publish_agent_lines(&self, agent_id: &str, lines: Vec<String>) {
-        for line in &lines {
+    fn publish_agent_lines(&self, agent_id: &str, accepted: Vec<AcceptedLine>) {
+        for AcceptedLine { line, stamp } in &accepted {
             let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
             let Some(method) = value.get("method").and_then(Value::as_str) else { continue };
             let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let session_id = stamp.as_ref().map(|(session_id, _)| session_id.clone());
+            let sequence = stamp.as_ref().map(|(_, sequence)| *sequence);
             match value.get("id") {
                 Some(id) if !id.is_null() => self.publish(RuntimeEvent::AcpAgentRequest {
                     agent_id: agent_id.to_string(),
                     id: id.clone(),
                     method: method.to_string(),
                     params,
+                    session_id,
+                    sequence,
                 }),
                 _ => self.publish(RuntimeEvent::AcpNotification {
                     agent_id: agent_id.to_string(),
                     method: method.to_string(),
                     params,
+                    session_id,
+                    sequence,
                 }),
             }
         }
+        let lines = accepted.into_iter().map(|accepted| accepted.line).collect();
         self.publish(RuntimeEvent::Inbound { agent_id: agent_id.to_string(), lines });
     }
 
@@ -1038,6 +1078,37 @@ mod tests {
                 break;
             }
         }
+        runtime.stop("agent").unwrap();
+    }
+
+    /// 进了日志的帧在活事件上带同一个序号:应用发的 `session/prompt`(outbound)与 agent 回的
+    /// 同一帧(cat 回显,带 id 即 acpAgentRequest)各占一号,与 `session_events` 里的序号一致 ——
+    /// 客户端靠这个发现漏帧、按序补齐。不进日志的帧(这里 cat 回显的 initialize 响应)没有序号。
+    #[tokio::test]
+    async fn journaled_frames_carry_their_sequence_on_live_events() {
+        let runtime = dsh_runtime().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        let prompt = r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}"#;
+        runtime.send("agent", prompt.into()).await.unwrap();
+        let mut outbound = None;
+        let mut echoed = None;
+        while outbound.is_none() || echoed.is_none() {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
+            match event {
+                RuntimeEvent::Outbound { session_id, sequence, .. } => outbound = Some((session_id, sequence)),
+                RuntimeEvent::AcpAgentRequest { method, session_id, sequence, .. } if method == "session/prompt" => {
+                    echoed = Some((session_id, sequence));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(outbound, Some((Some("s1".to_string()), Some(0))));
+        assert_eq!(echoed, Some((Some("s1".to_string()), Some(1))));
+        let journaled: Vec<u64> =
+            runtime.session_events("s1", None, 10).into_iter().map(|frame| frame.sequence).collect();
+        assert_eq!(journaled, vec![0, 1]);
         runtime.stop("agent").unwrap();
     }
 

@@ -199,9 +199,14 @@ pub enum RuntimeEvent {
         agent_id: String,
         lines: Vec<String>,
     },
+    /// 应用发给 agent 的一帧。进会话日志的帧带 `session_id` 与 `sequence`(见 `AcpNotification`)。
     Outbound {
         agent_id: String,
         line: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
     },
     Stderr {
         agent_id: String,
@@ -216,17 +221,28 @@ pub enum RuntimeEvent {
         sessions: Vec<SessionRunState>,
     },
     /// agent 发来的 ACP 通知(`session/update` 等),Runtime 已拆帧;与 `inbound` 里的同一帧并存。
+    ///
+    /// 进了会话日志的帧带 `session_id` 与 `sequence`(与 `sessionEvents` 里同一帧的序号相同):
+    /// 客户端据此发现漏帧(序号跳了)并用 `sessionEvents` 补齐。不进日志的帧没有这两个字段。
     AcpNotification {
         agent_id: String,
         method: String,
         params: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
     },
     /// agent 发来的 ACP 请求(`session/request_permission`、`elicitation/create`、`fs/*`…),
-    /// 应用用 `acpRespond` 带同一个 `id` 回答。
+    /// 应用用 `acpRespond` 带同一个 `id` 回答。序号字段同 `AcpNotification`。
     AcpAgentRequest {
         agent_id: String,
         id: Value,
         method: String,
         params: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
     },
 }

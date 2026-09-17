@@ -384,24 +384,26 @@ impl RuntimeEventSink for SocketEventSink {
     }
 }
 
+/// 主循环只读不写:写由独立任务做,慢连接堵住的是它自己的写端,不是断开、取消和别的请求。
+/// 队列满时 `SocketEventSink` 触发 `disconnect`,这里立刻断开并放弃写端;客户端重连后按 sequence 补齐。
 async fn handle_socket(socket: WebSocket, server: RuntimeServer) {
     let owner_id = format!("web-{}", Uuid::new_v4());
-    let (event_sender, mut event_receiver) = mpsc::channel::<String>(EVENT_QUEUE_CAPACITY);
+    let (event_sender, event_receiver) = mpsc::channel::<String>(EVENT_QUEUE_CAPACITY);
+    let (control_sender, control_receiver) = mpsc::channel::<Message>(16);
     let disconnect = Arc::new(Notify::new());
     let sink: Arc<dyn RuntimeEventSink> =
         Arc::new(SocketEventSink { sender: event_sender.clone(), disconnect: Arc::clone(&disconnect) });
     let sink_id = server.runtime.add_sink(&sink);
     let connection: SharedConnectionState =
         Arc::new(server.extension.connect(&owner_id, event_sender.clone(), Arc::clone(&disconnect)));
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
+    let write_failed = Arc::new(Notify::new());
+    let writer = tokio::spawn(socket_write_loop(sender, event_receiver, control_receiver, Arc::clone(&write_failed)));
 
     loop {
         tokio::select! {
             () = disconnect.notified() => break,
-            event = event_receiver.recv() => {
-                let Some(event) = event else { break };
-                if sender.send(Message::Text(event.into())).await.is_err() { break }
-            }
+            () = write_failed.notified() => break,
             message = receiver.next() => {
                 let Some(Ok(message)) = message else { break };
                 match message {
@@ -419,9 +421,8 @@ async fn handle_socket(socket: WebSocket, server: RuntimeServer) {
                         });
                     }
                     Message::Close(_) => break,
-                    Message::Ping(payload) => {
-                        if sender.send(Message::Pong(payload)).await.is_err() { break }
-                    }
+                    // 写端堵着时 pong 排不进去就丢:对端会再 ping,不值得为它挡住读端。
+                    Message::Ping(payload) => { let _ = control_sender.try_send(Message::Pong(payload)); }
                     Message::Pong(_) | Message::Binary(_) => {}
                 }
             }
@@ -432,6 +433,30 @@ async fn handle_socket(socket: WebSocket, server: RuntimeServer) {
     drop(connection);
     server.runtime.remove_sink(sink_id);
     server.runtime.detach_owners_under(&owner_id);
+    writer.abort();
+}
+
+/// 写端:事件与响应从同一条队列出去,pong 走控制通道。写失败即连接没了,通知主循环。
+async fn socket_write_loop(
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>, mut events: mpsc::Receiver<String>,
+    mut control: mpsc::Receiver<Message>, failed: Arc<Notify>,
+) {
+    loop {
+        let message = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => Message::Text(event.into()),
+                None => return,
+            },
+            control = control.recv() => match control {
+                Some(message) => message,
+                None => return,
+            },
+        };
+        if sender.send(message).await.is_err() {
+            failed.notify_one();
+            return;
+        }
+    }
 }
 
 /// Both core and extension requests run concurrently; long operations never block cancellation.

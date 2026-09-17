@@ -20,6 +20,8 @@ use tokio::sync::mpsc::error::TrySendError;
 
 pub const OWNER_ID: &str = "stdio";
 pub const EVENT_QUEUE_CAPACITY: usize = 8_192;
+/// 收尾后给写端排空队列的窗口;宿主已经不读了就到点放弃。
+pub const WRITER_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct QueueEventSink {
     sender: mpsc::Sender<String>,
@@ -39,15 +41,19 @@ impl RuntimeEventSink for QueueEventSink {
 }
 
 /// 在任意一对读写流上跑一条 Runtime 连接;`serve_stdio` 把它接到进程的 stdin / stdout。
+///
+/// 主循环只读不写:写由独立任务做,stdout 没人读(宿主卡住)也堵不住 `shutdown`、断开与 stdin 的处理。
+/// 宿主主动走有两条路,效果相同:stdin EOF,或发一条 `{"id":n,"method":"shutdown"}`(先收到回执,再收尾)
+/// —— 起子进程的宿主不一定能关自己那头的 stdin(Tauri 的 sidecar 就不能),所以给一个方法。
 /// 返回时所有 agent 已被 `kill_all`。
 pub async fn serve<R, W>(
-    server: RuntimeServer, input: R, mut output: W, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    server: RuntimeServer, input: R, output: W, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()>
 where
     R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (event_sender, mut event_receiver) = mpsc::channel::<String>(EVENT_QUEUE_CAPACITY);
+    let (event_sender, event_receiver) = mpsc::channel::<String>(EVENT_QUEUE_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
     let sink: Arc<dyn RuntimeEventSink> =
         Arc::new(QueueEventSink { sender: event_sender.clone(), dropped: Arc::clone(&dropped) });
@@ -55,6 +61,8 @@ where
     let disconnect = Arc::new(tokio::sync::Notify::new());
     let connection: SharedConnectionState =
         Arc::new(server.extension.connect(OWNER_ID, event_sender.clone(), Arc::clone(&disconnect)));
+    let write_failed = Arc::new(tokio::sync::Notify::new());
+    let mut writer = tokio::spawn(write_loop(output, event_receiver, Arc::clone(&dropped), Arc::clone(&write_failed)));
     let mut lines = input.lines();
     tokio::pin!(shutdown);
 
@@ -62,15 +70,7 @@ where
         tokio::select! {
             () = &mut shutdown => break Ok(()),
             () = disconnect.notified() => break Ok(()),
-            event = event_receiver.recv() => {
-                let Some(event) = event else { break Ok(()) };
-                let lagged = dropped.swap(0, Ordering::Relaxed);
-                if lagged > 0 {
-                    let notice = serde_json::json!({ "type": "lagged", "dropped": lagged }).to_string();
-                    if let Err(error) = write_line(&mut output, &notice).await { break Err(error) }
-                }
-                if let Err(error) = write_line(&mut output, &event).await { break Err(error) }
-            }
+            () = write_failed.notified() => break Err(std::io::Error::other("stdout closed")),
             line = lines.next_line() => {
                 let line = match line {
                     Ok(Some(line)) => line,
@@ -78,6 +78,12 @@ where
                     Err(error) => break Err(error),
                 };
                 if line.trim().is_empty() { continue }
+                if let Some(id) = shutdown_request_id(&line) {
+                    // 回执排进队列(写端会送出),然后走与 stdin EOF 相同的收尾。
+                    let receipt = serde_json::json!({ "id": id, "result": null, "error": null }).to_string();
+                    let _ = event_sender.send(receipt).await;
+                    break Ok(());
+                }
                 // 请求并发处理(同 ws):响应经同一条事件队列回到写端。用 send 而不是 try_send,响应不许丢。
                 let server = server.clone();
                 let connection = Arc::clone(&connection);
@@ -97,7 +103,39 @@ where
     server.runtime.detach_owners_under(OWNER_ID);
     let _ = tokio::time::timeout(SHUTDOWN_FORCE_WINDOW, server.extension.shutdown()).await;
     server.runtime.kill_all();
+    // 给写端一个窗口把回执与最后的事件送出去;宿主不读就不等它。
+    drop(sink);
+    drop(event_sender);
+    let _ = tokio::time::timeout(WRITER_DRAIN_WINDOW, &mut writer).await;
+    writer.abort();
     result
+}
+
+/// 写端:事件与响应从同一条队列出去。队列曾满过就先补一条 `lagged`。写失败即宿主没了,通知主循环。
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut output: W, mut events: mpsc::Receiver<String>, dropped: Arc<AtomicU64>, failed: Arc<tokio::sync::Notify>,
+) {
+    while let Some(event) = events.recv().await {
+        let lagged = dropped.swap(0, Ordering::Relaxed);
+        if lagged > 0 {
+            let notice = serde_json::json!({ "type": "lagged", "dropped": lagged }).to_string();
+            if write_line(&mut output, &notice).await.is_err() {
+                failed.notify_one();
+                return;
+            }
+        }
+        if write_line(&mut output, &event).await.is_err() {
+            failed.notify_one();
+            return;
+        }
+    }
+}
+
+/// `{"id":n,"method":"shutdown"}` 的 id;别的请求为 None。
+fn shutdown_request_id(line: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    (value.get("method").and_then(serde_json::Value::as_str) == Some("shutdown"))
+        .then(|| value.get("id").cloned().unwrap_or(serde_json::Value::Null))
 }
 
 /// 进程的 stdin / stdout 上的一条连接。先打一行 `{"type":"ready","transport":"stdio"}`,宿主据此开始发请求。
@@ -228,6 +266,44 @@ mod tests {
         }
         drop(writer);
         tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("serve returns on EOF").unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_is_answered_then_ends_the_connection() {
+        let (mut writer, mut reader, task) = connect().await;
+        let receipt = call(&mut writer, &mut reader, 7, "shutdown", Value::Null).await;
+        assert_eq!(receipt.id, 7);
+        assert!(receipt.error.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("serve returns after shutdown")
+            .unwrap();
+    }
+
+    /// 宿主不读 stdout 时写端会卡住;主循环不写,所以 shutdown 照样立刻生效。
+    #[tokio::test]
+    async fn a_host_that_stops_reading_cannot_block_shutdown() {
+        let (_client_in, server_out) = tokio::io::duplex(256);
+        let (server_in, mut client_out) = tokio::io::duplex(64 * 1024);
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            serve(server(), BufReader::new(server_in), server_out, async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+        });
+        // 一批 ping 的响应远超 256 字节的管道:写端在第几条上堵住都行,主循环必须还在读。
+        for id in 0..200u64 {
+            let request = serde_json::json!({ "id": id, "method": "ping" }).to_string() + "\n";
+            client_out.write_all(request.as_bytes()).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        shutdown_sender.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must not wait for a host that stopped reading")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[cfg(unix)]
