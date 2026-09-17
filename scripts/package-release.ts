@@ -1,6 +1,7 @@
-// 打一个平台的发布包:alwith-runtime-<target>.tar.gz,里面是二进制、LICENSE、THIRD_PARTY_NOTICES.md、
-// licenses/(每个第三方 crate 的许可原文)、BUILD.json(版本、目标、源码 revision)。
-// 应用的 stage 脚本要求这四样都在包里,缺一个就拒装。
+// 打一个平台的 npm 平台包:dist/npm/<os>-<cpu>/,里面是二进制、artifact.json(版本、目标、sha256)、
+// LICENSE、THIRD_PARTY_NOTICES.md、licenses/(每个第三方 crate 的许可原文)、package.json。
+// @alwith/runtime 本体(packages/runtime)按 optionalDependencies 指向这五个平台包,应用 bun install
+// 只装自己平台那一个,构建时 stageRuntime() 校验 sha 后拷进 sidecar。
 //
 // 用法:bun scripts/package-release.ts <rust-target-triple>
 // 前提:cargo build --release --locked -p alwith-runtime --target <triple> 已经跑完。
@@ -8,16 +9,25 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, write
 import { dirname, join, resolve } from "node:path"
 import { $ } from "bun"
 
+const platforms: Record<string, [string, string]> = {
+  "aarch64-apple-darwin": ["darwin", "arm64"],
+  "x86_64-unknown-linux-gnu": ["linux", "x64"],
+  "aarch64-unknown-linux-gnu": ["linux", "arm64"],
+  "x86_64-pc-windows-msvc": ["win32", "x64"],
+  "aarch64-pc-windows-msvc": ["win32", "arm64"]
+}
+
 const root = resolve(import.meta.dirname, "..")
 const target = process.argv[2]
-if (!target) throw new Error("Usage: bun scripts/package-release.ts <rust-target-triple>")
-const exe = target.includes("windows") ? ".exe" : ""
+if (!target || !platforms[target]) throw new Error(`Usage: bun scripts/package-release.ts <${Object.keys(platforms).join("|")}>`)
+const [os, cpu] = platforms[target]!
+const exe = os === "win32" ? ".exe" : ""
 const binary = join(root, "target", target, "release", `alwith-runtime${exe}`)
 if (!existsSync(binary)) throw new Error(`Build first: ${binary} is missing`)
 const version = (readFileSync(join(root, "Cargo.toml"), "utf8").match(/^version = "(.+)"$/m) ?? [])[1]
 if (!version) throw new Error("workspace version not found in Cargo.toml")
 
-const stage = join(root, "dist", "stage")
+const stage = join(root, "dist", "npm", `${os}-${cpu}`)
 rmSync(stage, { recursive: true, force: true })
 mkdirSync(stage, { recursive: true })
 cpSync(binary, join(stage, `alwith-runtime${exe}`))
@@ -65,9 +75,14 @@ for (const pkg of packages) {
 writeFileSync(join(stage, "THIRD_PARTY_NOTICES.md"), notices.join("\n") + "\n")
 
 const sourceRevision = (await $`git rev-parse HEAD`.cwd(root).text()).trim()
-writeFileSync(join(stage, "BUILD.json"), JSON.stringify({ version, target, sourceRevision }, null, 2) + "\n")
-
-const archive = join(root, "dist", `alwith-runtime-${target}.tar.gz`)
-await $`tar -C ${stage} -czf ${archive} alwith-runtime${exe} LICENSE THIRD_PARTY_NOTICES.md licenses BUILD.json`
-rmSync(stage, { recursive: true, force: true })
-console.log(`${archive}: alwith-runtime ${version} for ${target}, ${packages.length} third-party crates`)
+const sha256 = new Bun.CryptoHasher("sha256").update(readFileSync(join(stage, `alwith-runtime${exe}`))).digest("hex")
+writeFileSync(join(stage, "artifact.json"), JSON.stringify({ version, target, binary: `alwith-runtime${exe}`, sha256, sourceRevision }, null, 2) + "\n")
+writeFileSync(join(stage, "package.json"), JSON.stringify({
+  name: `@alwith/runtime-${os}-${cpu}`, version, os: [os], cpu: [cpu],
+  description: `ALwith Runtime binary for ${target}; installed by @alwith/runtime, staged by its stageRuntime()`,
+  license: "SEE LICENSE IN LICENSE",
+  files: [`alwith-runtime${exe}`, "artifact.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "licenses"],
+  publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
+  repository: { type: "git", url: "git+https://github.com/ALwith-ai/alwith-runtime.git" }
+}, null, 2) + "\n")
+console.log(`${stage}: @alwith/runtime-${os}-${cpu}@${version}, ${packages.length} third-party crates`)

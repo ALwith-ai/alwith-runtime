@@ -1,0 +1,18 @@
+{
+  "name": "@alwith/runtime",
+  "version": "0.1.2",
+  "description": "The closed ALwith Runtime process for your platform: npm installs the matching binary, stageRuntime() copies it into your app's sidecars at build time",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "files": ["stage.js", "stage.d.ts", "README.md", "LICENSE"],
+  "exports": { "./stage": { "types": "./stage.d.ts", "import": "./stage.js" } },
+  "optionalDependencies": {
+    "@alwith/runtime-darwin-arm64": "0.1.2",
+    "@alwith/runtime-linux-arm64": "0.1.2",
+    "@alwith/runtime-linux-x64": "0.1.2",
+    "@alwith/runtime-win32-arm64": "0.1.2",
+    "@alwith/runtime-win32-x64": "0.1.2"
+  },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" },
+  "repository": { "type": "git", "url": "git+https://github.com/ALwith-ai/alwith-runtime.git", "directory": "packages/runtime" }
+}

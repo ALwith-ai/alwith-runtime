@@ -133,3 +133,7 @@ git tag v0.1.0 && git push origin v0.1.0
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## 分发
+
+Runtime 只走 npm:推 `v<版本>` 的 tag,`release.yml` 编五个平台(macOS arm64、Linux x64/arm64、Windows x64/arm64),发 `@alwith/runtime` 本体 + 五个 `@alwith/runtime-<os>-<cpu>` 平台包。应用 `bun install` 按平台装一个,构建时 `stageRuntime()`(`@alwith/runtime/stage`)校验 sha 后拷进 sidecar;不用 npm 的消费者直接取 registry 上的 tgz。`scripts/package-release.ts` 负责把二进制、LICENSE、第三方许可原文、`artifact.json` 装进平台包。版本号一条线:Cargo 工作区 = tag = `packages/runtime`。发版前改这三处版本,新包名第一版要手发,之后 trusted publisher 全自动。

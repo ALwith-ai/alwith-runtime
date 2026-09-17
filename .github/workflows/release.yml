@@ -1,13 +1,8 @@
-# Builds alwith-runtime for every target alwith-u and Desktop bundle, and publishes
-# the binaries as GitHub Release assets. Source stays private; only assets are public.
-#
-# Asset contract (consumed by alwith-u scripts/stage.ts):
-#   alwith-runtime-<rust-triple>.tar.gz   one file inside: alwith-runtime[.exe]
-#   SHA256SUMS                        sha256 of every archive, `sha256sum` format
-#
-# Trigger: push a tag `v<version>` matching the workspace version, or run manually.
-# Publishing to a different (public) repo: set the repository variable RELEASE_REPO to
-# `owner/name` and the secret RELEASE_TOKEN to a token with `contents: write` there.
+# 发 Runtime:推 v<版本> 的 tag,五个平台各编一次,发到 npm —— @alwith/runtime 本体 + 五个
+# @alwith/runtime-<os>-<cpu> 平台包。这是唯一的分发渠道:应用 bun install 按平台装一个,
+# 构建时 stageRuntime() 校验 sha 后拷进 sidecar。不发 GitHub Release,不用任何 token
+# (npm trusted publishing;npmjs.com 上六个包各配一条:Repository alwith-runtime / Workflow release.yml)。
+# tag 必须等于 Cargo 工作区版本,也必须等于 packages/runtime 的版本和它五个 optionalDependencies。
 name: release
 
 on:
@@ -70,30 +65,57 @@ jobs:
       - run: bun scripts/package-release.ts ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: alwith-runtime-${{ matrix.target }}
-          path: alwith-runtime/dist/alwith-runtime-${{ matrix.target }}.tar.gz
+          name: runtime-${{ matrix.target }}
+          path: alwith-runtime/dist/npm
           if-no-files-found: error
 
+  # 五个平台包先各自发,再发 @alwith/runtime 本体(optionalDependencies 指向它们)。
+  # npm trusted publishing(OIDC):npmjs.com 上六个包各配一条(Repository alwith-runtime / Workflow filename
+  # release.yml),不存 token;不带 provenance(私有仓不支持)。已在 npm 上的版本跳过,半途被拒可重跑。
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          pattern: runtime-*
+          path: dist/npm
           merge-multiple: true
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum alwith-runtime-*.tar.gz > SHA256SUMS && cat SHA256SUMS
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          REPO: ${{ vars.RELEASE_REPO || github.repository }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: tag 的版本必须就是 packages/runtime 的版本,五个 optionalDependencies 与五个平台包也必须是它
         run: |
-          set -euo pipefail
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
-          else
-            gh release create "$TAG" dist/* --repo "$REPO" --title "alwith-runtime $TAG" --notes "alwith-runtime $TAG. Assets: alwith-runtime-<rust-triple>.tar.gz + SHA256SUMS."
-          fi
+          version=${GITHUB_REF_NAME#v}
+          node -e '
+            const pkg = require("./packages/runtime/package.json");
+            const want = process.argv[1];
+            if (pkg.version !== want) { console.error(`tag v${want} != packages/runtime ${pkg.version}`); process.exit(1) }
+            for (const [name, v] of Object.entries(pkg.optionalDependencies)) {
+              if (v !== want) { console.error(`${name} pinned to ${v}, expected ${want}`); process.exit(1) }
+            }
+            const dirs = require("fs").readdirSync("dist/npm");
+            if (dirs.length !== 5) { console.error(`expected 5 platform packages, got ${dirs}`); process.exit(1) }
+            for (const dir of dirs) {
+              const platform = require(`./dist/npm/${dir}/package.json`);
+              if (platform.version !== want) { console.error(`${platform.name} is ${platform.version}`); process.exit(1) }
+            }
+          ' "$version"
+      - name: 五个平台包,再发 @alwith/runtime 本体
+        run: |
+          publish() {
+            name=$(node -p "require('./package.json').name")
+            version=$(node -p "require('./package.json').version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version already on npm, skipping"
+            else
+              npm publish --access public
+            fi
+          }
+          for dir in dist/npm/*/; do (cd "$dir" && publish); done
+          (cd packages/runtime && publish)
