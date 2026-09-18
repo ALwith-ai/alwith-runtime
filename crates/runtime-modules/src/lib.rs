@@ -144,6 +144,29 @@ pub type Dispatch = Arc<
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ResponseError>>>>>;
 type ModuleInput = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
 
+struct PendingCall {
+    id: u64,
+    pending: Pending,
+    stdin: ModuleInput,
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if self.pending.lock().expect("pending lock poisoned").remove(&self.id).is_none() {
+            return;
+        }
+        let input = Arc::clone(&self.stdin);
+        let line = format!("{}\n", serde_json::json!({"method":"_runtime/cancel", "params":{"id":self.id}}));
+        tokio::spawn(async move {
+            let mut input = input.lock().await;
+            if let Some(input) = input.as_mut() {
+                let _ = input.write_all(line.as_bytes()).await;
+                let _ = input.flush().await;
+            }
+        });
+    }
+}
+
 struct ModuleProcess {
     manifest: ModuleManifest,
     stdin: ModuleInput,
@@ -186,14 +209,24 @@ pub struct ModuleHost {
 
 impl ModuleHost {
     pub fn new(runtime: Arc<Runtime>, runtime_version: impl Into<String>) -> Arc<Self> {
-        Arc::new(Self {
+        let host = Arc::new(Self {
             runtime,
             runtime_version: runtime_version.into(),
             modules: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(Vec::new()),
             next_subscriber: AtomicU64::new(1),
             dispatch: OnceLock::new(),
-        })
+        });
+        let weak = Arc::downgrade(&host);
+        host.runtime.set_tool_dispatch(Arc::new(move |module, agent_id, params| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let host = weak.upgrade().ok_or_else(|| ResponseError::connection_lost("module host stopped"))?;
+                host.call_module(&module, "_runtime/toolCall", serde_json::json!({"agentId":agent_id,"params":params}))
+                    .await
+            })
+        }));
+        host
     }
 
     /// 接上模块 → Runtime 请求的执行器。在 RuntimeServer 建好后调一次。
@@ -435,6 +468,7 @@ impl ModuleHost {
         let id = process.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         process.pending.lock().expect("pending lock poisoned").insert(id, sender);
+        let _pending = PendingCall { id, pending: Arc::clone(&process.pending), stdin: Arc::clone(&process.stdin) };
         let mut line = serde_json::json!({ "id": id, "method": method, "params": params }).to_string();
         line.push('\n');
         {

@@ -1,8 +1,10 @@
 use alwith_runtime_protocol::{AgentMetadata, ResponseError, RuntimeEvent};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -25,6 +27,12 @@ pub const SESSION_EVENTS_PAGE: usize = 2_000;
 const OUTPUT_BATCH_WINDOW: Duration = Duration::from_millis(16);
 const PORT_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Private module tool traffic never enters the public event bus or replay journal.
+pub type PrivateToolDispatch = Arc<
+    dyn Fn(String, String, Value) -> Pin<Box<dyn Future<Output = Result<Value, ResponseError>> + Send>> + Send + Sync,
+>;
+const TOOL_CALL_METHOD: &str = "_alwith/tool/call";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSnapshot {
     pub agent_id: String,
@@ -40,6 +48,7 @@ pub trait RuntimeEventSink: Send + Sync {
 }
 
 struct AgentHandle {
+    tool_owner: Option<String>,
     stdin: Arc<AsyncMutex<ChildStdin>>,
     child: AgentProcess,
     metadata: AgentMetadata,
@@ -68,6 +77,7 @@ fn journal_stamp(stamps: Vec<(String, u64)>) -> Option<(String, u64)> {
 }
 
 pub struct Runtime {
+    tool_dispatch: OnceLock<PrivateToolDispatch>,
     registry: Mutex<RuntimeRegistry>,
     journal: Journal,
     agents: Mutex<HashMap<String, AgentHandle>>,
@@ -91,6 +101,7 @@ impl Default for Runtime {
 impl Runtime {
     pub fn with_journal(journal: Journal) -> Self {
         Self {
+            tool_dispatch: OnceLock::new(),
             registry: Mutex::default(),
             journal,
             agents: Mutex::default(),
@@ -104,6 +115,10 @@ impl Runtime {
 
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+
+    pub fn set_tool_dispatch(&self, dispatch: PrivateToolDispatch) {
+        let _ = self.tool_dispatch.set(dispatch);
     }
 
     /// 把注册表刚判定出的日志动作落盘,返回每条落盘帧的 `(sessionId, sequence)`(与 Append 动作同序),
@@ -212,6 +227,10 @@ impl Runtime {
         self.agents.lock().map_err(|error| error.to_string())?.insert(
             agent_id.clone(),
             AgentHandle {
+                tool_owner: metadata
+                    .owner_id
+                    .strip_prefix("module:")
+                    .map(|owner| owner.split(':').next().unwrap_or(owner).to_string()),
                 stdin: Arc::new(AsyncMutex::new(stdin)),
                 child,
                 metadata,
@@ -600,8 +619,17 @@ impl Runtime {
     async fn pump_stdout(self: Arc<Self>, agent_id: String, stdout: tokio::process::ChildStdout) {
         let mut reader = BufReader::new(stdout).lines();
         let lane = self.lane(&agent_id);
+        let mut tool_tasks = tokio::task::JoinSet::new();
+        let mut tool_calls = HashMap::<String, tokio::task::AbortHandle>::new();
         loop {
-            let first = match reader.next_line().await {
+            let next = tokio::select! {
+                completed = tool_tasks.join_next(), if !tool_tasks.is_empty() => {
+                    if let Some(Ok(id)) = completed { tool_calls.remove(&id); }
+                    continue;
+                }
+                next = reader.next_line() => next,
+            };
+            let first = match next {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(error) => {
@@ -634,7 +662,64 @@ impl Runtime {
             if !self.agents.lock().expect("runtime agents lock poisoned").contains_key(&agent_id) {
                 break;
             }
-            self.publish(RuntimeEvent::Wire { agent_id: agent_id.clone(), outbound: false, lines: batch.clone() });
+            let mut public_batch = Vec::new();
+            for line in batch {
+                let value = serde_json::from_str::<Value>(&line).ok();
+                if let Some(frame) = value.as_ref().filter(|v| v["method"] == TOOL_CALL_METHOD) {
+                    let Some(id) = frame.get("id").filter(|id| id.is_string() || id.is_number()).cloned() else {
+                        continue;
+                    };
+                    let key = id.to_string();
+                    // ACP request IDs cannot be reused while pending. Do not repeat a side effect.
+                    if tool_calls.contains_key(&key) {
+                        continue;
+                    }
+                    let (owner, stdin) = {
+                        let agents = self.agents.lock().expect("runtime agents lock poisoned");
+                        let handle = agents.get(&agent_id).expect("agent under lane");
+                        (handle.tool_owner.clone(), Arc::clone(&handle.stdin))
+                    };
+                    let dispatch = self.tool_dispatch.get().cloned();
+                    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+                    let caller = agent_id.clone();
+                    let task_key = key.clone();
+                    let abort = tool_tasks.spawn(async move {
+                        let result = match (owner, dispatch) {
+                            (Some(owner), Some(dispatch)) => {
+                                tokio::time::timeout(Duration::from_secs(1800), dispatch(owner, caller, params))
+                                    .await
+                                    .unwrap_or_else(|_| Err(ResponseError::runtime("client tool timed out")))
+                            }
+                            _ => Err(ResponseError::method_not_found(TOOL_CALL_METHOD)),
+                        };
+                        let response = match result {
+                            Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+                            Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":error}),
+                        };
+                        // Captured pipe belongs to this process, never a replacement with the same agent ID.
+                        let mut input = stdin.lock().await;
+                        let _ = input.write_all(format!("{response}\n").as_bytes()).await;
+                        let _ = input.flush().await;
+                        task_key
+                    });
+                    tool_calls.insert(key, abort);
+                    continue;
+                }
+                if let Some(frame) = value.as_ref().filter(|v| v["method"] == "$/cancel_request") {
+                    if let Some(id) = frame.pointer("/params/requestId") {
+                        if let Some(task) = tool_calls.remove(&id.to_string()) {
+                            task.abort();
+                            continue;
+                        }
+                    }
+                }
+                public_batch.push(line);
+            }
+            self.publish(RuntimeEvent::Wire {
+                agent_id: agent_id.clone(),
+                outbound: false,
+                lines: public_batch.clone(),
+            });
             let active = self
                 .agents
                 .lock()
@@ -643,7 +728,7 @@ impl Runtime {
                 .is_some_and(|handle| handle.failure.is_none());
             if active {
                 let mut accepted = Vec::new();
-                for line in batch {
+                for line in public_batch {
                     match self.accept_line(&agent_id, line) {
                         Ok(Some(line)) => accepted.push(line),
                         Ok(None) => {}
@@ -662,6 +747,8 @@ impl Runtime {
                 break;
             }
         }
+        tool_tasks.abort_all();
+        while tool_tasks.join_next().await.is_some() {}
         let _operation = lane.lock().await;
         // 旧进程已经由替换操作收尾；不能向新进程的订阅者交付旧 Exit。
         let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
@@ -912,6 +999,105 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn tool_callbacks_are_private_and_bound_to_the_spawn_owner() {
+        let runtime = Arc::new(test_runtime());
+        runtime.set_tool_dispatch(Arc::new(|owner, agent, params| {
+            Box::pin(async move {
+                assert_eq!(owner, "board");
+                assert_eq!(agent, "tool-agent");
+                assert_eq!(params["name"], "private-read");
+                Ok(serde_json::json!({"success":true,"contentItems":[{"type":"text","text":"secret-tool-result"}]}))
+            })
+        }));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import json,sys
+print(json.dumps({'jsonrpc':'2.0','id':9,'method':'_alwith/tool/call','params':{'name':'private-read'}}),flush=True)
+reply=json.loads(sys.stdin.readline())
+assert reply['id']==9 and reply['result']['contentItems'][0]['text']=='secret-tool-result'
+print(json.dumps({'method':'test/finished','params':{}}),flush=True)
+"#,
+        ]);
+        let mut meta = metadata("codex");
+        meta.owner_id = "module:board:chat".into();
+        runtime.start("tool-agent".into(), meta, &mut command).await.unwrap();
+        let mut finished = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert!(
+                !encoded.contains("private-read") && !encoded.contains("secret-tool-result"),
+                "private frame escaped: {encoded}"
+            );
+            if let RuntimeEvent::AcpNotification { method, .. } = &event {
+                finished |= method == "test/finished";
+            }
+            if matches!(event, RuntimeEvent::Exit { .. }) {
+                break;
+            }
+        }
+        assert!(finished);
+    }
+
+    #[tokio::test]
+    async fn tool_cancellation_and_process_exit_drop_owned_dispatches() {
+        for cancel in [true, false] {
+            let runtime = Arc::new(test_runtime());
+            let dropped = Arc::new(tokio::sync::Notify::new());
+            let started = Arc::new(tokio::sync::Notify::new());
+            let drop_signal = Arc::clone(&dropped);
+            let start_signal = Arc::clone(&started);
+            runtime.set_tool_dispatch(Arc::new(move |_, _, _| {
+                let dropped = Arc::clone(&drop_signal);
+                let started = Arc::clone(&start_signal);
+                Box::pin(async move {
+                    struct Guard(Arc<tokio::sync::Notify>);
+                    impl Drop for Guard {
+                        fn drop(&mut self) {
+                            self.0.notify_one();
+                        }
+                    }
+                    let _guard = Guard(dropped);
+                    started.notify_one();
+                    std::future::pending().await
+                })
+            }));
+            let mut command = Command::new("python3");
+            command.args([
+                "-c",
+                if cancel {
+                    r#"
+import json,sys,time
+print(json.dumps({'id':9,'method':'_alwith/tool/call','params':{}}),flush=True)
+time.sleep(.1)
+print(json.dumps({'method':'$/cancel_request','params':{'requestId':9}}),flush=True)
+sys.stdin.readline()
+"#
+                } else {
+                    r#"
+import json,time
+print(json.dumps({'id':9,'method':'_alwith/tool/call','params':{}}),flush=True)
+time.sleep(.1)
+"#
+                },
+            ]);
+            let mut meta = metadata("codex");
+            meta.owner_id = "module:board".into();
+            runtime.start("tool-agent".into(), meta, &mut command).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), started.notified()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), dropped.notified()).await.unwrap();
+            if cancel {
+                runtime.stop("tool-agent").unwrap();
+            }
+        }
+    }
 
     fn test_runtime() -> Runtime {
         let root = tempfile::tempdir().expect("temp journal dir").keep();

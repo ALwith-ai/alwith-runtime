@@ -12,7 +12,9 @@ pub use alwith_runtime_protocol::{
     SessionEventFrame, SessionLifecycleFrame, SessionRunState, SessionTask,
 };
 pub use journal::{Journal, JournalOp, SESSION_JOURNAL_MAX_BYTES};
-pub use runtime::{AgentSnapshot, Runtime, RuntimeEventSink, SESSION_EVENTS_PAGE, default_journal_root};
+pub use runtime::{
+    AgentSnapshot, PrivateToolDispatch, Runtime, RuntimeEventSink, SESSION_EVENTS_PAGE, default_journal_root,
+};
 
 const AGENT_REPLAY_CAPACITY: usize = 1_000;
 
