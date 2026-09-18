@@ -44,6 +44,85 @@ fn public_request_line(value: &Value) -> String {
     }
 }
 
+// Keep credential values only for the lifetime of their engine. Providers can rotate keys;
+// old values remain sensitive while late errors from an earlier request may still arrive.
+#[derive(Default)]
+struct PrivateValues(HashSet<String>);
+impl PrivateValues {
+    fn remember(&mut self, value: &Value, private: bool) {
+        match value {
+            Value::String(value) if private && !value.is_empty() => {
+                self.0.insert(value.clone());
+                if let Some(token) = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")) {
+                    if !token.is_empty() {
+                        self.0.insert(token.into());
+                    }
+                }
+            }
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    self.remember(
+                        value,
+                        private
+                            || matches!(
+                                key.as_str(),
+                                "apikey"
+                                    | "bearertoken"
+                                    | "accesstoken"
+                                    | "refreshtoken"
+                                    | "password"
+                                    | "authorization"
+                                    | "headers"
+                                    | "token"
+                                    | "secret"
+                            ),
+                    );
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    self.remember(value, private);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn text(&self, text: &str) -> String {
+        let mut values: Vec<_> = self.0.iter().collect();
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.into_iter().fold(text.to_string(), |text, secret| text.replace(secret.as_str(), "[REDACTED]"))
+    }
+    fn json(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.text(text),
+            Value::Object(values) => {
+                for value in values.values_mut() {
+                    self.json(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    self.json(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn line(&self, line: &str) -> String {
+        if self.0.is_empty() {
+            return line.to_string();
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(mut value) => {
+                self.json(&mut value);
+                value.to_string()
+            }
+            Err(_) => self.text(line),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSnapshot {
     pub agent_id: String,
@@ -61,6 +140,7 @@ pub trait RuntimeEventSink: Send + Sync {
 struct AgentHandle {
     tool_owner: Option<String>,
     private_tool_ids: HashSet<String>,
+    private_values: PrivateValues,
     stdin: Arc<AsyncMutex<ChildStdin>>,
     child: AgentProcess,
     metadata: AgentMetadata,
@@ -180,6 +260,7 @@ impl Runtime {
                 Err(kill_error) => format!("{error}; stop agent failed: {kill_error}"),
             }
         };
+        let message = self.public_agent_line(agent_id, &message);
         // 保持 stdout task 存活，排空管道并正常交付 Exit；不再执行新请求。
         self.publish(RuntimeEvent::Stderr { agent_id: agent_id.to_string(), line: message.clone() });
         self.publish_agent_lines(
@@ -240,6 +321,7 @@ impl Runtime {
             agent_id.clone(),
             AgentHandle {
                 private_tool_ids: HashSet::new(),
+                private_values: PrivateValues::default(),
                 tool_owner: metadata
                     .owner_id
                     .strip_prefix("module:")
@@ -269,7 +351,10 @@ impl Runtime {
             let lane = runtime.lane(&agent_id);
             while let Ok(Some(line)) = lines.next_line().await {
                 let _operation = lane.lock().await;
-                runtime.publish(RuntimeEvent::Stderr { agent_id: agent_id.clone(), line });
+                runtime.publish(RuntimeEvent::Stderr {
+                    agent_id: agent_id.clone(),
+                    line: runtime.public_agent_line(&agent_id, &line),
+                });
             }
         });
 
@@ -355,6 +440,15 @@ impl Runtime {
             self.registry.lock().map_err(|error| error.to_string())?.reserve_session(agent_id, session_id)?;
         }
         value.as_object().ok_or("ACP envelope must be an object")?;
+        if matches!(method, Some("providers/set" | "auth/login")) {
+            self.agents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get_mut(agent_id)
+                .expect("agent under lane")
+                .private_values
+                .remember(&value["params"], false);
+        }
         let wire_line = value.to_string();
         let write_result = async {
             let mut writer = stdin.lock().await;
@@ -376,8 +470,11 @@ impl Runtime {
                 .expect("agent under lane")
                 .initialize_request_id = value.get("id").cloned();
         }
-        let public_wire = public_request_line(&value);
-        let line = public_request_line(&serde_json::from_str::<Value>(&line).expect("validated ACP frame"));
+        let public_wire = self.public_agent_line(agent_id, &public_request_line(&value));
+        let line = self.public_agent_line(
+            agent_id,
+            &public_request_line(&serde_json::from_str::<Value>(&line).expect("validated ACP frame")),
+        );
         self.publish(RuntimeEvent::Wire { agent_id: agent_id.to_string(), outbound: true, lines: vec![public_wire] });
         let changed =
             self.registry.lock().map_err(|error| error.to_string())?.record_outbound(agent_id, &line, now_ms());
@@ -601,6 +698,14 @@ impl Runtime {
     /// 必须持有 agent lane。会话身份就是引擎报的 sessionId(两芯都以它命名 ALwith 记录),Runtime 不做翻译。
     /// 返回 `None` 的帧是 Runtime 自己发出的请求的响应:记日志、不进 `inbound`(应用没发过它)。
     /// 进了日志的帧带回 `(sessionId, sequence)`,发活事件时盖上,客户端据此发现漏帧。
+    fn public_agent_line(&self, agent_id: &str, line: &str) -> String {
+        self.agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .get(agent_id)
+            .map_or_else(|| line.to_string(), |handle| handle.private_values.line(line))
+    }
+
     fn accept_line(&self, agent_id: &str, line: String) -> Result<Option<AcceptedLine>, String> {
         let value = serde_json::from_str::<Value>(&line).ok();
         let mut answered_runtime_request = false;
@@ -630,6 +735,7 @@ impl Runtime {
                 }
             }
         }
+        let line = self.public_agent_line(agent_id, &line);
         self.registry.lock().map_err(|error| error.to_string())?.record_inbound_batch(
             agent_id,
             std::slice::from_ref(&line),
@@ -742,7 +848,7 @@ impl Runtime {
             self.publish(RuntimeEvent::Wire {
                 agent_id: agent_id.clone(),
                 outbound: false,
-                lines: public_batch.clone(),
+                lines: public_batch.iter().map(|line| self.public_agent_line(&agent_id, line)).collect(),
             });
             let active = self
                 .agents
@@ -1183,7 +1289,8 @@ import json,sys
 for line in sys.stdin:
     frame=json.loads(line)
     assert frame['params']['_meta']['codex']['bearerToken']=='private-provider-token'
-    print(json.dumps({'jsonrpc':'2.0','id':frame['id'],'result':{'received':True}}),flush=True)
+    print('upstream rejected private-provider-token',file=sys.stderr,flush=True)
+    print(json.dumps({'jsonrpc':'2.0','id':frame['id'],'result':{'received':True,'echo':'private-provider-token'}}),flush=True)
 "#,
         ]);
         runtime.start("agent".into(), metadata("codex"), &mut command).await.unwrap();
@@ -1200,9 +1307,13 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(result["received"], true);
+        assert_eq!(result["echo"], "private-provider-token");
         let mut saw_redacted_wire = false;
         let mut saw_redacted_outbound = false;
-        while let Ok(event) = receiver.try_recv() {
+        let mut saw_redacted_stderr = false;
+        // stderr and stdout are separate pipes; wait for the diagnostic as well as the reply.
+        while !saw_redacted_stderr || !saw_redacted_wire || !saw_redacted_outbound {
+            let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv()).await.unwrap().unwrap();
             let encoded = serde_json::to_string(&event).unwrap();
             assert!(!encoded.contains("private-provider-token"));
             match event {
@@ -1210,11 +1321,25 @@ for line in sys.stdin:
                     saw_redacted_wire |= lines.iter().any(|line| line.contains("redacted"));
                 }
                 RuntimeEvent::Outbound { line, .. } => saw_redacted_outbound |= line.contains("redacted"),
+                RuntimeEvent::Stderr { line, .. } => saw_redacted_stderr |= line.contains("[REDACTED]"),
                 _ => {}
             }
         }
         assert!(saw_redacted_wire && saw_redacted_outbound);
         runtime.stop("agent").unwrap();
+    }
+
+    #[test]
+    fn diagnostics_redact_escaped_and_rotated_credentials_without_corrupting_json() {
+        let mut private = PrivateValues::default();
+        let original = "key-with-\"quote\nand-newline";
+        private.remember(&serde_json::json!({"headers":{"authorization":format!("Bearer {original}")}}), false);
+        private.remember(&serde_json::json!({"_meta":{"codex":{"bearerToken":"rotated-secret"}}}), false);
+        let encoded = serde_json::json!({"id":1,"error":{"message":format!("{original} rotated-secret")}}).to_string();
+        let public: Value = serde_json::from_str(&private.line(&encoded)).unwrap();
+        assert_eq!(public["id"], 1);
+        assert_eq!(public["error"]["message"], "[REDACTED] [REDACTED]");
+        assert_eq!(private.line(&format!("stderr: {original}")), "stderr: [REDACTED]");
     }
 
     #[test]
