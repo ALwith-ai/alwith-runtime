@@ -49,6 +49,22 @@ fn public_request_line(value: &Value) -> String {
 #[derive(Default)]
 struct PrivateValues(HashSet<String>);
 impl PrivateValues {
+    fn command(command: &Command) -> Self {
+        let mut values = Self::default();
+        for (key, value) in command.as_std().get_envs() {
+            let key = key.to_string_lossy().to_ascii_uppercase();
+            if key.ends_with("_API_KEY")
+                || key.ends_with("_AUTH_TOKEN")
+                || key.ends_with("_ACCESS_TOKEN")
+                || key.ends_with("_SECRET")
+            {
+                if let Some(value) = value {
+                    values.remember(&Value::String(value.to_string_lossy().into_owned()), true);
+                }
+            }
+        }
+        values
+    }
     fn remember(&mut self, value: &Value, private: bool) {
         match value {
             Value::String(value) if private && !value.is_empty() => {
@@ -321,7 +337,7 @@ impl Runtime {
             agent_id.clone(),
             AgentHandle {
                 private_tool_ids: HashSet::new(),
-                private_values: PrivateValues::default(),
+                private_values: PrivateValues::command(command),
                 tool_owner: metadata
                     .owner_id
                     .strip_prefix("module:")
@@ -1129,6 +1145,17 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn launch_credentials_are_redacted_even_before_first_provider_request() {
+        let mut command = Command::new("engine");
+        command.env("ANTHROPIC_AUTH_TOKEN", "launch-private-key").env("OPENAI_API_KEY", "another-private-key");
+        let values = PrivateValues::command(&command);
+        let message = values.line(r#"{"error":"launch-private-key and another-private-key"}"#);
+        assert!(!message.contains("launch-private-key"));
+        assert!(!message.contains("another-private-key"));
+        assert!(serde_json::from_str::<Value>(&message).is_ok());
+    }
 
     #[tokio::test]
     async fn tool_callbacks_are_private_and_bound_to_the_spawn_owner() {

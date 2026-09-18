@@ -197,6 +197,22 @@ struct Subscriber {
     routed_modules: HashSet<String>,
 }
 
+struct Delegation {
+    module: String,
+    owner: String,
+    connection_id: u64,
+}
+
+struct DelegationGuard<'a> {
+    id: u64,
+    calls: &'a Mutex<HashMap<u64, Delegation>>,
+}
+impl Drop for DelegationGuard<'_> {
+    fn drop(&mut self) {
+        self.calls.lock().expect("module call scopes").remove(&self.id);
+    }
+}
+
 pub struct ModuleHost {
     runtime: Arc<Runtime>,
     /// 本 Runtime 的版本;清单 `runtime` 字段要求更高的模块不加载。
@@ -204,6 +220,8 @@ pub struct ModuleHost {
     modules: Mutex<HashMap<String, Arc<ModuleProcess>>>,
     subscribers: Mutex<Vec<Subscriber>>,
     next_subscriber: AtomicU64,
+    next_call: AtomicU64,
+    calls: Mutex<HashMap<u64, Delegation>>,
     dispatch: OnceLock<Dispatch>,
 }
 
@@ -215,6 +233,8 @@ impl ModuleHost {
             modules: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(Vec::new()),
             next_subscriber: AtomicU64::new(1),
+            next_call: AtomicU64::new(1),
+            calls: Mutex::new(HashMap::new()),
             dispatch: OnceLock::new(),
         });
         let weak = Arc::downgrade(&host);
@@ -433,11 +453,45 @@ impl ModuleHost {
         });
     }
 
+    /// Private-pipe delegation lasts only for the active application call and connection.
+    /// The module cannot nominate an owner or reuse a scope after its call returns.
+    fn delegated_request(&self, module: &str, params: Value) -> Result<(String, String, Value), ResponseError> {
+        let call_id = params["callId"].as_u64().ok_or_else(|| ResponseError::invalid_params("callId required"))?;
+        let calls = self.calls.lock().expect("module call scopes");
+        let call = calls
+            .get(&call_id)
+            .filter(|call| call.module == module)
+            .ok_or_else(|| ResponseError::runtime("module call scope expired or belongs to another module"))?;
+        if !self
+            .subscribers
+            .lock()
+            .expect("subscribers lock poisoned")
+            .iter()
+            .any(|subscriber| subscriber.id == call.connection_id)
+        {
+            return Err(ResponseError::connection_lost("application connection closed"));
+        }
+        let method = params["method"].as_str().ok_or_else(|| ResponseError::invalid_params("method required"))?;
+        if method != "acpRequest" {
+            return Err(ResponseError::invalid_params("call delegation only permits ACP requests"));
+        }
+        let mut arguments = params["params"].clone();
+        arguments
+            .as_object_mut()
+            .ok_or_else(|| ResponseError::invalid_params("params must be an object"))?
+            .remove("owner");
+        Ok((call.owner.clone(), method.to_string(), arguments))
+    }
+
     async fn handle_module_request(&self, module: &str, stdin: &ModuleInput, value: Value) {
         let id = value.get("id").cloned().unwrap_or(Value::Null);
         let method = value.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         let result = match self.dispatch.get() {
+            Some(dispatch) if method == "_runtime/requestForCall" => match self.delegated_request(module, params) {
+                Ok((owner, method, params)) => dispatch(owner, method, params).await,
+                Err(error) => Err(error),
+            },
             Some(dispatch) => dispatch(format!("module:{module}"), method, params).await,
             None => Err(ResponseError::runtime("module host has no dispatcher")),
         };
@@ -570,17 +624,36 @@ impl Extension for ModuleExtension {
                     .ok_or_else(|| ResponseError::connection_lost("module connection closed"))?;
                 subscriber.routed_modules.insert(module.clone());
             }
-            return self
-                .0
-                .call_module(
-                    &module,
-                    "_runtime/call",
-                    serde_json::json!({
-                        "connectionId":subscription.id, "owner":owner_id, "method":method, "params":params
-                    }),
-                )
-                .await
-                .map(Some);
+            let delegated = self.0.modules.lock().expect("modules lock poisoned").get(&module).is_some_and(|process| {
+                process.manifest.capabilities.iter().any(|capability| capability == "owner-requests")
+            });
+            let mut params = params;
+            let owner = if delegated {
+                let label = params.as_object_mut().and_then(|params| params.remove("owner"));
+                let label = match label {
+                    Some(Value::String(label)) => Some(label),
+                    Some(Value::Null) | None => None,
+                    Some(_) => return Err(ResponseError::invalid_params("owner must be a string")),
+                };
+                alwith_runtime_ws::owner_of(owner_id, label)
+            } else {
+                owner_id.to_string()
+            };
+            let mut envelope =
+                serde_json::json!({"connectionId":subscription.id,"owner":owner,"method":method,"params":params});
+            let _scope = if delegated {
+                let id = self.0.next_call.fetch_add(1, Ordering::Relaxed);
+                self.0
+                    .calls
+                    .lock()
+                    .expect("module call scopes")
+                    .insert(id, Delegation { module: module.clone(), owner, connection_id: subscription.id });
+                envelope["callId"] = id.into();
+                Some(DelegationGuard { id, calls: &self.0.calls })
+            } else {
+                None
+            };
+            return self.0.call_module(&module, "_runtime/call", envelope).await.map(Some);
         };
         let Some((module, module_method)) = rest.split_once('/') else {
             return Err(ResponseError::invalid_params(format!(
@@ -682,6 +755,37 @@ for line in sys.stdin:
             serde_json::json!({ "name": name, "version": "0.0.1", "entry": { "default": "entry.py" }, "persistent": true, "capabilities": ["network"] }).to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn delegated_requests_are_bound_to_module_call_and_live_connection() {
+        let journal = tempfile::tempdir().unwrap();
+        let host = ModuleHost::new(Arc::new(Runtime::with_journal(Journal::open(journal.path()).unwrap())), "0.3.0");
+        let (events, _) = mpsc::channel(1);
+        host.subscribers.lock().unwrap().push(Subscriber {
+            id: 7,
+            events,
+            disconnect: Arc::new(Notify::new()),
+            routed_modules: HashSet::new(),
+        });
+        host.calls
+            .lock()
+            .unwrap()
+            .insert(11, Delegation { module: "services".into(), owner: "window:actual".into(), connection_id: 7 });
+        let request = serde_json::json!({"callId":11,"method":"acpRequest","params":{"agentId":"agent","method":"providers/set","owner":"forged"}});
+        let scope = DelegationGuard { id: 11, calls: &host.calls };
+        let (owner, _, params) = host.delegated_request("services", request.clone()).unwrap();
+        assert_eq!(owner, "window:actual");
+        assert!(params.get("owner").is_none());
+        assert!(host.delegated_request("different-module", request.clone()).is_err());
+        let mut forbidden = request.clone();
+        forbidden["method"] = "start".into();
+        assert!(host.delegated_request("services", forbidden).is_err());
+        host.subscribers.lock().unwrap().clear();
+        assert!(host.delegated_request("services", request.clone()).is_err());
+        drop(scope);
+        assert!(host.delegated_request("services", request).is_err());
+        assert!(host.calls.lock().unwrap().is_empty());
     }
 
     #[test]

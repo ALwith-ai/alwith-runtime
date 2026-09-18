@@ -80,7 +80,7 @@ environment; this is not an OS sandbox or multi-tenant security boundary.
 
 Module-private operations (unavailable through public `modules/...` calls):
 
-- `_runtime/call`: `{connectionId,owner,method,params}`.
+- `_runtime/call`: `{connectionId,owner,method,params}`. Modules declaring `owner-requests` also receive a private `callId`. They may call `_runtime/requestForCall` with `{callId,method:"acpRequest",params}` while that application call and connection remain alive. Runtime supplies the original owner, strips any owner supplied by the module, and runs the normal agent ownership check. A routed application's optional `owner` label is scoped beneath its connection, matching core commands. Scopes expire on completion, cancellation or disconnect; another module cannot use them. This lets a credential-owning service call an engine without returning credentials to its caller.
 - `_runtime/disconnect`: `{connectionId}`; must release connection-owned resources.
 - `_runtime/ready`: resolves after initialization.
 - `_runtime/resolveLaunch`: optional private launch resolver.
