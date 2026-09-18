@@ -53,14 +53,13 @@ impl PrivateValues {
         let mut values = Self::default();
         for (key, value) in command.as_std().get_envs() {
             let key = key.to_string_lossy().to_ascii_uppercase();
-            if key.ends_with("_API_KEY")
+            if (key.ends_with("_API_KEY")
                 || key.ends_with("_AUTH_TOKEN")
                 || key.ends_with("_ACCESS_TOKEN")
-                || key.ends_with("_SECRET")
+                || key.ends_with("_SECRET"))
+                && let Some(value) = value
             {
-                if let Some(value) = value {
-                    values.remember(&Value::String(value.to_string_lossy().into_owned()), true);
-                }
+                values.remember(&Value::String(value.to_string_lossy().into_owned()), true);
             }
         }
         values
@@ -69,10 +68,10 @@ impl PrivateValues {
         match value {
             Value::String(value) if private && !value.is_empty() => {
                 self.0.insert(value.clone());
-                if let Some(token) = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")) {
-                    if !token.is_empty() {
-                        self.0.insert(token.into());
-                    }
+                if let Some(token) = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer "))
+                    && !token.is_empty()
+                {
+                    self.0.insert(token.into());
                 }
             }
             Value::Object(fields) => {
@@ -402,12 +401,12 @@ impl Runtime {
             Arc::clone(&handle.stdin)
         };
         let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        if value.get("method").is_none() {
-            if let Some(id) = value.get("id") {
-                let agents = self.agents.lock().map_err(|error| error.to_string())?;
-                if agents.get(agent_id).expect("agent under lane").private_tool_ids.contains(&id.to_string()) {
-                    return Err("module-owned tool replies cannot be supplied by application connections".into());
-                }
+        if value.get("method").is_none()
+            && let Some(id) = value.get("id")
+        {
+            let agents = self.agents.lock().map_err(|error| error.to_string())?;
+            if agents.get(agent_id).expect("agent under lane").private_tool_ids.contains(&id.to_string()) {
+                return Err("module-owned tool replies cannot be supplied by application connections".into());
             }
         }
         // ACP v2 每连接只握手一次;新属主(重载、接管)再发 `initialize` 时 Runtime 从缓存回放原响应,不再打扰引擎。
@@ -851,13 +850,12 @@ impl Runtime {
                     tool_calls.insert(key, abort);
                     continue;
                 }
-                if let Some(frame) = value.as_ref().filter(|v| v["method"] == "$/cancel_request") {
-                    if let Some(id) = frame.pointer("/params/requestId") {
-                        if let Some(task) = tool_calls.remove(&id.to_string()) {
-                            task.abort();
-                            continue;
-                        }
-                    }
+                if let Some(frame) = value.as_ref().filter(|v| v["method"] == "$/cancel_request")
+                    && let Some(id) = frame.pointer("/params/requestId")
+                    && let Some(task) = tool_calls.remove(&id.to_string())
+                {
+                    task.abort();
+                    continue;
                 }
                 public_batch.push(line);
             }
