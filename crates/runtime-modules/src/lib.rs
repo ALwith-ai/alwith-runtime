@@ -142,10 +142,11 @@ pub type Dispatch = Arc<
 >;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ResponseError>>>>>;
+type ModuleInput = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
 
 struct ModuleProcess {
     manifest: ModuleManifest,
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    stdin: ModuleInput,
     pending: Pending,
     next_id: AtomicU64,
     alive: Arc<std::sync::atomic::AtomicBool>,
@@ -274,7 +275,7 @@ impl ModuleHost {
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| format!("spawn {}: {error}", entry.display()))?;
-        let stdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take().expect("piped stdin")));
+        let stdin = Arc::new(tokio::sync::Mutex::new(Some(child.stdin.take().expect("piped stdin"))));
         let stdout = child.stdout.take().expect("piped stdout");
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -300,7 +301,26 @@ impl ModuleHost {
         let host = Arc::clone(self);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            // Requests may call back into the same module. Keep consuming responses
+            // while dispatch is pending, and own every dispatch until pipe EOF.
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                let line = tokio::select! {
+                    result = requests.join_next(), if !requests.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            log::error!("[modules] {name}: request task failed: {error}");
+                        }
+                        continue;
+                    }
+                    result = lines.next_line() => match result {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(error) => {
+                            log::warn!("[modules] {name}: stdout failed: {error}");
+                            break;
+                        }
+                    },
+                };
                 let text = line.trim();
                 if text.is_empty() {
                     continue;
@@ -315,7 +335,12 @@ impl ModuleHost {
                 if value.get("type").is_some() {
                     host.broadcast(&name, value);
                 } else if value.get("method").is_some() {
-                    host.handle_module_request(&name, &stdin, value).await;
+                    let host = Arc::clone(&host);
+                    let name = name.clone();
+                    let stdin = Arc::clone(&stdin);
+                    requests.spawn(async move {
+                        host.handle_module_request(&name, &stdin, value).await;
+                    });
                 } else if let Some(id) = value.get("id").and_then(Value::as_u64) {
                     let response = match value.get("error") {
                         Some(error) if !error.is_null() => Err(ResponseError::parse(error)),
@@ -327,6 +352,8 @@ impl ModuleHost {
                 }
             }
             alive.store(false, Ordering::Relaxed);
+            requests.abort_all();
+            while requests.join_next().await.is_some() {}
             for subscriber in host.subscribers.lock().expect("subscribers lock poisoned").iter() {
                 if subscriber.routed_modules.contains(&name) {
                     subscriber.disconnect.notify_one();
@@ -373,7 +400,7 @@ impl ModuleHost {
         });
     }
 
-    async fn handle_module_request(&self, module: &str, stdin: &Arc<tokio::sync::Mutex<ChildStdin>>, value: Value) {
+    async fn handle_module_request(&self, module: &str, stdin: &ModuleInput, value: Value) {
         let id = value.get("id").cloned().unwrap_or(Value::Null);
         let method = value.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
         let params = value.get("params").cloned().unwrap_or(Value::Null);
@@ -388,6 +415,7 @@ impl ModuleHost {
         let mut line = response.to_string();
         line.push('\n');
         let mut stdin = stdin.lock().await;
+        let Some(stdin) = stdin.as_mut() else { return };
         let _ = stdin.write_all(line.as_bytes()).await;
         let _ = stdin.flush().await;
     }
@@ -411,6 +439,10 @@ impl ModuleHost {
         line.push('\n');
         {
             let mut stdin = process.stdin.lock().await;
+            let Some(stdin) = stdin.as_mut() else {
+                process.pending.lock().expect("pending lock poisoned").remove(&id);
+                return Err(ResponseError::connection_lost(format!("module {module}: stdin closed")));
+            };
             if let Err(error) = stdin.write_all(line.as_bytes()).await.and(stdin.flush().await) {
                 process.pending.lock().expect("pending lock poisoned").remove(&id);
                 return Err(ResponseError::connection_lost(format!("module {module}: write failed: {error}")));
@@ -421,7 +453,7 @@ impl ModuleHost {
 }
 
 struct ModuleEventSink {
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    stdin: ModuleInput,
     alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -435,6 +467,7 @@ impl RuntimeEventSink for ModuleEventSink {
         let stdin = Arc::clone(&self.stdin);
         tokio::spawn(async move {
             let mut stdin = stdin.lock().await;
+            let Some(stdin) = stdin.as_mut() else { return };
             let _ = stdin.write_all(line.as_bytes()).await;
             let _ = stdin.flush().await;
         });
@@ -554,7 +587,9 @@ impl Extension for ModuleExtension {
             self.0.modules.lock().expect("modules lock poisoned").values().cloned().collect();
         for module in modules {
             let mut stdin = module.stdin.lock().await;
-            let _ = stdin.shutdown().await;
+            // ChildStdin::shutdown does not close the owned pipe on every platform.
+            // Drop the sole handle so modules observe EOF and dispatch tasks stop.
+            stdin.take();
         }
     }
 }
@@ -624,6 +659,74 @@ for line in sys.stdin:
         let found = discover(root.path());
         let names: Vec<&str> = found.iter().map(|(_, manifest)| manifest.name.as_str()).collect();
         assert_eq!(names, vec!["a-mod", "b-mod"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_module_request_can_wait_for_a_callback_to_the_same_module() {
+        let root = tempfile::tempdir().unwrap();
+        write_module(root.path(), "reverse");
+        let journal = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal.path()).unwrap()));
+        let host = ModuleHost::new(runtime, "0.3.0");
+        let weak_host = Arc::downgrade(&host);
+        let (completed, received) = oneshot::channel();
+        let completed = Arc::new(Mutex::new(Some(completed)));
+        host.set_dispatch(Arc::new(move |owner, method, _| {
+            let host = weak_host.upgrade().unwrap();
+            let completed = Arc::clone(&completed);
+            Box::pin(async move {
+                assert_eq!(owner, "module:reverse");
+                assert_eq!(method, "ping");
+                let result = host.call_module("reverse", "echo", serde_json::json!({"tool": "read"})).await;
+                completed.lock().unwrap().take().unwrap().send(result.clone()).unwrap();
+                result
+            })
+        }));
+        host.load_dir(root.path()).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), received)
+            .await
+            .expect("reverse callback must not deadlock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, serde_json::json!({"tool": "read"}));
+        ModuleExtension(Arc::clone(&host)).shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn module_eof_cancels_its_pending_dispatch_tasks() {
+        struct Dropped(Arc<Notify>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        write_module(root.path(), "closing");
+        let journal = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal.path()).unwrap()));
+        let host = ModuleHost::new(runtime, "0.3.0");
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let start_signal = Arc::clone(&started);
+        let drop_signal = Arc::clone(&dropped);
+        host.set_dispatch(Arc::new(move |_, _, _| {
+            let started = Arc::clone(&start_signal);
+            let dropped = Arc::clone(&drop_signal);
+            Box::pin(async move {
+                let _guard = Dropped(dropped);
+                started.notify_one();
+                std::future::pending().await
+            })
+        }));
+        host.load_dir(root.path()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified()).await.unwrap();
+        ModuleExtension(Arc::clone(&host)).shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped.notified())
+            .await
+            .expect("pipe EOF must release outstanding dispatch work");
+        assert!(!host.list()[0].alive);
     }
 
     #[cfg(unix)]
