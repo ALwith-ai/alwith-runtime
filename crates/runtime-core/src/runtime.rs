@@ -33,6 +33,17 @@ pub type PrivateToolDispatch = Arc<
 >;
 const TOOL_CALL_METHOD: &str = "_alwith/tool/call";
 
+// Credentials go to the engine, never to observers or replay diagnostics.
+fn public_request_line(value: &Value) -> String {
+    if matches!(value.get("method").and_then(Value::as_str), Some("providers/set" | "auth/login")) {
+        let mut public = value.clone();
+        public["params"] = serde_json::json!({"redacted": true});
+        public.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSnapshot {
     pub agent_id: String,
@@ -365,7 +376,9 @@ impl Runtime {
                 .expect("agent under lane")
                 .initialize_request_id = value.get("id").cloned();
         }
-        self.publish(RuntimeEvent::Wire { agent_id: agent_id.to_string(), outbound: true, lines: vec![wire_line] });
+        let public_wire = public_request_line(&value);
+        let line = public_request_line(&serde_json::from_str::<Value>(&line).expect("validated ACP frame"));
+        self.publish(RuntimeEvent::Wire { agent_id: agent_id.to_string(), outbound: true, lines: vec![public_wire] });
         let changed =
             self.registry.lock().map_err(|error| error.to_string())?.record_outbound(agent_id, &line, now_ms());
         let stamp = journal_stamp(self.commit_journal());
@@ -1048,7 +1061,9 @@ print(json.dumps({'method':'test/finished','params':{}}),flush=True)
         meta.owner_id = "module:board:chat".into();
         runtime.start("tool-agent".into(), meta, &mut command).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), callback_started.notified()).await.unwrap();
-        let spoof = runtime.send("tool-agent", r#"{"jsonrpc":"2.0","id":9,"result":{"success":true,"contentItems":[]}}"#.into()).await;
+        let spoof = runtime
+            .send("tool-agent", r#"{"jsonrpc":"2.0","id":9,"result":{"success":true,"contentItems":[]}}"#.into())
+            .await;
         assert!(spoof.unwrap_err().contains("module-owned tool replies"));
         release_callback.notify_one();
         let mut finished = false;
@@ -1152,6 +1167,64 @@ time.sleep(.1)
         let runtime = Arc::new(test_runtime());
         runtime.start("agent".into(), metadata("dsh"), &mut Command::new("cat")).await.unwrap();
         runtime
+    }
+
+    #[tokio::test]
+    async fn credentials_reach_the_engine_without_entering_observer_events() {
+        let runtime = Arc::new(test_runtime());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import json,sys
+for line in sys.stdin:
+    frame=json.loads(line)
+    assert frame['params']['_meta']['codex']['bearerToken']=='private-provider-token'
+    print(json.dumps({'jsonrpc':'2.0','id':frame['id'],'result':{'received':True}}),flush=True)
+"#,
+        ]);
+        runtime.start("agent".into(), metadata("codex"), &mut command).await.unwrap();
+        let result = runtime
+            .acp_request(
+                "agent",
+                "providers/set",
+                serde_json::json!({
+                    "providerId":"openai", "apiType":"openai", "baseUrl":"https://fixture.invalid",
+                    "_meta":{"codex":{"bearerToken":"private-provider-token"}}
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["received"], true);
+        let mut saw_redacted_wire = false;
+        let mut saw_redacted_outbound = false;
+        while let Ok(event) = receiver.try_recv() {
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert!(!encoded.contains("private-provider-token"));
+            match event {
+                RuntimeEvent::Wire { outbound: true, lines, .. } => {
+                    saw_redacted_wire |= lines.iter().any(|line| line.contains("redacted"));
+                }
+                RuntimeEvent::Outbound { line, .. } => saw_redacted_outbound |= line.contains("redacted"),
+                _ => {}
+            }
+        }
+        assert!(saw_redacted_wire && saw_redacted_outbound);
+        runtime.stop("agent").unwrap();
+    }
+
+    #[test]
+    fn auth_diagnostics_remove_all_private_input_but_keep_request_identity() {
+        let public: Value = serde_json::from_str(&public_request_line(&serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"auth/login", "params":{"password":"private-password", "_meta":{"apiKey":"private-key"}}
+        }))).unwrap();
+        assert_eq!(public["id"], 1);
+        assert_eq!(public["method"], "auth/login");
+        assert_eq!(public["params"], serde_json::json!({"redacted":true}));
     }
 
     #[tokio::test]

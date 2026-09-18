@@ -188,7 +188,8 @@ pub struct AgentMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RuntimeEvent {
-    /// 实际 stdio 原文，供协议诊断；Lines/Outbound 是剥掉 Runtime 信封前的同一份帧。
+    /// stdio 协议诊断；出站 providers/set 与 auth/login 的 params 脱敏。
+    /// 引擎收到原始私密参数，观察者和回放记录不会收到这些参数。
     Wire {
         agent_id: String,
         outbound: bool,
