@@ -1,5 +1,5 @@
 use alwith_runtime_protocol::{AgentMetadata, ResponseError, RuntimeEvent};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -49,6 +49,7 @@ pub trait RuntimeEventSink: Send + Sync {
 
 struct AgentHandle {
     tool_owner: Option<String>,
+    private_tool_ids: HashSet<String>,
     stdin: Arc<AsyncMutex<ChildStdin>>,
     child: AgentProcess,
     metadata: AgentMetadata,
@@ -227,6 +228,7 @@ impl Runtime {
         self.agents.lock().map_err(|error| error.to_string())?.insert(
             agent_id.clone(),
             AgentHandle {
+                private_tool_ids: HashSet::new(),
                 tool_owner: metadata
                     .owner_id
                     .strip_prefix("module:")
@@ -288,6 +290,14 @@ impl Runtime {
             Arc::clone(&handle.stdin)
         };
         let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if value.get("method").is_none() {
+            if let Some(id) = value.get("id") {
+                let agents = self.agents.lock().map_err(|error| error.to_string())?;
+                if agents.get(agent_id).expect("agent under lane").private_tool_ids.contains(&id.to_string()) {
+                    return Err("module-owned tool replies cannot be supplied by application connections".into());
+                }
+            }
+        }
         // ACP v2 每连接只握手一次;新属主(重载、接管)再发 `initialize` 时 Runtime 从缓存回放原响应,不再打扰引擎。
         let method = value.get("method").and_then(Value::as_str);
         let cached_initialize = method == Some("initialize")
@@ -675,8 +685,9 @@ impl Runtime {
                         continue;
                     }
                     let (owner, stdin) = {
-                        let agents = self.agents.lock().expect("runtime agents lock poisoned");
-                        let handle = agents.get(&agent_id).expect("agent under lane");
+                        let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
+                        let handle = agents.get_mut(&agent_id).expect("agent under lane");
+                        handle.private_tool_ids.insert(key.clone());
                         (handle.tool_owner.clone(), Arc::clone(&handle.stdin))
                     };
                     let dispatch = self.tool_dispatch.get().cloned();
@@ -1003,8 +1014,16 @@ mod tests {
     #[tokio::test]
     async fn tool_callbacks_are_private_and_bound_to_the_spawn_owner() {
         let runtime = Arc::new(test_runtime());
-        runtime.set_tool_dispatch(Arc::new(|owner, agent, params| {
+        let callback_started = Arc::new(tokio::sync::Notify::new());
+        let release_callback = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::clone(&callback_started);
+        let release = Arc::clone(&release_callback);
+        runtime.set_tool_dispatch(Arc::new(move |owner, agent, params| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
             Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
                 assert_eq!(owner, "board");
                 assert_eq!(agent, "tool-agent");
                 assert_eq!(params["name"], "private-read");
@@ -1028,6 +1047,10 @@ print(json.dumps({'method':'test/finished','params':{}}),flush=True)
         let mut meta = metadata("codex");
         meta.owner_id = "module:board:chat".into();
         runtime.start("tool-agent".into(), meta, &mut command).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), callback_started.notified()).await.unwrap();
+        let spoof = runtime.send("tool-agent", r#"{"jsonrpc":"2.0","id":9,"result":{"success":true,"contentItems":[]}}"#.into()).await;
+        assert!(spoof.unwrap_err().contains("module-owned tool replies"));
+        release_callback.notify_one();
         let mut finished = false;
         loop {
             let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
