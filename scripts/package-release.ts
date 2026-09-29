@@ -8,6 +8,7 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { $ } from "bun"
+import { checkWindowsRuntime } from "./check-windows-runtime"
 
 const platforms: Record<string, [string, string]> = {
   "aarch64-apple-darwin": ["darwin", "arm64"],
@@ -24,6 +25,8 @@ const [os, cpu] = platforms[target]!
 const exe = os === "win32" ? ".exe" : ""
 const binary = join(root, "target", target, "release", `alwith-runtime${exe}`)
 if (!existsSync(binary)) throw new Error(`Build first: ${binary} is missing`)
+// Check the actual artifact before staging: runner-installed DLLs can hide dynamic CRT dependencies.
+if (os === "win32") checkWindowsRuntime(binary)
 const version = (readFileSync(join(root, "Cargo.toml"), "utf8").match(/^version = "(.+)"$/m) ?? [])[1]
 if (!version) throw new Error("workspace version not found in Cargo.toml")
 
