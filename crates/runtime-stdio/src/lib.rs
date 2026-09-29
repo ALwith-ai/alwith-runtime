@@ -12,9 +12,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alwith_runtime_core::{RuntimeEvent, RuntimeEventSink};
+use alwith_runtime_core::{RuntimeEvent, RuntimeEventSink, protocol_lines};
 use alwith_runtime_ws::{RuntimeServer, SHUTDOWN_FORCE_WINDOW, SharedConnectionState, process_request_shared};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -63,7 +63,7 @@ where
         Arc::new(server.extension.connect(OWNER_ID, event_sender.clone(), Arc::clone(&disconnect)));
     let write_failed = Arc::new(tokio::sync::Notify::new());
     let mut writer = tokio::spawn(write_loop(output, event_receiver, Arc::clone(&dropped), Arc::clone(&write_failed)));
-    let mut lines = input.lines();
+    let mut lines = protocol_lines(input);
     tokio::pin!(shutdown);
 
     let result = loop {

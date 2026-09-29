@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
+mod framing;
 mod journal;
+pub use framing::{MAX_BUFFERED_BYTES, MAX_MESSAGE_BYTES, ProtocolLines, protocol_lines};
 mod port_scanner;
 pub mod process;
 mod runtime;
@@ -139,6 +141,9 @@ impl RuntimeRegistry {
         let replay = self.inbound_replay.entry(agent_id.to_string()).or_default();
         for line in lines {
             push_bounded(replay, line.clone(), AGENT_REPLAY_CAPACITY);
+            while replay.iter().map(String::len).sum::<usize>() > MAX_BUFFERED_BYTES {
+                replay.pop_front();
+            }
         }
 
         let mut changed = false;
@@ -444,6 +449,12 @@ impl RuntimeRegistry {
             return false;
         }
         if !matches!(method, Some("session/update" | "session/prompt" | "session/request_permission")) {
+            return false;
+        }
+        // ACP notices are live-only and must never be replayed after reconnect.
+        if method == Some("session/update")
+            && value.pointer("/params/update/sessionUpdate").and_then(Value::as_str) == Some("notice")
+        {
             return false;
         }
         let Some(session_id) = value.pointer("/params/sessionId").and_then(Value::as_str) else { return false };
@@ -903,6 +914,23 @@ mod tests {
                 JournalOp::Reset { .. } => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn notice_is_live_only_and_does_not_change_run_state() {
+        let mut registry = RuntimeRegistry::default();
+        registry.begin_agent("agent".into(), "main".into());
+        registry.record_outbound(
+            "agent",
+            r#"{"id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[]}}"#,
+            1,
+        );
+        registry.take_journal_ops();
+        let before = serde_json::to_value(registry.run_states()).unwrap();
+        let changed = registry.record_inbound_batch("agent", &[r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"notice","severity":"warning","title":"Advisory"}}}"#.into()], 2);
+        assert!(!changed);
+        assert!(registry.take_journal_ops().is_empty());
+        assert_eq!(serde_json::to_value(registry.run_states()).unwrap(), before);
     }
 
     #[test]

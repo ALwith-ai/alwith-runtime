@@ -365,7 +365,11 @@ async fn upgrade(
     if !authenticated || !protocols.split(',').map(str::trim).any(|protocol| protocol == PROTOCOL) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    Ok(websocket.protocols([PROTOCOL]).on_upgrade(move |socket| handle_socket(socket, server)))
+    Ok(websocket
+        .max_message_size(alwith_runtime_core::MAX_MESSAGE_BYTES)
+        .max_frame_size(alwith_runtime_core::MAX_MESSAGE_BYTES)
+        .protocols([PROTOCOL])
+        .on_upgrade(move |socket| handle_socket(socket, server)))
 }
 
 struct SocketEventSink {

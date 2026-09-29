@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
+use crate::{MAX_MESSAGE_BYTES, protocol_lines};
 
 /// 缺省日志目录:系统缓存目录下,「设置 → 缓存 → 清理」能一次收回。
 pub fn default_journal_root() -> std::path::PathBuf {
@@ -389,6 +390,9 @@ impl Runtime {
     }
 
     async fn send_inner(&self, agent_id: &str, line: String) -> Result<(), String> {
+        if line.len() > MAX_MESSAGE_BYTES {
+            return Err(format!("ACP message exceeds {MAX_MESSAGE_BYTES} bytes"));
+        }
         self.slow_mode_wait().await;
         let lane = self.lane(agent_id);
         let _operation = lane.lock().await;
@@ -761,7 +765,7 @@ impl Runtime {
     }
 
     async fn pump_stdout(self: Arc<Self>, agent_id: String, stdout: tokio::process::ChildStdout) {
-        let mut reader = BufReader::new(stdout).lines();
+        let mut reader = protocol_lines(stdout);
         let lane = self.lane(&agent_id);
         let mut tool_tasks = tokio::task::JoinSet::new();
         let mut tool_calls = HashMap::<String, tokio::task::AbortHandle>::new();
@@ -782,12 +786,19 @@ impl Runtime {
                     break;
                 }
             };
+            let mut batch_bytes = first.len();
             let mut batch = vec![first];
             let deadline = tokio::time::Instant::now() + OUTPUT_BATCH_WINDOW;
             let mut reached_end = false;
             loop {
                 match tokio::time::timeout_at(deadline, reader.next_line()).await {
-                    Ok(Ok(Some(line))) => batch.push(line),
+                    Ok(Ok(Some(line))) => {
+                        batch_bytes += line.len();
+                        batch.push(line);
+                        if batch_bytes >= MAX_MESSAGE_BYTES {
+                            break;
+                        }
+                    }
                     Ok(Ok(None)) => {
                         reached_end = true;
                         break;
