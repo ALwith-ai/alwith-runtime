@@ -27,6 +27,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: alwith-runtime
+      - uses: oven-sh/setup-bun@v2
+      - run: bun test ./scripts/__tests__/check-windows-runtime.test.ts
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
