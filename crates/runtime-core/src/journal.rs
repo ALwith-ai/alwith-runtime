@@ -1,11 +1,18 @@
-//! 会话事件日志:每个会话一个追加写的 jsonl,每帧带单调递增的 `sequence`。
+//! Session event journal: one append-only jsonl per session, each frame carrying a monotonically
+//! increasing `sequence`.
 //!
-//! 它是 Runtime 里**唯一**的会话帧留存点:晚加入的端按 `sequence` 补齐、观察面读生命周期、
-//! 移动端 attach 时回放,全部从这里读;注册表只保留状态机与未答权限的 id,不再各留一份
-//! 环形缓冲。Runtime 进程退出、agent 收尾之后文件都还在,重启后可继续查。
+//! It is the **only** place in the Runtime that retains session frames: late joiners catch up by
+//! `sequence`, the observer reads lifecycle from it,
+//! and mobile attach replays from it. The registry keeps only the state machine and the ids of
+//! unanswered permissions, no longer a ring buffer of its own.
+//! The files survive Runtime process exit and agent teardown, and can still be queried after a
+//! restart.
 //!
-//! 它**不是会话记录**:记录归引擎自写(`docs/architecture/runtime.md`「Runtime 不写记录」),
-//! 这里存的是 Runtime 经手的 ACP 帧原文,供观察与补齐,丢了只丢观察面,不丢会话。
+//! It is **not the session record**: records are written by the engine itself
+//! (`docs/architecture/runtime.md`,
+//! "the Runtime does not write records"),
+//! and what is stored here is the raw ACP frames the Runtime handled, for observation and catch-up.
+//! Losing it loses only the observer view, never the session.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -15,10 +22,11 @@ use std::sync::Mutex;
 
 use alwith_runtime_protocol::{FrameDirection, SessionEventFrame};
 
-/// 单个会话日志的字节上限。超过就只保留后半段(sequence 连续性不受影响,只是最早的帧没了)。
+/// Byte cap for a single session journal. Past it only the second half is kept (sequence continuity
+/// is unaffected; only the earliest frames are gone).
 pub const SESSION_JOURNAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// 注册表判定出的日志动作;由 runtime 落盘,注册表自己不做 IO。
+/// Journal action decided by the registry; the runtime persists it, the registry does no IO itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JournalOp {
     Append {
@@ -26,7 +34,8 @@ pub enum JournalOp {
         direction: FrameDirection,
         line: String,
     },
-    /// 引擎将重放历史(带 `replayFrom` 的 resume):旧帧作废,从头记。
+    /// The engine will replay history (resume with `replayFrom`): old frames are void, record from
+    /// scratch.
     Reset {
         session_id: String,
     },
@@ -57,7 +66,9 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
 }
 
 impl Journal {
-    /// 打开(必要时创建)日志根目录。文件按需打开,目录里可以已有上次留下的日志。
+    /// Open (creating if needed) the journal root directory. Files are opened on demand, and the
+    /// directory
+    /// may already hold journals left by a previous run.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|error| format!("create journal dir {}: {error}", root.display()))?;
@@ -89,7 +100,8 @@ impl Journal {
         Ok(OpenSession { writer: BufWriter::new(file), next_sequence, bytes })
     }
 
-    /// 应用一批注册表给出的动作,返回追加成功的帧(带分配好的 sequence)。整批结束后 flush 一次。
+    /// Apply a batch of actions from the registry and return the frames appended successfully (with
+    /// their assigned sequence). Flushes once after the whole batch.
     pub fn apply(&self, ops: &[JournalOp], recorded_at: i64) -> Result<Vec<SessionEventFrame>, String> {
         if ops.is_empty() {
             return Ok(Vec::new());
@@ -143,7 +155,7 @@ impl Journal {
         Ok(appended)
     }
 
-    /// 超限时只保留后半段:重写文件,sequence 原样保留。
+    /// When over the limit, keep only the second half: rewrite the file, preserving sequence as is.
     fn compact(&self, session_id: &str) -> Result<OpenSession, String> {
         let path = self.path(session_id);
         let frames = read_frames(&path, None, usize::MAX)?;
@@ -163,17 +175,20 @@ impl Journal {
         self.open_session(session_id)
     }
 
-    /// `after_sequence` 之后的帧(不含),最多 `limit` 条。`None` 从头读。
+    /// Frames after `after_sequence` (exclusive), at most `limit`. `None` reads from the start.
     pub fn read_since(
         &self, session_id: &str, after_sequence: Option<u64>, limit: usize,
     ) -> Result<Vec<SessionEventFrame>, String> {
         validate_session_id(session_id)?;
-        // 持锁读:保证读到的是已经 flush 的全部帧,不会与正在写的批次交错。
+        // Read under the lock: guarantees we see every frame already flushed and never interleave
+        // with a
+        // batch being written.
         let _sessions = self.sessions.lock().map_err(|error| error.to_string())?;
         read_frames(&self.path(session_id), after_sequence, limit)
     }
 
-    /// 已有日志的会话 id 列表(重启后观察面据此列出还能查的会话)。
+    /// Ids of sessions that have a journal (after a restart the observer lists queryable sessions
+    /// from this).
     pub fn sessions(&self) -> Result<Vec<String>, String> {
         let mut ids = Vec::new();
         for entry in
@@ -216,7 +231,8 @@ fn read_frames(path: &Path, after_sequence: Option<u64>, limit: usize) -> Result
     Ok(frames)
 }
 
-/// 文件末尾那一帧的 sequence。只读最后 64KB,大文件不用整个扫。
+/// Sequence of the last frame in the file. Reads only the last 64KB so large files need no full
+/// scan.
 fn last_sequence(mut reader: BufReader<File>) -> Result<Option<u64>, String> {
     let length = reader.get_ref().metadata().map_err(|error| error.to_string())?.len();
     let start = length.saturating_sub(64 * 1024);
@@ -224,7 +240,7 @@ fn last_sequence(mut reader: BufReader<File>) -> Result<Option<u64>, String> {
     let mut last: Option<u64> = None;
     let mut lines = reader.lines();
     if start > 0 {
-        // 从中间起读,第一行多半是半截,丢掉。
+        // Start reading from the middle; the first line is probably partial, drop it.
         lines.next();
     }
     for line in lines {

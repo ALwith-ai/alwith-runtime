@@ -1,10 +1,12 @@
-// 打一个平台的 npm 平台包:dist/npm/<os>-<cpu>/,里面是二进制、artifact.json(版本、目标、sha256)、
-// LICENSE、THIRD_PARTY_NOTICES.md、licenses/(每个第三方 crate 的许可原文)、package.json。
-// @alwith/runtime 本体(packages/runtime)按 optionalDependencies 指向这五个平台包,应用 bun install
-// 只装自己平台那一个,构建时 stageRuntime() 校验 sha 后拷进 sidecar。
+// Builds the npm platform package for one platform: dist/npm/<os>-<cpu>/, holding the binary,
+// artifact.json (version, target, sha256), LICENSE, THIRD_PARTY_NOTICES.md, licenses/ (the license
+// text of every third-party crate) and package.json.
+// The @alwith/runtime main package (packages/runtime) points at these five platform packages through
+// optionalDependencies; an app's bun install installs only its own platform's, and at build time
+// stageRuntime() verifies the sha and copies it into the sidecar.
 //
-// 用法:bun scripts/package-release.ts <rust-target-triple>
-// 前提:cargo build --release --locked -p alwith-runtime --target <triple> 已经跑完。
+// Usage: bun scripts/package-release.ts <rust-target-triple>
+// Prerequisite: cargo build --release --locked -p alwith-runtime --target <triple> has already finished.
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { $ } from "bun"
@@ -25,7 +27,8 @@ const [os, cpu] = platforms[target]!
 const exe = os === "win32" ? ".exe" : ""
 const binary = join(root, "target", target, "release", `alwith-runtime${exe}`)
 if (!existsSync(binary)) throw new Error(`Build first: ${binary} is missing`)
-// Check the actual artifact before staging: runner-installed DLLs can hide dynamic CRT dependencies.
+// Check the actual artifact before staging: runner-installed DLLs can hide dynamic CRT
+// dependencies.
 if (os === "win32") checkWindowsRuntime(binary)
 const version = (readFileSync(join(root, "Cargo.toml"), "utf8").match(/^version = "(.+)"$/m) ?? [])[1]
 if (!version) throw new Error("workspace version not found in Cargo.toml")
@@ -36,8 +39,9 @@ mkdirSync(stage, { recursive: true })
 cpSync(binary, join(stage, `alwith-runtime${exe}`))
 cpSync(join(root, "LICENSE"), join(stage, "LICENSE"))
 
-// 第三方许可:按这个平台实际链进来的 crate 收,原文一份不少;没有许可文件的 crate 用已知的上游位置补,
-// 补不到就失败 —— 少一份就是分发违规,不能静默。
+// Third-party licenses: collected for the crates actually linked for this platform, every license text
+// included; a crate without a license file is filled in from a known upstream location, and the script
+// fails if that is not possible -- a missing one is a distribution violation and must not pass silently.
 const metadata = await $`cargo metadata --format-version 1 --filter-platform ${target}`.cwd(root).json()
 const notices = ["# Runtime third-party notices", "", "ALwith implementations remain proprietary. Third-party software retains its own licences.", ""]
 const known: Record<string, string> = {

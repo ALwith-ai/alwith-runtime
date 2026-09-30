@@ -1,17 +1,23 @@
-//! 模块宿主。模块是包:目录里一份 `alwith-module.json` 清单加一个可执行入口;Runtime 按清单
-//! spawn 入口为子进程,和它在 stdio 上说与应用相同的一行一帧协议。三种帧,按字段区分:
+//! Module host. A module is a package: a directory with an `alwith-module.json` manifest plus an
+//! executable entry. Runtime spawns the entry as a child process according to the manifest and speaks
+//! to it on stdio with the same one-frame-per-line protocol the app uses.
 //!
-//! - 模块 → Runtime 的请求 `{id, method, params}`:模块是一个客户端,能调 Runtime 的任何方法,
-//!   属主记为 `module:<name>`。Runtime 回 `{id, result | error}`。
-//! - Runtime → 模块的请求:应用调 `modules/<name>/<method>`,Runtime 原样转给模块
-//!   `{id, method, params}`,模块回 `{id, result | error}`。两个方向各自编 id。
-//! - 事件 `{type, ...}`:Runtime 的事件原样推给模块;模块发的事件包成
-//!   `{"type":"module","module":<name>,"event":{...}}` 广播给所有应用连接。
+//! Three kinds of frame, told apart by their fields:
 //!
-//! 清单字段:`name`、`version`、`entry`(按 target triple 或 `default` 给相对路径)、`runtime`
-//! (最低 Runtime 版本,只记录)、`persistent`(要求 Runtime 常驻)、`capabilities`(声明会碰什么,
-//! 只记录不拦截)。发现规则:`<dir>/*/alwith-module.json` 与 `<dir>/@*/*/alwith-module.json`,
-//! 也就是应用的 `node_modules`。
+//! - Module -> Runtime request `{id, method, params}`: the module is a client and may call any Runtime
+//!   method; the owner is recorded as `module:<name>`. Runtime answers `{id, result | error}`.
+//! - Runtime -> module request: the app calls `modules/<name>/<method>`, and Runtime forwards it to the
+//!   module unchanged as `{id, method, params}`; the module answers `{id, result | error}`. Each
+//!   direction numbers its own ids.
+//! - Events `{type, ...}`: Runtime events are pushed to the module as they are; events sent by the
+//!   module are wrapped as `{"type":"module","module":<name>,"event":{...}}` and broadcast to every
+//!   app connection.
+//!
+//! Manifest fields: `name`, `version`, `entry` (a relative path per target triple, or `default`),
+//! `runtime` (minimum Runtime version, recorded only), `persistent` (requires Runtime to stay
+//! resident), `capabilities` (declares what it will touch, recorded but not enforced). Discovery
+//! rules: `<dir>/*/alwith-module.json` and `<dir>/@*/*/alwith-module.json`, i.e. the app's
+//! `node_modules`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -33,7 +39,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 pub const MANIFEST_FILE: &str = "alwith-module.json";
 pub const METHOD_PREFIX: &str = "modules/";
-/// 应用查已加载模块的方法名。
+/// Method name the app uses to query loaded modules.
 pub const LIST_METHOD: &str = "modules";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -41,7 +47,7 @@ pub const LIST_METHOD: &str = "modules";
 pub struct ModuleManifest {
     pub name: String,
     pub version: String,
-    /// target triple → 入口相对路径;没有匹配项时取 `default`。
+    /// target triple -> entry relative path; falls back to `default` when nothing matches.
     pub entry: BTreeMap<String, String>,
     #[serde(default)]
     pub runtime: Option<String>,
@@ -55,7 +61,8 @@ pub struct ModuleManifest {
 }
 
 impl ModuleManifest {
-    /// 先按本机 target triple 找入口,没有(或文件不在,如开发态未打包)再取 `default`。
+    /// Looks for the entry by the host's target triple first, then falls back to `default` if there is none
+    /// (or the file is missing, e.g. an unpackaged dev build).
     pub fn entry_path(&self, module_dir: &Path) -> Result<PathBuf, String> {
         let triple = current_triple();
         let candidates = [self.entry.get(&triple), self.entry.get("default")];
@@ -85,7 +92,7 @@ pub fn current_triple() -> String {
     format!("{arch}-{os}")
 }
 
-/// 扫一个目录(通常是应用的 `node_modules`)里所有带清单的包。
+/// Scans a directory (usually the app's `node_modules`) for all packages carrying a manifest.
 pub fn discover(modules_dir: &Path) -> Vec<(PathBuf, ModuleManifest)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(modules_dir) else { return found };
@@ -117,13 +124,15 @@ fn push_if_module(found: &mut Vec<(PathBuf, ModuleManifest)>, dir: &Path) {
         .map_err(|error| error.to_string())
         .and_then(|text| serde_json::from_str::<ModuleManifest>(&text).map_err(|error| error.to_string()))
     {
-        // node_modules 里常是符号链接(workspace / bun link):入口按真实目录解析,否则相对路径落空。
+        // node_modules often holds symlinks (workspace / bun link): resolve the entry against the real
+        // directory, otherwise the relative path misses.
         Ok(manifest) => found.push((dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()), manifest)),
         Err(error) => log::warn!("[modules] {} unreadable: {error}", manifest_path.display()),
     }
 }
 
-/// 清单 `runtime` 字段:`>=X.Y.Z`(或裸 `X.Y.Z`,同义)。只认这一种写法,别的写法报错而不是装作满足。
+/// Manifest `runtime` field: `>=X.Y.Z` (or a bare `X.Y.Z`, equivalent). Only this one form is accepted;
+/// any other form is an error rather than pretending to be satisfied.
 pub fn runtime_satisfies(version: &str, requirement: &str) -> Result<bool, String> {
     fn parse(text: &str) -> Result<(u64, u64, u64), String> {
         let mut parts = text.trim().split('.').map(|part| part.parse::<u64>());
@@ -136,7 +145,8 @@ pub fn runtime_satisfies(version: &str, requirement: &str) -> Result<bool, Strin
     Ok(parse(version)? >= parse(required)?)
 }
 
-/// 模块 → Runtime 请求的执行器,由 Runtime 主程序在建好 RuntimeServer 后接进来。
+/// Executor of module -> Runtime requests, wired in by the Runtime main program after it builds the
+/// RuntimeServer.
 pub type Dispatch = Arc<
     dyn Fn(String, String, Value) -> Pin<Box<dyn Future<Output = Result<Value, ResponseError>> + Send>> + Send + Sync,
 >;
@@ -173,7 +183,8 @@ struct ModuleProcess {
     pending: Pending,
     next_id: AtomicU64,
     alive: Arc<std::sync::atomic::AtomicBool>,
-    /// Runtime 只持 sink 的弱引用;强引用挂在模块进程上,进程在事件就一直送。
+    /// Runtime holds only a weak reference to the sink; the strong reference hangs on the module process, so
+    /// events keep flowing as long as the process lives.
     _sink: Arc<dyn RuntimeEventSink>,
     _child: Child,
 }
@@ -188,8 +199,10 @@ pub struct ModuleStatus {
     pub alive: bool,
 }
 
-/// 一条应用连接对模块事件的订阅:队列满就让协议层断开这条慢连接(与 Runtime 事件同一策略),
-/// 客户端重连后自己补;绝不静默丢掉订阅让连接以为自己还在收。
+/// An app connection's subscription to module events: when the queue is full the protocol layer
+/// disconnects the slow connection (the same policy as Runtime events),
+/// the client catches up after reconnecting; a subscription is never silently dropped while the
+/// connection believes it is still receiving.
 struct Subscriber {
     id: u64,
     events: mpsc::Sender<String>,
@@ -215,7 +228,7 @@ impl Drop for DelegationGuard<'_> {
 
 pub struct ModuleHost {
     runtime: Arc<Runtime>,
-    /// 本 Runtime 的版本;清单 `runtime` 字段要求更高的模块不加载。
+    /// This Runtime's version; modules whose manifest `runtime` field requires a higher one are not loaded.
     runtime_version: String,
     modules: Mutex<HashMap<String, Arc<ModuleProcess>>>,
     subscribers: Mutex<Vec<Subscriber>>,
@@ -249,12 +262,13 @@ impl ModuleHost {
         host
     }
 
-    /// 接上模块 → Runtime 请求的执行器。在 RuntimeServer 建好后调一次。
+    /// Wires in the executor of module -> Runtime requests. Called once after the RuntimeServer is built.
     pub fn set_dispatch(&self, dispatch: Dispatch) {
         let _ = self.dispatch.set(dispatch);
     }
 
-    /// 加载目录里的全部模块;单个模块起不来只记日志,不影响其他模块。
+    /// Loads every module in the directory; a single module failing to start is only logged and does not
+    /// affect the others.
     pub async fn load_dir(self: &Arc<Self>, modules_dir: &Path) -> Vec<ModuleStatus> {
         for (dir, manifest) in discover(modules_dir) {
             if let Err(error) = self.spawn(&dir, manifest.clone()).await {
@@ -282,7 +296,8 @@ impl ModuleHost {
         statuses
     }
 
-    /// 是否有活着的常驻模块(Runtime 退出策略据此决定要不要留着)。
+    /// Whether any resident (persistent) module is alive (Runtime's exit policy uses this to decide whether
+    /// to stay).
     pub fn has_persistent(&self) -> bool {
         self.modules
             .lock()
@@ -335,7 +350,7 @@ impl ModuleHost {
         let name = manifest.name.clone();
         log::info!("[modules] {name} {} started (pid {:?})", manifest.version, child.id());
 
-        // Runtime 事件 → 模块 stdin(模块是一个客户端)。
+        // Runtime events -> module stdin (a module is a client).
         let sink: Arc<dyn RuntimeEventSink> =
             Arc::new(ModuleEventSink { stdin: Arc::clone(&stdin), alive: Arc::clone(&alive) });
         let sink_id = self.runtime.add_sink(&sink);
@@ -507,7 +522,7 @@ impl ModuleHost {
         let _ = stdin.flush().await;
     }
 
-    /// 应用 → 模块的请求。
+    /// App -> module request.
     pub async fn call_module(&self, module: &str, method: &str, params: Value) -> Result<Value, ResponseError> {
         let process = self
             .modules
@@ -574,7 +589,7 @@ impl Drop for Subscription {
     }
 }
 
-/// 把模块宿主挂进 RuntimeServer 的 `Extension` 插槽。
+/// Attaches the module host to the RuntimeServer's `Extension` slot.
 pub struct ModuleExtension(pub Arc<ModuleHost>);
 
 #[async_trait]
@@ -719,7 +734,7 @@ mod tests {
         }
     }
 
-    /// 一个用 python 写的模块:回答 echo / fail,启动时发一个事件并向 Runtime 发一次 ping。
+    /// A module written in python: answers echo / fail, sends one event at startup and one ping to Runtime.
     const MODULE_SCRIPT: &str = r#"#!/usr/bin/env python3
 import json, sys
 print(json.dumps({"type": "hello", "pid": 1}), flush=True)
@@ -899,7 +914,7 @@ for line in sys.stdin:
         assert!(statuses[0].alive && statuses[0].persistent);
         assert!(host.has_persistent());
 
-        // 一条应用连接经 stdio 入口。
+        // An app connection through the stdio entry.
         let (client_reader, server_writer) = tokio::io::duplex(64 * 1024);
         let (server_reader, mut client_writer) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -916,7 +931,8 @@ for line in sys.stdin:
         let unknown = serde_json::json!({ "id": 9, "method": "modules/echo/nope" }).to_string() + "\n";
         client_writer.write_all(unknown.as_bytes()).await.unwrap();
 
-        // Runtime 的事件要到模块:模块把收到的事件类型回报成自己的事件。
+        // Runtime events must reach the module: the module reports each received event type back as its own
+        // event.
         host.runtime.publish(RuntimeEvent::Stderr { agent_id: "probe".into(), line: "hello module".into() });
 
         let mut echoed = None;

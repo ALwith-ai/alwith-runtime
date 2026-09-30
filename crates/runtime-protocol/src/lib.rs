@@ -1,26 +1,30 @@
-//! `alwith-runtime-v1` 帧协议里的类型:会话运行态、生命周期帧、日志帧、agent 元数据与 Runtime 事件。
+//! Types in the `alwith-runtime-v1` frame protocol: session run state, lifecycle frames, journal
+//! frames,
+//! agent metadata and Runtime events.
 //! Canonical wire types owned by Runtime. Client bindings are exported from this definition.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
 
-/// 响应帧里的 `error`,JSON-RPC 的形状。Runtime 自己的错误用下面几个 code;
-/// agent 回的 ACP 错误(`acpRequest` 等)原样透传,`code`/`data` 都是 agent 给的。
+/// The `error` in a response frame, in JSON-RPC shape. Runtime's own errors use the codes below;
+/// ACP errors returned by the agent (`acpRequest` etc.) pass through unchanged, `code`/`data` come
+/// from the agent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct ResponseError {
     pub code: i64,
     pub message: String,
-    /// agent 错误附带的数据(如 `{details}`、`{authMethods}`);没有就是 null。
+    /// Data attached to an agent error (e.g. `{details}`, `{authMethods}`); null if absent.
     #[serde(default)]
     #[specta(type = Option<specta_typescript::Unknown>)]
     pub data: Option<Value>,
 }
 
 impl ResponseError {
-    /// Runtime 执行失败(没有该 agent、不是属主、agent 退出…)。
+    /// Runtime failed to execute (no such agent, not the owner, agent exited...).
     pub const RUNTIME: i64 = -32000;
-    /// 连接断了:Runtime 退出、写不进去。客户端本地生成,Runtime 不会发。
+    /// Connection lost: Runtime exited or cannot be written to. Generated locally by the client,
+    /// never sent by Runtime.
     pub const CONNECTION_LOST: i64 = -32001;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
@@ -45,7 +49,8 @@ impl ResponseError {
         Self::new(Self::INVALID_PARAMS, format!("invalid params: {detail}"))
     }
 
-    /// 帧里的 `error` 对象 → 原样;不是这个形状就整个当 message。
+    /// The frame's `error` object -> as is; if it is not that shape, the whole value becomes the
+    /// message.
     pub fn parse(error: &Value) -> Self {
         match serde_json::from_value::<Self>(error.clone()) {
             Ok(parsed) => parsed,
@@ -80,7 +85,8 @@ impl From<ResponseError> for String {
     }
 }
 
-/// attach 时仍没回答的 agent 请求(`session/request_permission` 等),新属主用 `acpRespond` 带同一个 `id` 回答。
+/// Agent requests still unanswered at attach time (`session/request_permission` etc.); the new
+/// owner answers them with `acpRespond` using the same `id`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct PendingAgentRequest {
     #[specta(type = specta_typescript::Unknown)]
@@ -90,9 +96,12 @@ pub struct PendingAgentRequest {
     pub params: Value,
 }
 
-/// 会话运行态。前三个直接是 ACP v2 `StateUpdate` 的取值(agent 直报,不再由 Runtime 从流量推导);
-/// `Done` 是我们自己合成的产品态 —— 协议没有「完成没人看」这个概念,它 = idle + 未读,
-/// 由 `upsert_run_state` 在 running/done → idle 的迁移上合成,只由 `markRead` 消费。
+/// Session run state. The first three are values of ACP v2 `StateUpdate` directly (reported by the
+/// agent, no longer derived by Runtime from traffic);
+/// `Done` is a product state we synthesize ourselves: the protocol has no notion of "finished but
+/// unseen". It = idle + unread,
+/// synthesized by `upsert_run_state` on a running/done -> idle transition and consumed only by
+/// `markRead`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
@@ -119,13 +128,16 @@ pub struct SessionRunState {
     pub reusable_draft: bool,
     #[serde(rename = "owner")]
     pub owner_id: String,
-    /// 会话工作目录(session/new|load|resume|fork 的 params.cwd)。空串 = init 请求没带
-    /// (如进程重启后仅凭 prompt 追踪到的会话)。移动端列表显示用。
+    /// Session working directory (params.cwd of session/new|load|resume|fork). Empty string = the
+    /// init request carried none
+    /// (e.g. a session tracked only from a prompt after a process restart). Used for mobile list
+    /// display.
     pub cwd: String,
-    /// 会话标题(session/update 的 session_info_update.title,与桌面 chat 标题同源)。
-    /// 空串 = agent 还没产出标题。移动端列表显示用。
+    /// Session title (session_info_update.title in session/update, same source as the desktop chat
+    /// title).
+    /// Empty string = the agent has not produced a title yet. Used for mobile list display.
     pub title: String,
-    /// 进入当前状态的时刻(epoch ms)。同态延续时保留。
+    /// Time the current state was entered (epoch ms). Kept when the same state continues.
     pub since: i64,
     pub tasks: Vec<SessionTask>,
     pub listening_ports: Vec<u16>,
@@ -146,26 +158,30 @@ pub struct SessionLifecycleFrame {
 #[serde(rename_all = "camelCase")]
 pub struct AttachInfo {
     pub agent_id: String,
-    /// 该 agent spawn 时起的芯(AgentMetadata 权威值),由 `Runtime::attach` 填。
+    /// The core this agent was spawned with (authoritative AgentMetadata value), filled by
+    /// `Runtime::attach`.
     pub engine: String,
-    /// 该 agent 最近一次确认的 provider(启动配置或成功的 providers/set)。attach 不 spawn,
-    /// 前端据此标记当前供应商(prompt 逐轮下发的 _meta.alwith.providerId 依赖它)。
-    /// registry 不持进程 metadata,由 `Runtime::attach`(唯一公开出口)填。
+    /// The agent's most recently confirmed provider (startup config or a successful providers/set).
+    /// attach does not spawn,
+    /// so the frontend uses this to mark the current provider (the _meta.alwith.providerId sent
+    /// with every prompt depends on it).
+    /// The registry holds no process metadata; filled by `Runtime::attach` (the only public exit).
     pub provider: String,
-    /// 仍没回答的 agent 请求,给新属主接着答。来源是入站回放缓冲,极端情况下可能已被冲掉。
+    /// Agent requests still unanswered, for the new owner to answer. Sourced from the inbound
+    /// replay buffer, which may have been flushed in extreme cases.
     pub pending_agent_requests: Vec<PendingAgentRequest>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameDirection {
-    /// agent → Runtime(session/update、request_permission 等)。
+    /// agent -> Runtime (session/update, request_permission, etc.).
     In,
-    /// Runtime → agent(session/prompt 等)。
+    /// Runtime -> agent (session/prompt, etc.).
     Out,
 }
 
-/// 日志里的一帧。`line` 是 ACP JSON-RPC 原文(Runtime 信封之前)。
+/// One frame in the journal. `line` is the raw ACP JSON-RPC text (before the Runtime envelope).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionEventFrame {
@@ -178,7 +194,8 @@ pub struct SessionEventFrame {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMetadata {
     pub owner_id: String,
-    /// 起的是哪颗芯(desktop engine 清单键;Runtime 只透传,不解释)。attach 不 spawn,前端只能从这里知道。
+    /// Which core was started (desktop engine manifest key; Runtime only passes it through). attach
+    /// does not spawn, so the frontend can only learn it here.
     pub engine: String,
     pub provider: String,
     pub model: String,
@@ -188,19 +205,21 @@ pub struct AgentMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RuntimeEvent {
-    /// stdio 协议诊断；出站 providers/set 与 auth/login 的 params 脱敏。
-    /// 引擎收到原始私密参数，观察者和回放记录不会收到这些参数。
+    /// stdio protocol diagnostics; params of outbound providers/set and auth/login are redacted.
+    /// The engine receives the raw secret params; observers and replay records never see them.
     Wire {
         agent_id: String,
         outbound: bool,
         lines: Vec<String>,
     },
-    /// agent 输出的 ACP 帧(agent → 应用),按 16ms 合批,每帧已带 `_alwithRuntime` 信封。
+    /// ACP frames output by the agent (agent -> app), batched every 16ms, each already carrying the
+    /// `_alwithRuntime` envelope.
     Inbound {
         agent_id: String,
         lines: Vec<String>,
     },
-    /// 应用发给 agent 的一帧。进会话日志的帧带 `session_id` 与 `sequence`(见 `AcpNotification`)。
+    /// A frame the app sent to the agent. Frames entering the session journal carry `session_id`
+    /// and `sequence` (see `AcpNotification`).
     Outbound {
         agent_id: String,
         line: String,
@@ -213,18 +232,22 @@ pub enum RuntimeEvent {
         agent_id: String,
         line: String,
     },
-    /// agent 进程已收尸。同一个 agentId 不会有第二个进程在跑(`start` 在它活着时直接拒),
-    /// 所以这条事件没有歧义:收到它就是「我这个 agent 没了」。
+    /// The agent process has been reaped. There is never a second process running under the same
+    /// agentId (`start` rejects while it is alive),
+    /// so this event is unambiguous: receiving it means "my agent is gone".
     Exit {
         agent_id: String,
     },
     RunStates {
         sessions: Vec<SessionRunState>,
     },
-    /// agent 发来的 ACP 通知(`session/update` 等),Runtime 已拆帧;与 `inbound` 里的同一帧并存。
+    /// ACP notification from the agent (`session/update` etc.), already unframed by Runtime;
+    /// coexists with the same frame in `inbound`.
     ///
-    /// 进了会话日志的帧带 `session_id` 与 `sequence`(与 `sessionEvents` 里同一帧的序号相同):
-    /// 客户端据此发现漏帧(序号跳了)并用 `sessionEvents` 补齐。不进日志的帧没有这两个字段。
+    /// Frames that entered the session journal carry `session_id` and `sequence` (same number as
+    /// the same frame in `sessionEvents`):
+    /// the client uses it to detect missed frames (a sequence gap) and refill via `sessionEvents`.
+    /// Frames not journaled have neither field.
     AcpNotification {
         agent_id: String,
         method: String,
@@ -234,8 +257,9 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence: Option<u64>,
     },
-    /// agent 发来的 ACP 请求(`session/request_permission`、`elicitation/create`、`fs/*`…),
-    /// 应用用 `acpRespond` 带同一个 `id` 回答。序号字段同 `AcpNotification`。
+    /// ACP request from the agent (`session/request_permission`, `elicitation/create`, `fs/*`...),
+    /// the app answers with `acpRespond` using the same `id`. Sequence fields as in
+    /// `AcpNotification`.
     AcpAgentRequest {
         agent_id: String,
         id: Value,

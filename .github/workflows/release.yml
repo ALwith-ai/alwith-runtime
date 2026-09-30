@@ -1,8 +1,11 @@
-# 发 Runtime:推 v<版本> 的 tag,五个平台各编一次,发到 npm —— @alwith/runtime 本体 + 五个
-# @alwith/runtime-<os>-<cpu> 平台包。这是唯一的分发渠道:应用 bun install 按平台装一个,
-# 构建时 stageRuntime() 校验 sha 后拷进 sidecar。不发 GitHub Release,不用任何 token
-# (npm trusted publishing;npmjs.com 上六个包各配一条:Repository alwith-runtime / Workflow release.yml)。
-# tag 必须等于 Cargo 工作区版本,也必须等于 packages/runtime 的版本和它五个 optionalDependencies。
+# Publish Runtime: pushing a v<version> tag builds once on each of the five platforms and publishes to
+# npm: the @alwith/runtime main package plus five @alwith/runtime-<os>-<cpu> platform packages. This is
+# the only distribution channel: an app's bun install picks the one for its platform, and at build time
+# stageRuntime() verifies the sha and copies it into the sidecar. No GitHub Release is published and no
+# token is used (npm trusted publishing; on npmjs.com each of the six packages gets one entry:
+# Repository alwith-runtime / Workflow release.yml).
+# The tag must equal the Cargo workspace version, and also the packages/runtime version and its five
+# optionalDependencies.
 name: release
 
 on:
@@ -60,7 +63,8 @@ jobs:
       - run: cargo test --locked --workspace --target ${{ matrix.target }}
         if: ${{ !contains(matrix.target, 'x86_64-apple') }}
       - run: cargo build --release --locked -p alwith-runtime --target ${{ matrix.target }}
-      # 包里除了二进制还有 LICENSE、第三方许可原文、BUILD.json:应用的 stage 脚本缺一个就拒装。
+      # Besides the binary the package holds LICENSE, the third-party license texts and BUILD.json:
+      # the app's stage script refuses to install if any is missing.
       - uses: oven-sh/setup-bun@v2
       - run: bun test ./scripts/__tests__/check-windows-runtime.test.ts
       - run: bun scripts/package-release.ts ${{ matrix.target }}
@@ -70,9 +74,12 @@ jobs:
           path: alwith-runtime/dist/npm
           if-no-files-found: error
 
-  # 五个平台包先各自发,再发 @alwith/runtime 本体(optionalDependencies 指向它们)。
-  # npm trusted publishing(OIDC):npmjs.com 上六个包各配一条(Repository alwith-runtime / Workflow filename
-  # release.yml),不存 token;不带 provenance(私有仓不支持)。已在 npm 上的版本跳过,半途被拒可重跑。
+  # The five platform packages are published first, then the @alwith/runtime main package (its
+  # optionalDependencies point at them).
+  # npm trusted publishing (OIDC): on npmjs.com each of the six packages gets one entry (Repository
+  # alwith-runtime / Workflow filename release.yml), so no token is stored; no provenance (private
+  # repos do not support it). Versions already on npm are skipped, so a run rejected midway can be
+  # re-run.
   publish:
     needs: build
     runs-on: ubuntu-24.04
@@ -90,7 +97,7 @@ jobs:
           pattern: runtime-*
           path: dist/npm
           merge-multiple: true
-      - name: tag 的版本必须就是 packages/runtime 的版本,五个 optionalDependencies 与五个平台包也必须是它
+      - name: The tag version must equal the packages/runtime version, and the five optionalDependencies and five platform packages must match it
         run: |
           version=${GITHUB_REF_NAME#v}
           node -e '
@@ -107,7 +114,7 @@ jobs:
               if (platform.version !== want) { console.error(`${platform.name} is ${platform.version}`); process.exit(1) }
             }
           ' "$version"
-      - name: 五个平台包,再发 @alwith/runtime 本体
+      - name: Publish the five platform packages, then the @alwith/runtime main package
         run: |
           publish() {
             name=$(node -p "require('./package.json').name")

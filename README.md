@@ -134,22 +134,22 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## 分发
+## Distribution
 
-Runtime 只走 npm:推 `v<版本>` 的 tag,`release.yml` 编五个平台(macOS arm64、Linux x64/arm64、Windows x64/arm64),发 `@alwith/runtime` 本体 + 五个 `@alwith/runtime-<os>-<cpu>` 平台包。应用 `bun install` 按平台装一个,构建时 `stageRuntime()`(`@alwith/runtime/stage`)校验 sha 后拷进 sidecar;不用 npm 的消费者直接取 registry 上的 tgz。`scripts/package-release.ts` 负责把二进制、LICENSE、第三方许可原文、`artifact.json` 装进平台包。版本号一条线:Cargo 工作区 = tag = `packages/runtime`。发版前改这三处版本,新包名第一版要手发,之后 trusted publisher 全自动。
+The Runtime ships only through npm. Pushing a `v<version>` tag makes `release.yml` build five platforms (macOS arm64, Linux x64/arm64, Windows x64/arm64) and publish `@alwith/runtime` plus five `@alwith/runtime-<os>-<cpu>` platform packages. An app's `bun install` installs the one for its platform, and at build time `stageRuntime()` (`@alwith/runtime/stage`) verifies the sha before copying it into the sidecar; consumers that do not use npm take the tgz from the registry directly. `scripts/package-release.ts` puts the binary, LICENSE, third-party licence texts and `artifact.json` into each platform package. There is one version line: Cargo workspace = tag = `packages/runtime`. Bump those three before a release; the first version of a new package name is published by hand, after that trusted publishing is fully automatic.
 
 ### Windows CRT
 
-Windows x64 / ARM64 通过 `.cargo/config.toml` 静态链接 CRT，Runtime 不要求用户另装
-VC++ Redistributable。Windows 打包要求 PATH 中有 LLVM 的 `llvm-readobj`（发布 runner
-已预装）；打包脚本检查实际 EXE 的普通与延迟导入表，发现动态 CRT 依赖即失败，不生成平台包。
-环境变量 `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` 可以覆盖 Cargo 配置，因此不能只检查构建参数。
+Windows x64 / ARM64 link the CRT statically through `.cargo/config.toml`, so the Runtime does not require users to install the
+VC++ Redistributable. Windows packaging needs LLVM's `llvm-readobj` on PATH (preinstalled on the release
+runner); the packaging script checks the actual EXE's regular and delay-load import tables and fails without producing a platform package if it finds a dynamic CRT dependency.
+The `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` environment variables can override the Cargo configuration, so checking build flags alone is not enough.
 
 ```sh
 bun test ./scripts/__tests__/check-windows-runtime.test.ts
 bun scripts/check-windows-runtime.ts target/x86_64-pc-windows-msvc/release/alwith-runtime.exe
 ```
 
-发布前还需在未安装 VC++ Redistributable 的干净 Windows 上验证新产物能输出 `ready`。
-静态 CRT 的安全更新需要重新构建并发布 Runtime；已有 npm 包不会随源码修复而改变，
-消费者需更新到新发布版本并重新打包应用。
+Before a release, also verify on a clean Windows machine without the VC++ Redistributable that the new build prints `ready`.
+A security update to the static CRT requires rebuilding and republishing the Runtime; existing npm packages do not change when the source is fixed,
+so consumers must update to the new release and repackage their app.

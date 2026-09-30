@@ -17,12 +17,12 @@ use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
 use crate::{MAX_MESSAGE_BYTES, protocol_lines};
 
-/// 缺省日志目录:系统缓存目录下,「设置 → 缓存 → 清理」能一次收回。
+/// Default journal directory: under the system cache directory, so "Settings → Cache → Clear" reclaims it in one go.
 pub fn default_journal_root() -> std::path::PathBuf {
     dirs::cache_dir().expect("platform cache directory").join("alwith").join("Runtime").join("sessions")
 }
 
-/// 一次 `session_events` 最多返回多少帧;客户端按 `sequence` 翻页。
+/// Maximum frames one `session_events` call returns; clients page by `sequence`.
 pub const SESSION_EVENTS_PAGE: usize = 2_000;
 
 const OUTPUT_BATCH_WINDOW: Duration = Duration::from_millis(16);
@@ -163,7 +163,7 @@ struct AgentHandle {
     failure: Option<String>,
     initialize_request_id: Option<Value>,
     initialize_response: Option<Value>,
-    /// Runtime 自己发出的 ACP 请求(id 形如 `rt-<n>`),等 agent 的响应。
+    /// ACP requests the Runtime itself sent (ids like `rt-<n>`), waiting for the agent's response.
     pending_acp: HashMap<String, oneshot::Sender<Result<Value, ResponseError>>>,
     // Route IDs (such as "main") are not provider identities. Commit the supplied
     // identity only when its matching providers/set request succeeds.
@@ -171,18 +171,18 @@ struct AgentHandle {
     next_acp_id: u64,
 }
 
-/// Runtime 发出的 ACP 请求 id 的前缀;应用自己发的帧用数字 id,两边不会撞。
+/// Prefix of ACP request ids the Runtime sends; apps use numeric ids, so the two never collide.
 const ACP_REQUEST_ID_PREFIX: &str = "rt-";
-/// Runtime 代应用握手时报的协议版本。
+/// Protocol version the Runtime reports when it handshakes on an app's behalf.
 pub const ACP_PROTOCOL_VERSION: u64 = 2;
 
-/// agent 的一帧,连同它在会话日志里的位置(进了日志才有)。
+/// One agent frame together with its position in the session journal (present only once journaled).
 struct AcceptedLine {
     line: String,
     stamp: Option<(String, u64)>,
 }
 
-/// 一批日志动作里这一帧落在哪:一行最多进一次日志,取第一条即可。
+/// Where this frame landed in a batch of journal actions: a line is journaled at most once, so the first match suffices.
 fn journal_stamp(stamps: Vec<(String, u64)>) -> Option<(String, u64)> {
     stamps.into_iter().next()
 }
@@ -192,7 +192,7 @@ pub struct Runtime {
     registry: Mutex<RuntimeRegistry>,
     journal: Journal,
     agents: Mutex<HashMap<String, AgentHandle>>,
-    // 同一 agent 的跨代创建、收发、退出串行；不同 agent 互不等待。
+    // Creation across generations, sends, receives and exit of one agent are serialized; different agents never wait on each other.
     lanes: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     sinks: Mutex<BTreeMap<u64, Weak<dyn RuntimeEventSink>>>,
     next_sink_id: AtomicU64,
@@ -232,8 +232,9 @@ impl Runtime {
         let _ = self.tool_dispatch.set(dispatch);
     }
 
-    /// 把注册表刚判定出的日志动作落盘,返回每条落盘帧的 `(sessionId, sequence)`(与 Append 动作同序),
-    /// 发活事件时盖在帧上。日志写失败不拖垮 ACP 通道,但必须报出来。
+    /// Persist the journal actions the registry just decided and return each persisted frame's `(sessionId, sequence)`
+    /// (in Append order), stamped on the frame when the live event goes out. A journal write failure must not take
+    /// down the ACP channel, but it must be reported.
     fn commit_journal(&self) -> Vec<(String, u64)> {
         let ops = self.registry.lock().expect("runtime registry lock poisoned").take_journal_ops();
         match self.journal.apply(&ops, now_ms()) {
@@ -280,7 +281,7 @@ impl Runtime {
             }
         };
         let message = self.public_agent_line(agent_id, &message);
-        // 保持 stdout task 存活，排空管道并正常交付 Exit；不再执行新请求。
+        // Keep the stdout task alive to drain the pipe and deliver Exit normally; no new requests run.
         self.publish(RuntimeEvent::Stderr { agent_id: agent_id.to_string(), line: message.clone() });
         self.publish_agent_lines(
             agent_id,
@@ -307,16 +308,18 @@ impl Runtime {
         self.slow_mode_delay_ms.store(delay_ms, Ordering::Relaxed);
     }
 
-    /// 起一个 agent 进程。同名进程还活着就是调用方的 bug(换芯 = 先停、等退出、再起),直接报错。
+    /// Start an agent process. A live process with the same name is a caller bug (switching engines = stop, wait for
+    /// exit, then start), so this errors out.
     pub async fn start(
         self: &Arc<Self>, agent_id: String, metadata: AgentMetadata, command: &mut Command,
     ) -> Result<(), String> {
         let lane = self.lane(&agent_id);
         let _operation = lane.lock().await;
-        // 同名进程还活着就直接拒。换芯是「先停,等它真的退出,再起」—— 不隐式替换,于是
-        // 「同一个 agentId 的两个进程」这种东西不存在,迟到的输出也就没有归属歧义。
-        // 句柄在收尾(pump 读到 EOF → 收尸 → 广播 Exit)之前一直在表里,所以这一条同时挡住
-        // 「进程已死但还在排最后几行」的空窗。
+        // Refuse outright while a process with the same name is alive. Switching engines is "stop, wait until it has
+        // really exited, then start"; there is no implicit replacement, so "two processes for one agentId" cannot exist
+        // and late output has no ownership ambiguity. The handle stays in the table until teardown (pump reads EOF →
+        // reap → broadcast Exit), so this also covers the window where the process is dead but its last lines are
+        // still draining.
         if self.agents.lock().map_err(|error| error.to_string())?.contains_key(&agent_id) {
             return Err(format!(
                 "agent {agent_id} is still running; stop it and wait for its exit before starting again"
@@ -387,7 +390,7 @@ impl Runtime {
         }
         let runtime = Arc::clone(self);
         let agent_id = agent_id.to_string();
-        // 接受的请求由 Runtime 持有到投递记账结束；连接断开不能在意图与结果之间取消它。
+        // An accepted request is held by the Runtime until delivery bookkeeping ends; a disconnect cannot cancel it between intent and result.
         tokio::spawn(async move { runtime.send_inner(&agent_id, line).await })
             .await
             .map_err(|error| format!("Runtime send task failed: {error}"))?
@@ -417,7 +420,8 @@ impl Runtime {
                 return Err("module-owned tool replies cannot be supplied by application connections".into());
             }
         }
-        // ACP v2 每连接只握手一次;新属主(重载、接管)再发 `initialize` 时 Runtime 从缓存回放原响应,不再打扰引擎。
+        // ACP v2 handshakes once per connection; when a new owner (reload, attach) sends `initialize` again the Runtime
+            // replays the original response from cache instead of bothering the engine.
         let method = value.get("method").and_then(Value::as_str);
         let cached_initialize = method == Some("initialize")
             && self
@@ -452,8 +456,9 @@ impl Runtime {
             return Ok(());
         }
         if value.get("method").and_then(Value::as_str) == Some("session/resume") {
-            // 两芯同一句 session/resume:引擎自己读 ALwith 记录。Runtime 只在请求发出前占住记录身份,
-            // 另一颗芯或另一个进程不能同时恢复同一份记录;引擎应答后注册表转正或释放占用。
+            // Both engines use the same session/resume: the engine reads the ALwith record itself. The Runtime only reserves
+            // the record identity before the request goes out, so another engine or process cannot restore the same record
+            // at the same time; once the engine answers, the registry confirms or releases the reservation.
             let session_id =
                 value.pointer("/params/sessionId").and_then(Value::as_str).ok_or("resume missing sessionId")?;
             value.get("id").ok_or("resume requires request id")?;
@@ -572,7 +577,7 @@ impl Runtime {
             .collect()
     }
 
-    /// 属主连接断开后 owner 置空 = 孤儿:任何连接可直接 stop(回收),或经 attach 认领
+    /// When the owning connection drops, owner becomes empty = orphan: any connection may stop it (reclaim) or claim it through attach
     pub fn agent_orphaned(&self, agent_id: &str) -> bool {
         self.agents
             .lock()
@@ -593,7 +598,7 @@ impl Runtime {
         self.registry.lock().expect("runtime registry lock poisoned").agent_id_for_session(session_id)
     }
 
-    /// 该 agent 当前的属主(空串 = 无主);没有这个 agent 返回 None。
+    /// The agent's current owner (empty string = unowned); None when there is no such agent.
     pub fn agent_owner(&self, agent_id: &str) -> Option<String> {
         self.agents
             .lock()
@@ -602,7 +607,7 @@ impl Runtime {
             .map(|handle| handle.metadata.owner_id.clone())
     }
 
-    /// 一条连接断开:它自己(`root`)和它名下所有子属主(`root:<label>`)一并改挂无主。
+    /// A connection dropped: it (`root`) and every sub-owner under it (`root:<label>`) become unowned together.
     pub fn detach_owners_under(&self, root: &str) -> bool {
         let prefix = format!("{root}:");
         let mut owners: std::collections::BTreeSet<String> = self
@@ -627,12 +632,12 @@ impl Runtime {
         self.registry.lock().expect("runtime registry lock poisoned").run_states()
     }
 
-    /// 会话的全部帧原文(移动端 attach 回放用),已答过的权限请求剔除。
+    /// Every raw frame of a session (for mobile attach replay), with answered permission requests removed.
     pub fn session_replay(&self, session_id: &str) -> Vec<String> {
         self.session_events(session_id, None, usize::MAX).into_iter().map(|frame| frame.line).collect()
     }
 
-    /// 生命周期帧(prompt / 权限请求 / 工具状态迁移),不含 AI 正文;agent 收尾后仍可查。
+    /// Lifecycle frames (prompt / permission requests / tool state transitions), without AI prose; still queryable after the agent ends.
     pub fn session_lifecycle(&self, session_id: &str) -> Vec<crate::SessionLifecycleFrame> {
         self.session_events(session_id, None, usize::MAX)
             .into_iter()
@@ -645,8 +650,8 @@ impl Runtime {
             .collect()
     }
 
-    /// `after_sequence` 之后的会话帧,最多 `limit` 条;晚加入的端靠它补齐。
-    /// 已答复的 `session/request_permission` 不再给出 —— 重放它就会被答两次。
+    /// Session frames after `after_sequence`, at most `limit`; late joiners catch up with it.
+    /// Answered `session/request_permission` frames are left out, since replaying one would get it answered twice.
     pub fn session_events(
         &self, session_id: &str, after_sequence: Option<u64>, limit: usize,
     ) -> Vec<SessionEventFrame> {
@@ -669,7 +674,7 @@ impl Runtime {
         changed
     }
 
-    /// 执行租约显式释放(见 `RuntimeRegistry::release_execution`),有变化即广播。
+    /// Explicitly release an execution lease (see `RuntimeRegistry::release_execution`); broadcasts when anything changed.
     pub fn release_execution(&self, execution_id: &str) -> bool {
         let changed = self.registry.lock().expect("runtime registry lock poisoned").release_execution(execution_id);
         if changed {
@@ -711,7 +716,7 @@ impl Runtime {
             let _operation = lane.lock().await;
             let info = {
                 let mut registry = self.registry.lock().expect("runtime registry lock poisoned");
-                // 等待期间可能换了持有者；重新定位对应的 agent lane。
+                // The holder may have changed while waiting; locate the matching agent lane again.
                 if registry.agent_id_for_session(session_id).as_deref() != Some(agent_id.as_str()) {
                     continue;
                 }
@@ -742,9 +747,10 @@ impl Runtime {
         true
     }
 
-    /// 必须持有 agent lane。会话身份就是引擎报的 sessionId(两芯都以它命名 ALwith 记录),Runtime 不做翻译。
-    /// 返回 `None` 的帧是 Runtime 自己发出的请求的响应:记日志、不进 `inbound`(应用没发过它)。
-    /// 进了日志的帧带回 `(sessionId, sequence)`,发活事件时盖上,客户端据此发现漏帧。
+    /// The agent lane must be held. Session identity is the sessionId the engine reports (both engines name ALwith
+    /// records by it); the Runtime does not translate it. A frame returning `None` is the response to a request the
+    /// Runtime itself sent: it is journaled but not put into `inbound` (the app never sent it). Journaled frames come
+    /// back with `(sessionId, sequence)`, stamped on the live event so clients can detect missed frames.
     fn public_agent_line(&self, agent_id: &str, line: &str) -> String {
         self.agents
             .lock()
@@ -780,7 +786,7 @@ impl Runtime {
                 let _ = sender.send(outcome);
                 answered_runtime_request = true;
             }
-            // ACP v2 每连接只握手一次；后续窗口接管读取这份原始响应。
+            // ACP v2 handshakes once per connection; later windows attaching read this original response.
             if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
                 && handle.initialize_request_id.is_some()
                 && response.get("id") == handle.initialize_request_id.as_ref()
@@ -943,14 +949,14 @@ impl Runtime {
         tool_tasks.abort_all();
         while tool_tasks.join_next().await.is_some() {}
         let _operation = lane.lock().await;
-        // 旧进程已经由替换操作收尾；不能向新进程的订阅者交付旧 Exit。
+        // The old process was already torn down by the replacement; its Exit must not reach the new process's subscribers.
         let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
         let mut handle = self.agents.lock().expect("runtime agents lock poisoned").remove(&agent_id);
         if let Some(handle) = &mut handle {
             for (_, sender) in handle.pending_acp.drain() {
                 let _ = sender.send(Err(ResponseError::runtime(format!("agent {agent_id} exited"))));
             }
-            // stdout 关闭即 ACP 通道终止；不能等待仍存活的进程无限占住 agent lane。
+            // A closed stdout ends the ACP channel; a still-running process must not hold the agent lane forever.
             if let Err(error) = handle.child.stop_and_wait().await {
                 self.publish(RuntimeEvent::Stderr {
                     agent_id: agent_id.clone(),
@@ -993,11 +999,12 @@ impl Runtime {
         self.publish(RuntimeEvent::Inbound { agent_id: agent_id.to_string(), lines });
     }
 
-    /// Runtime 代应用向 agent 发一条 ACP 请求并等响应。经 `send` 同一条路:信封、日志、运行态都照常。
-    /// 错误分两种:Runtime 自己的(没有该 agent、agent 中途退出,`ResponseError::RUNTIME`)和 agent 回的
-    /// ACP 错误(code / data 原样)。
-    /// `request_id`:应用自己选的 JSON-RPC id(字符串或数字),要发 `$/cancel_request` 撤回时才需要;
-    /// 不传由 Runtime 编(`rt-<n>`)。同一 agent 上还没答的 id 不能重用。
+    /// Send an ACP request to the agent on the app's behalf and wait for the response. It takes the same path as
+    /// `send`: envelope, journal and run state as usual. Errors come in two kinds: the Runtime's own (no such agent,
+    /// the agent exited midway, `ResponseError::RUNTIME`) and ACP errors from the agent (code / data as is).
+    /// `request_id`: a JSON-RPC id (string or number) chosen by the app, needed only to withdraw it with
+    /// `$/cancel_request`; when omitted the Runtime assigns one (`rt-<n>`). Ids still pending on the same agent
+    /// cannot be reused.
     pub async fn acp_request(
         self: &Arc<Self>, agent_id: &str, method: &str, params: Value, request_id: Option<Value>,
     ) -> Result<Value, ResponseError> {
@@ -1046,7 +1053,7 @@ impl Runtime {
         })
     }
 
-    /// 向 agent 发一条 ACP 通知(`session/cancel` 等)。
+    /// Send an ACP notification to the agent (`session/cancel` and the like).
     pub async fn acp_notify(
         self: &Arc<Self>, agent_id: &str, method: &str, params: Value,
     ) -> Result<(), ResponseError> {
@@ -1054,7 +1061,7 @@ impl Runtime {
         self.send(agent_id, frame.to_string()).await.map_err(ResponseError::runtime)
     }
 
-    /// 回答 agent 发来的请求(`acpAgentRequest` 事件里的那个 `id`)。
+    /// Answer a request from the agent (the `id` in the `acpAgentRequest` event).
     pub async fn acp_respond(
         self: &Arc<Self>, agent_id: &str, id: Value, result: Option<Value>, error: Option<Value>,
     ) -> Result<(), ResponseError> {
@@ -1065,8 +1072,9 @@ impl Runtime {
         self.send(agent_id, frame.to_string()).await.map_err(ResponseError::runtime)
     }
 
-    /// 握手一次;已握过(应用自己发过 `initialize`,或 Runtime 代发过)就用缓存。
-    /// 应用要声明自己的客户端能力(如 elicitation)就在第一次会话操作前先调 `initialize`。
+    /// Handshake once; if it already happened (the app sent `initialize` itself, or the Runtime did on its behalf)
+    /// the cached result is used. An app that wants to declare its client capabilities (such as elicitation) calls
+    /// `initialize` before its first session operation.
     pub async fn ensure_initialized(
         self: &Arc<Self>, agent_id: &str, client_version: &str, info: Option<Value>, capabilities: Option<Value>,
     ) -> Result<Value, ResponseError> {
@@ -1120,12 +1128,13 @@ impl Runtime {
             {
                 Ok(ports_by_root) => ports_by_root,
                 Err(error) => {
-                    // 跨平台系统 socket 表可能瞬时读取失败；保留上一份端口快照，下一轮重试。
+                    // Reading the system socket table can fail transiently on some platforms; keep the previous port snapshot and retry next round.
                     log::warn!("[Runtime] scan agent listening ports failed: {error}");
                     return;
                 }
             };
-        // 扫描期间进程可能换了(停掉又起了一个同名的):按 pid 认人,不是同一个就不记它的端口。
+        // The process may have changed during the scan (stopped and restarted under the same name): match by pid, and
+        // do not record ports of a different process.
         let current_process_ids = self
             .agents
             .lock()
@@ -1149,7 +1158,7 @@ impl Runtime {
         }
     }
 
-    /// 向所有已注册的 sink 广播一条事件。Runtime 自己用它,宿主也可以用它注入事件(如 stderr 提示)。
+    /// Broadcast an event to every registered sink. The Runtime uses it itself, and hosts may use it to inject events (such as stderr notices).
     pub fn publish(&self, event: RuntimeEvent) {
         let sinks: Vec<Arc<dyn RuntimeEventSink>> = {
             let mut registered = self.sinks.lock().expect("Runtime sink lock poisoned");
@@ -1170,7 +1179,7 @@ impl Runtime {
     }
 }
 
-/// 只保留仍未答复的权限请求,其余帧原样。
+/// Keep only permission requests that are still unanswered; other frames stay as they are.
 fn filter_answered_permissions(frames: Vec<SessionEventFrame>, pending_ids: &[String]) -> Vec<SessionEventFrame> {
     frames
         .into_iter()
@@ -1342,7 +1351,7 @@ time.sleep(.1)
         }
     }
 
-    // cat 阻塞在被持有的 piped stdin 上,进程存活到 runtime drop(kill_on_drop)
+    // cat blocks on the held piped stdin, so the process lives until the runtime drops (kill_on_drop)
     async fn dsh_runtime() -> Arc<Runtime> {
         let runtime = Arc::new(test_runtime());
         runtime.start("agent".into(), metadata("dsh"), &mut Command::new("cat")).await.unwrap();
@@ -1437,12 +1446,12 @@ for line in sys.stdin:
             runtime.add_sink(&sink);
             let request = r#"{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"record","cwd":"/p","replayFrom":{"type":"start"}}}"#;
             runtime.send("agent", request.to_string()).await.unwrap();
-            // 引擎应答前记录身份就归这个 agent;另一颗芯或另一个进程不能同时恢复同一份记录。
+            // Before the engine answers, the record identity already belongs to this agent; another engine or process cannot restore the same record at the same time.
             assert_eq!(runtime.agent_id_for_session("record").as_deref(), Some("agent"));
             let error = runtime.send("other", request.into()).await.unwrap_err();
             assert!(error.contains("already active or opening"), "{error}");
             assert!(runtime.agents.lock().unwrap()["other"].failure.is_none());
-            // 发给引擎的是标准 session/resume:replayFrom 原样透传,只剥 Runtime 信封。
+            // The engine receives a standard session/resume: replayFrom passes through as is, only the Runtime envelope is stripped.
             loop {
                 let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
                 if let RuntimeEvent::Wire { outbound: true, lines, .. } = event {
@@ -1455,7 +1464,7 @@ for line in sys.stdin:
             }
             runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#.into()).unwrap();
             assert_eq!(runtime.agent_id_for_session("record").as_deref(), Some("agent"));
-            // 同一进程再次接回自己的会话不算抢占。
+            // The same process reattaching its own session is not a takeover.
             runtime.send("agent", request.into()).await.unwrap();
             runtime.stop("agent").unwrap();
             runtime.stop("other").unwrap();
@@ -1468,7 +1477,7 @@ for line in sys.stdin:
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
         runtime.add_sink(&sink);
-        // 还没有成功的握手:initialize 照常送到引擎(与 initialize 不同,它是真握手)。
+        // No successful handshake yet: initialize goes to the engine as usual (a real handshake).
         runtime.send("agent", r#"{"jsonrpc":"2.0","id":20,"method":"initialize","params":{}}"#.into()).await.unwrap();
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
@@ -1477,7 +1486,7 @@ for line in sys.stdin:
                 break;
             }
         }
-        // 相同 id 的服务端请求不能冒充握手响应,失败的握手也不进缓存。
+        // A server request with the same id cannot pose as the handshake response, and a failed handshake is not cached.
         runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":20,"method":"test","params":{}}"#.into()).unwrap();
         runtime
             .accept_line("agent", r#"{"jsonrpc":"2.0","id":20,"error":{"code":-32602,"message":"rejected"}}"#.into())
@@ -1486,7 +1495,7 @@ for line in sys.stdin:
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
             if let RuntimeEvent::Wire { outbound: true, lines, .. } = event {
-                assert!(lines[0].contains(r#""id":29"#), "握手失败过就没有缓存,这一条照常送到引擎");
+                assert!(lines[0].contains(r#""id":29"#), "a failed handshake leaves no cache, so this one goes to the engine as usual");
                 break;
             }
         }
@@ -1495,7 +1504,7 @@ for line in sys.stdin:
         runtime
             .accept_line("agent", serde_json::json!({"jsonrpc":"2.0","id":21,"result":response}).to_string())
             .unwrap();
-        // 排空 id 21 那次真握手的出站帧,后面的断言只看缓存回放。
+        // Drain the outbound frames of the real handshake with id 21; the assertions below only look at the cache replay.
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
             if let RuntimeEvent::Wire { outbound: true, lines, .. } = event
@@ -1540,7 +1549,7 @@ for line in sys.stdin:
         runtime.send("agent", r#"{"id":20,"method":"initialize","params":{}}"#.into()).await.unwrap();
         runtime.accept_line("agent", r#"{"id":20,"result":{"protocolVersion":2,"capabilities":{}}}"#.into()).unwrap();
         let metadata = runtime.agents.lock().unwrap().get("agent").unwrap().metadata.clone();
-        // 重起 = 先停、等它真的退出、再起。
+        // Restart = stop, wait until it has really exited, then start.
         runtime.stop("agent").unwrap();
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
@@ -1549,7 +1558,7 @@ for line in sys.stdin:
             }
         }
         runtime.start("agent".into(), metadata, &mut Command::new("cat")).await.unwrap();
-        // 新进程没握过手:这一条送到引擎,不从缓存回答。
+        // The new process has not handshaken yet: this goes to the engine instead of being answered from cache.
         runtime.send("agent", r#"{"id":30,"method":"initialize","params":{}}"#.into()).await.unwrap();
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
@@ -1562,9 +1571,10 @@ for line in sys.stdin:
         runtime.stop("agent").unwrap();
     }
 
-    /// 进了日志的帧在活事件上带同一个序号:应用发的 `session/prompt`(outbound)与 agent 回的
-    /// 同一帧(cat 回显,带 id 即 acpAgentRequest)各占一号,与 `session_events` 里的序号一致 ——
-    /// 客户端靠这个发现漏帧、按序补齐。不进日志的帧(这里 cat 回显的 initialize 响应)没有序号。
+    /// Journaled frames carry the same sequence on the live event: the app's `session/prompt` (outbound) and the same
+    /// frame echoed by the agent (cat echo, which with an id is an acpAgentRequest) each take one number, matching the
+    /// sequences in `session_events`; clients use this to detect missed frames and refill in order. Frames that are
+    /// not journaled (here the initialize response echoed by cat) have no sequence.
     #[tokio::test]
     async fn journaled_frames_carry_their_sequence_on_live_events() {
         let runtime = dsh_runtime().await;
@@ -1593,8 +1603,9 @@ for line in sys.stdin:
         runtime.stop("agent").unwrap();
     }
 
-    /// 换芯 = 先停、等它退出、再起。进程还在就不许起同名的第二个 —— 这一条替掉了旧的代次机制:
-    /// 没有「同一个 agentId 的两个进程」,迟到的输出也就没有归属歧义。
+    /// Switching engines = stop, wait for exit, then start. A second process with the same name may not start while
+    /// the first is alive; this replaces the old generation mechanism: with no "two processes for one agentId", late
+    /// output has no ownership ambiguity.
     #[tokio::test]
     async fn starting_a_live_agent_again_is_refused_until_it_exits() {
         let runtime = dsh_runtime().await;
@@ -1612,7 +1623,7 @@ for line in sys.stdin:
                 break;
             }
         }
-        // 收到 Exit 就是「它真的没了」:此刻起同名进程一定成功。
+        // Receiving Exit means "it is really gone": from now on starting the same name always succeeds.
         runtime.start("agent".into(), metadata, &mut Command::new("cat")).await.unwrap();
         runtime.stop("agent").unwrap();
     }
@@ -1772,8 +1783,8 @@ for line in sys.stdin:
         }
 
         let info = runtime.attach("session-1", "browser".to_string()).await.expect("attach live agent");
-        // 未热切时 provider 来自启动 metadata；registry 层只填空串占位,
-        // 丢掉 runtime 层这次回填,空 providerId 会一路流到前端盖章
+        // Without a hot switch the provider comes from the launch metadata; the registry layer only fills an empty
+        // placeholder, so dropping this runtime-layer backfill would let an empty providerId flow all the way to the frontend
         assert_eq!(info.provider, "kimi");
     }
 }

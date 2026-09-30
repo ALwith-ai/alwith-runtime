@@ -1,18 +1,29 @@
-//! Runtime 的 WebSocket 线上协议。桌面内嵌宿主与独立 `alwith-runtime` 都只是这层之上的端口适配器:
-//! 进程、代次、运行态、attach / release、权限回放、事件合批全在 `alwith-runtime-core`,这里只做
-//! 「怎么连」——握手鉴权、请求信封、事件扇出,以及把宿主自己的方法(alwith.dev、store、QA…)
-//! 经 [`Extension`] 挂进同一条连接。
+//! Runtime's WebSocket wire protocol. The embedded desktop host and the standalone `alwith-runtime`
+//! are both just port adapters on top of this layer:
+//! process, generation, run state, attach / release, permission replay and event batching all live
+//! in `alwith-runtime-core`; this crate only handles
+//! "how to connect": handshake auth, the request envelope, event fan-out, and mounting the host's
+//! own methods (alwith.dev, store, QA...)
+//! onto the same connection via [`Extension`].
 //!
-//! 线上契约(`alwith-runtime-v1`):
+//! Wire contract (`alwith-runtime-v1`):
 //!
-//! - 握手:`Sec-WebSocket-Protocol` 同时带 `alwith-runtime-v1` 与 `alwith-auth.<token>`,缺任一即 401。
-//! - 请求:`{ "id": u64, "method": "camelCase", "params": {...} }` → `{ "id", "result" | "error" }`。
-//!   信封解析失败也回带原 `id`(取不到用 0),否则客户端按 id 配对的 pending 永远等不到。
-//! - 事件:与请求同一条连接上的 JSON 帧,`type` 判别:`wire` / `lines` / `outbound` / `stderr` /
-//!   `exit` / `runStates`(即 [`RuntimeEvent`] 的 serde 形态),宿主扩展事件同样带 `type`。
-//! - 事件对所有已认证连接全局广播;写类操作(send / stop / release)只认属主连接。
-//! - 子属主:写类与 attach 请求可带 `owner`(桌面的窗口 label),属主记为 `<连接>:<owner>`;连接本身
-//!   对名下子属主的 agent 都有写权,`detachOwner` 让一个子属主名下的 agent 改挂无主。
+//! - Handshake: `Sec-WebSocket-Protocol` carries both `alwith-runtime-v1` and
+//! `alwith-auth.<token>`; missing either yields 401.
+//! - Request: `{ "id": u64, "method": "camelCase", "params": {...} }` -> `{ "id", "result" |
+//! "error" }`.
+//!   A failed envelope parse also replies with the original `id` (0 if unavailable); otherwise the
+//! client's pending entry keyed by id would wait forever.
+//! - Events: JSON frames on the same connection as requests, discriminated by `type`: `wire` /
+//! `lines` / `outbound` / `stderr` /
+//!   `exit` / `runStates` (the serde form of [`RuntimeEvent`]); host extension events also carry
+//! `type`.
+//! - Events are broadcast globally to all authenticated connections; write operations (send / stop
+//! / release) accept only the owner connection.
+//! - Sub-owners: write and attach requests may carry `owner` (the desktop window label); the owner
+//! is recorded as `<connection>:<owner>`; the connection itself
+//!   has write access to the agents of its sub-owners, and `detachOwner` reassigns a sub-owner's
+//! agents to no owner.
 
 use std::future::IntoFuture;
 use std::sync::{Arc, Mutex};
@@ -39,41 +50,50 @@ use uuid::Uuid;
 pub const PROTOCOL: &str = "alwith-runtime-v1";
 pub const AUTH_PREFIX: &str = "alwith-auth.";
 pub const EVENT_QUEUE_CAPACITY: usize = 1_024;
-/// Ctrl-C / SIGTERM 后给在飞连接的收尾窗:常驻 WebSocket 永不自行关闭,无上限等待会让
-/// graceful shutdown 永远等不完,到点强制退出。
+/// Shutdown window for in-flight connections after Ctrl-C / SIGTERM: a persistent WebSocket never
+/// closes on its own, so an unbounded wait would make
+/// graceful shutdown never finish; force exit at the deadline.
 pub const SHUTDOWN_FORCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// 宿主决定「起哪个进程」:清单、入口解析、env 装配都在宿主,协议层只拿到一条 Command。
+/// The host decides "which process to start": manifest, entry resolution and env assembly all live
+/// in the host; the protocol layer only receives a Command.
 #[async_trait]
 pub trait AgentLauncher: Send + Sync {
-    /// `params` 是 `start` 请求里 `launch` 字段的原文,宿主自己定义它的形状。
+    /// `params` is the raw `launch` field of the `start` request; the host defines its shape.
     async fn prepare(&self, agent_id: &str, owner_id: &str, params: Value) -> Result<(Command, AgentMetadata), String>;
-    /// `version` 报的版本。
+    /// The version reported as `version`.
     fn version(&self) -> String;
 }
 
-/// 每条连接的宿主侧状态(文件监听、订阅转发任务…),连接关闭即 drop。
+/// Per-connection host-side state (file watchers, subscription forwarding tasks...), dropped when
+/// the connection closes.
 pub type ConnectionState = Box<dyn std::any::Any + Send + Sync>;
-/// 请求共享连接资源;只锁具体可变资源,不能持连接级锁等待业务执行。
+/// Requests share connection resources; lock only the specific mutable resource, never hold a
+/// connection-level lock while waiting for business execution.
 pub type SharedConnectionState = Arc<ConnectionState>;
 
-/// 宿主扩展:协议层认不出的方法交给它,连接打开时它可以往同一条事件通道里推自己的事件。
+/// Host extension: methods the protocol layer does not recognize are handed to it; when a
+/// connection opens it may push its own events into the same event channel.
 #[async_trait]
 pub trait Extension: Send + Sync {
-    /// 连接建立。返回的状态随连接存活,宿主在这里订阅自己的广播并经 `events` 推给客户端;
-    /// 通道满时应 `disconnect.notify_one()` 让协议层断开这条慢连接。
+    /// Connection established. The returned state lives as long as the connection; the host
+    /// subscribes to its own broadcast here and pushes to the client via `events`;
+    /// when the channel is full it should call `disconnect.notify_one()` so the protocol layer
+    /// drops this slow connection.
     fn connect(&self, owner_id: &str, events: mpsc::Sender<String>, disconnect: Arc<Notify>) -> ConnectionState;
-    /// 协议层没有的方法。`Ok(None)` 表示这个方法宿主也不认识。
+    /// Methods the protocol layer lacks. `Ok(None)` means the host does not recognize the method
+    /// either.
     async fn call(
         &self, owner_id: &str, connection: &ConnectionState, method: &str, params: Value,
     ) -> Result<Option<Value>, ResponseError>;
     /// Transport disconnects even when a long-running call still holds the state.
     async fn disconnect(&self, _connection: &ConnectionState) {}
-    /// 服务停止时的清理(编排停止等),协议层随后 `kill_all`。
+    /// Cleanup when the service stops (stopping orchestration, etc.); the protocol layer then calls
+    /// `kill_all`.
     async fn shutdown(&self) {}
 }
 
-/// 没有宿主扩展时的空实现。
+/// No-op implementation for when there is no host extension.
 pub struct NoExtension;
 
 #[async_trait]
@@ -89,13 +109,17 @@ impl Extension for NoExtension {
     }
 }
 
-/// 协议层自己认识的方法。参数字段与 TS `RuntimePort` 一一对应(camelCase)。
+/// Methods the protocol layer recognizes itself. Parameter fields correspond one-to-one with the TS
+/// `RuntimePort` (camelCase).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RuntimeCommand {
-    /// `owner`:连接下的子属主标签(桌面的窗口 label)。属主记为 `<连接>:<owner>`;不带就是连接本身。
-    /// 连接本身对名下所有子属主的 agent 都有写权,子属主之间互不可写。
-    /// `launch`:引擎表之上的启动参数,形状由 `AgentLauncher` 定。
+    /// `owner`: the sub-owner label under the connection (the desktop window label). The owner is
+    /// recorded as `<connection>:<owner>`; if omitted it is the connection itself.
+    /// The connection itself has write access to all its sub-owners' agents; sub-owners cannot
+    /// write to each other.
+    /// `launch`: startup parameters on top of the engine table; the shape is defined by
+    /// `AgentLauncher`.
     Start {
         agent_id: String,
         launch: Value,
@@ -128,22 +152,23 @@ pub enum RuntimeCommand {
         #[serde(default)]
         owner: Option<String>,
     },
-    /// 子属主(窗口)消失:名下 agent 改挂无主,进程不杀。
+    /// A sub-owner (window) is gone: its agents become ownerless; processes are not killed.
     DetachOwner {
         owner: String,
     },
-    /// 执行租约显式释放(alwith_dev 执行结束)。
+    /// Explicit execution lease release (alwith_dev execution finished).
     ReleaseExecution {
         execution_id: String,
     },
     AgentForSession {
         session_id: String,
     },
-    /// 会话全部帧原文(已答权限剔除),给需要一次拿全的端。
+    /// All raw session frames (answered permissions removed), for clients that need everything at
+    /// once.
     SessionReplay {
         session_id: String,
     },
-    /// dev-only:人为放慢 agent 输出。
+    /// dev-only: deliberately slow down agent output.
     SetSlowMode {
         delay_ms: u64,
     },
@@ -157,19 +182,22 @@ pub enum RuntimeCommand {
     SessionLifecycle {
         session_id: String,
     },
-    /// 晚加入的端按 `sequence` 补齐;`afterSequence` 缺省从头,`limit` 缺省 [`SESSION_EVENTS_PAGE`]。
+    /// Late-joining clients refill by `sequence`; `afterSequence` defaults to the start, `limit`
+    /// defaults to [`SESSION_EVENTS_PAGE`].
     SessionEvents {
         session_id: String,
         after_sequence: Option<u64>,
         limit: Option<usize>,
     },
     RunStates,
-    /// Runtime 自己的版本。
+    /// Runtime's own version.
     Version,
     Agents,
     Ping,
-    // ---- ACP:Runtime 代应用说 ACP v2,应用不用再自己拼帧。原始的 send / inbound 仍在,是逃生口。 ----
-    /// 任意 ACP 请求,Runtime 编 id、等响应。`id` 可选:应用要撤回(`$/cancel_request`)时自己选 id。
+    // ---- ACP: Runtime speaks ACP v2 on behalf of the app, so the app no longer assembles frames
+    // itself. Raw send / inbound remain as an escape hatch. ----
+    /// Any ACP request; Runtime assigns the id and awaits the response. `id` is optional: the app
+    /// picks its own id when it needs to withdraw (`$/cancel_request`).
     AcpRequest {
         agent_id: String,
         method: String,
@@ -180,7 +208,7 @@ pub enum RuntimeCommand {
         #[serde(default)]
         owner: Option<String>,
     },
-    /// 任意 ACP 通知(无 id)。
+    /// Any ACP notification (no id).
     AcpNotify {
         agent_id: String,
         method: String,
@@ -189,7 +217,7 @@ pub enum RuntimeCommand {
         #[serde(default)]
         owner: Option<String>,
     },
-    /// 回答 agent 发来的请求(`acpAgentRequest` 事件里的 `id`)。
+    /// Answer a request sent by the agent (the `id` in the `acpAgentRequest` event).
     AcpRespond {
         agent_id: String,
         id: Value,
@@ -200,8 +228,10 @@ pub enum RuntimeCommand {
         #[serde(default)]
         owner: Option<String>,
     },
-    /// ACP 握手,可带应用自己的客户端信息与能力(如 elicitation);已握过就回缓存。
-    /// 不调也行:会话方法第一次用时 Runtime 以自己的身份、空能力握手。
+    /// ACP handshake, may carry the app's own client info and capabilities (e.g. elicitation); if
+    /// already done, the cached reply is returned.
+    /// Optional: on first use of a session method, Runtime handshakes with its own identity and
+    /// empty capabilities.
     Initialize {
         agent_id: String,
         #[serde(default)]
@@ -211,7 +241,8 @@ pub enum RuntimeCommand {
         #[serde(default)]
         owner: Option<String>,
     },
-    /// 建会话;第一次会先由 Runtime 握手(`initialize`)。`meta` 进 `_meta`。
+    /// Create a session; the first time, Runtime handshakes first (`initialize`). `meta` goes into
+    /// `_meta`.
     SessionNew {
         agent_id: String,
         cwd: String,
@@ -255,7 +286,8 @@ pub enum RuntimeCommand {
         #[serde(default)]
         owner: Option<String>,
     },
-    /// 一轮对话;回合结束才返回(`{stopReason, _meta}`)。过程中的内容走 `acpNotification` 事件。
+    /// One conversation turn; returns only when the turn ends (`{stopReason, _meta}`). In-progress
+    /// content flows through `acpNotification` events.
     Prompt {
         agent_id: String,
         session_id: String,
@@ -265,7 +297,7 @@ pub enum RuntimeCommand {
         #[serde(default)]
         owner: Option<String>,
     },
-    /// 取消当前回合(`session/cancel` 通知)。
+    /// Cancel the current turn (`session/cancel` notification).
     Cancel {
         agent_id: String,
         session_id: String,
@@ -274,7 +306,7 @@ pub enum RuntimeCommand {
     },
 }
 
-/// 把 `meta` 放进 ACP 的 `_meta`。
+/// Put `meta` into ACP's `_meta`.
 fn with_meta(mut params: Value, meta: Option<Value>) -> Value {
     if let Some(meta) = meta {
         params["_meta"] = meta;
@@ -313,8 +345,9 @@ impl RuntimeServer {
         Self { runtime, launcher, extension, token: token.into(), system: Arc::new(Mutex::new(System::new())) }
     }
 
-    /// WebSocket 挂在根路径,和 `codex app-server` 一样;`/readyz`、`/healthz` 给探针。
-    /// 宿主自己的 HTTP 路由(产物预览等)放进 `extra`。
+    /// WebSocket is mounted at the root path, like `codex app-server`; `/readyz` and `/healthz` are
+    /// for probes.
+    /// The host's own HTTP routes (artifact preview, etc.) go into `extra`.
     pub fn router(self, extra: Router) -> Router {
         Router::new()
             .route("/", get(upgrade))
@@ -324,7 +357,8 @@ impl RuntimeServer {
             .merge(extra)
     }
 
-    /// 起服务并等 `shutdown`;信号后给 [`SHUTDOWN_FORCE_WINDOW`] 收尾,再 `kill_all` 所有 agent。
+    /// Start the service and wait for `shutdown`; after a signal, allow [`SHUTDOWN_FORCE_WINDOW`]
+    /// to wind down, then `kill_all` all agents.
     pub async fn serve_with_shutdown(
         self, listener: TcpListener, extra: Router, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), std::io::Error> {
@@ -382,14 +416,17 @@ impl RuntimeEventSink for SocketEventSink {
         let payload = serde_json::to_string(&event).expect("serialize runtime event");
         match self.sender.try_send(payload) {
             Ok(()) | Err(TrySendError::Closed(_)) => {}
-            // 慢连接:与其无限积压不如断开,客户端重连后按 sequence 补齐。
+            // Slow connection: better to drop it than buffer without bound; the client refills by
+            // sequence after reconnecting.
             Err(TrySendError::Full(_)) => self.disconnect.notify_one(),
         }
     }
 }
 
-/// 主循环只读不写:写由独立任务做,慢连接堵住的是它自己的写端,不是断开、取消和别的请求。
-/// 队列满时 `SocketEventSink` 触发 `disconnect`,这里立刻断开并放弃写端;客户端重连后按 sequence 补齐。
+/// The main loop only reads, never writes: writes are done by a separate task, so a slow connection
+/// blocks only its own write side, not disconnect, cancellation or other requests.
+/// When the queue is full `SocketEventSink` triggers `disconnect`; the write side is abandoned
+/// immediately here, and the client refills by sequence after reconnecting.
 async fn handle_socket(socket: WebSocket, server: RuntimeServer) {
     let owner_id = format!("web-{}", Uuid::new_v4());
     let (event_sender, event_receiver) = mpsc::channel::<String>(EVENT_QUEUE_CAPACITY);
@@ -412,8 +449,11 @@ async fn handle_socket(socket: WebSocket, server: RuntimeServer) {
                 let Some(Ok(message)) = message else { break };
                 match message {
                     Message::Text(text) => {
-                        // 请求并发处理:`prompt` 这类要等一整轮的请求不能挡住同一连接上的下一条(比如答权限)。
-                        // 响应经事件通道回到这一个写端,帧不会交错。
+                        // Requests are handled concurrently: a request that waits for a whole turn
+                        // (like `prompt`) must not block the next one on the same connection (e.g.
+                        // answering a permission).
+                        // Responses return to this single writer via the event channel, so frames
+                        // never interleave.
                         let server = server.clone();
                         let owner_id = owner_id.clone();
                         let connection = Arc::clone(&connection);
@@ -425,7 +465,8 @@ async fn handle_socket(socket: WebSocket, server: RuntimeServer) {
                         });
                     }
                     Message::Close(_) => break,
-                    // 写端堵着时 pong 排不进去就丢:对端会再 ping,不值得为它挡住读端。
+                    // When the write side is blocked, drop the pong if it cannot be queued: the
+                    // peer will ping again, not worth blocking the read side for.
                     Message::Ping(payload) => { let _ = control_sender.try_send(Message::Pong(payload)); }
                     Message::Pong(_) | Message::Binary(_) => {}
                 }
@@ -440,7 +481,8 @@ async fn handle_socket(socket: WebSocket, server: RuntimeServer) {
     writer.abort();
 }
 
-/// 写端:事件与响应从同一条队列出去,pong 走控制通道。写失败即连接没了,通知主循环。
+/// Writer: events and responses leave through the same queue, pong goes via the control channel. A
+/// write failure means the connection is gone; notify the main loop.
 async fn socket_write_loop(
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>, mut events: mpsc::Receiver<String>,
     mut control: mpsc::Receiver<Message>, failed: Arc<Notify>,
@@ -492,7 +534,8 @@ pub async fn process_request_shared(
     }
 }
 
-/// 一条请求帧进、一条响应帧出。ws 与 stdio 两个入口共用;信封解析失败也回带原 `id`。
+/// One request frame in, one response frame out. Shared by the ws and stdio entry points; a failed
+/// envelope parse also replies with the original `id`.
 pub async fn process_request(
     server: &RuntimeServer, owner_id: &str, connection: &ConnectionState, text: &str,
 ) -> ResponseEnvelope {
@@ -513,7 +556,8 @@ pub async fn process_request(
     }
 }
 
-/// 方法名对不上 `RuntimeCommand`:是核心方法但参数不对 → INVALID_PARAMS;根本没这个方法 → METHOD_NOT_FOUND。
+/// Method name does not match `RuntimeCommand`: a core method with bad params -> INVALID_PARAMS; no
+/// such method at all -> METHOD_NOT_FOUND.
 fn unknown_method(method: &str, parse_error: &serde_json::Error) -> ResponseError {
     let detail = parse_error.to_string();
     if detail.starts_with("unknown variant") {
@@ -536,7 +580,7 @@ async fn dispatch(
     }
 }
 
-/// 连接 + 可选子属主 → 实际属主字符串。
+/// Connection + optional sub-owner -> the actual owner string.
 pub fn owner_of(connection: &str, owner: Option<String>) -> String {
     match owner {
         Some(label) if !label.is_empty() => format!("{connection}:{label}"),
@@ -544,8 +588,9 @@ pub fn owner_of(connection: &str, owner: Option<String>) -> String {
     }
 }
 
-/// 协议层方法的实现。`mark_read` 与两种只读回放不要求属主:已读是全局事实,观察是一等权利;
-/// 写类操作(send / stop / release)仍走属主校验。
+/// Implementation of the protocol-layer methods. `mark_read` and the two read-only replays do not
+/// require ownership: read state is a global fact, observing is a first-class right;
+/// write operations (send / stop / release) still go through the owner check.
 pub async fn execute(
     server: &RuntimeServer, connection: &str, command: RuntimeCommand,
 ) -> Result<Value, ResponseError> {
@@ -704,7 +749,8 @@ pub async fn execute(
     }
 }
 
-/// 属主校验:本人,或本人是该 agent 属主的连接根(`<root>:<label>` 的 `<root>`)。
+/// Owner check: the caller itself, or the caller is the connection root of the agent's owner
+/// (`<root>` of `<root>:<label>`).
 pub fn require_owned(runtime: &Runtime, owner_id: &str, agent_id: &str) -> Result<(), String> {
     if runtime.owns_agent(agent_id, owner_id) {
         return Ok(());
@@ -717,7 +763,8 @@ pub fn require_owned(runtime: &Runtime, owner_id: &str, agent_id: &str) -> Resul
     Err(format!("agent is not owned by this connection: {agent_id}"))
 }
 
-/// stop 专用:孤儿 agent(属主连接已断)任何连接都可回收,不必先 attach 认领。
+/// stop only: an orphan agent (owner connection gone) can be reclaimed by any connection, no need
+/// to attach and claim it first.
 pub fn require_owned_or_orphaned(runtime: &Runtime, owner_id: &str, agent_id: &str) -> Result<(), String> {
     if runtime.agent_orphaned(agent_id) {
         return Ok(());
@@ -933,7 +980,7 @@ mod tests {
         assert_eq!(agent.result, Some(Value::String("cat".into())));
         let detached = call(&mut socket, 6, "detachOwner", serde_json::json!({ "owner": "main" })).await;
         assert!(detached.error.is_none());
-        // 无主后任何人都能停。
+        // Once ownerless, anyone can stop it.
         let stopped = call(&mut socket, 7, "stop", serde_json::json!({ "agentId": "cat", "owner": "side" })).await;
         assert!(stopped.error.is_none(), "{:?}", stopped.error);
     }
@@ -947,7 +994,8 @@ mod tests {
             call(&mut socket, 1, "start", serde_json::json!({ "agentId": "cat", "launch": { "engine": "echo" } }))
                 .await;
         assert!(started.error.is_none(), "{:?}", started.error);
-        // cat 把 prompt 原样回显成一条入站帧;两条都进会话日志。
+        // cat echoes the prompt back verbatim as an inbound frame; both go into the session
+        // journal.
         let prompt = r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}"#;
         let sent = call(&mut socket, 2, "send", serde_json::json!({ "agentId": "cat", "line": prompt })).await;
         assert!(sent.error.is_none(), "{:?}", sent.error);
@@ -969,7 +1017,8 @@ mod tests {
             call(&mut socket, 4, "sessionEvents", serde_json::json!({ "sessionId": "s1", "afterSequence": 0 })).await;
         assert_eq!(tail.result.unwrap().as_array().unwrap().len(), 1);
 
-        // 第二条连接不是属主:读得到日志,但不能替属主发送。
+        // The second connection is not the owner: it can read the journal but cannot send on the
+        // owner's behalf.
         let mut observer = connect(&url, "secret").await;
         let seen = call(&mut observer, 1, "sessionEvents", serde_json::json!({ "sessionId": "s1" })).await;
         assert_eq!(seen.result.unwrap().as_array().unwrap().len(), 2);

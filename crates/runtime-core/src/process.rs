@@ -1,15 +1,19 @@
-// Windows 下 spawn 子进程默认会分配一个 console（conhost.exe），表现为黑框一闪。
-// `CREATE_NO_WINDOW` (0x08000000) 让 Windows 既不创建新 console 也不继承父级 console。
-// 子进程内部再 spawn 时，由于自身没有 console，再 spawn console 子进程也不会闪窗。
+// By default, spawning a child process on Windows allocates a console (conhost.exe), which shows
+// up as a black window flashing.
+// `CREATE_NO_WINDOW` (0x08000000) makes Windows neither create a new console nor inherit the
+// parent's console.
+// When that child spawns further processes, it has no console of its own, so the console
+// children it spawns will not flash a window either.
 //
-// 同一个 trait 同时覆盖 std + tokio Command，调用点只需 `.hide_console()` 一行。
-// non-windows 平台是 no-op，避免在每个 spawn 点写 `#[cfg(windows)]`。
-// 唯一实现下沉在 alwith-runtime（desktop 与 alwith-runtime (ws) 双面共用），desktop 的
-// `platform/windows_hide.rs` 只做 re-export。
+// One trait covers both std and tokio `Command`; call sites need only a single `.hide_console()`.
+// On non-windows platforms it is a no-op, so no spawn site needs `#[cfg(windows)]`.
+// The single implementation lives in alwith-runtime (shared by desktop and alwith-runtime (ws));
+// desktop's `platform/windows_hide.rs` only re-exports it.
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 
-/// ACP 进程拥有自己的进程组（Windows 为 Job Object）。退出时收回整组，而非仅适配器主进程。
+/// The ACP process owns its own process group (a Job Object on Windows). On exit the whole group is
+/// reclaimed, not just the adapter's main process.
 pub(crate) struct AgentProcess {
     child: AsyncGroupChild,
     stop_requested: bool,
@@ -20,7 +24,8 @@ impl AgentProcess {
         command.kill_on_drop(true);
         let mut group = command.group();
         group.kill_on_drop(true);
-        // command-group 会重设 Windows creation flags，必须在它的 builder 上保留不弹 console 的行为。
+        // command-group resets the Windows creation flags, so the no-console behavior must be kept
+        // on its builder.
         #[cfg(windows)]
         group.creation_flags(CREATE_NO_WINDOW);
         let child = group.spawn()?;
@@ -40,7 +45,8 @@ impl AgentProcess {
             return Ok(());
         }
         if let Err(error) = self.child.start_kill() {
-            // 正常退出可能先于停止请求完成；ESRCH 明确表示整组已不存在，不吞其它系统错误。
+            // A normal exit may finish before the stop request; ESRCH clearly means the whole group
+            // is gone, and other system errors are not swallowed.
             #[cfg(unix)]
             if error.raw_os_error() == Some(libc::ESRCH) {
                 self.stop_requested = true;
@@ -53,7 +59,8 @@ impl AgentProcess {
     }
 
     pub(crate) async fn stop_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        // 先终止整组，再回收主进程；回收后不再向可能被复用的组 ID 发信号。
+        // Terminate the whole group first, then reap the main process; after reaping, send no more
+        // signals to a group ID that may be reused.
         self.start_kill()?;
         self.child.wait().await
     }
@@ -61,7 +68,8 @@ impl AgentProcess {
 
 impl Drop for AgentProcess {
     fn drop(&mut self) {
-        // command-group 的 Unix kill_on_drop 仅作用于 Tokio 主进程，必须显式终止进程组。
+        // command-group's Unix kill_on_drop only acts on the Tokio main process, so the process
+        // group must be terminated explicitly.
         if let Err(error) = self.start_kill() {
             log::error!("stop ACP process group on drop: {error}");
         }
@@ -107,7 +115,8 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), child.stop_and_wait()).await.unwrap().unwrap();
             }
             let mut remainder = String::new();
-            // 主进程终止而后代仍存活时，这里会卡住，不能仅用主进程退出作为通过证据。
+            // This hangs if the main process terminates while descendants stay alive; main-process
+            // exit alone must not count as passing evidence.
             tokio::time::timeout(Duration::from_secs(5), stdout.read_to_string(&mut remainder)).await.unwrap().unwrap();
             assert!(remainder.is_empty());
         }

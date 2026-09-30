@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# 核心只要协议类型,不要客户端(那是应用侧的事)
+# The core needs only the protocol types, not the client (that is the app side's job)
 alwith-runtime-protocol = { path = "../runtime-protocol" }
 command-group = { version = "5", features = ["with-tokio"] }
 dirs = "7"

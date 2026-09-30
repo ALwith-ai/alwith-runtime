@@ -1,20 +1,25 @@
-//! ALwith Runtime:独立的 Runtime 进程。宿主 spawn 它;默认走 stdio(`--listen stdio://`),
-//! 浏览器与远程用 `--listen ws://IP:PORT`。引擎表经 env 给。
+//! ALwith Runtime: the standalone Runtime process. The host spawns it; it speaks stdio by default
+//! (`--listen stdio://`), and browsers and remote clients use `--listen ws://IP:PORT`. The engine table
+//! comes in through env.
 //!
-//! - `stdio://`:stdin 进请求,stdout 出响应与事件(先打一行 `{"type":"ready","transport":"stdio"}`),
-//!   日志走 stderr。stdin EOF 即退出。不需要 token,管道就是授权。
-//! - `ws://IP:PORT`(`ws://` 单独出现取 `ALWITH_RUNTIME_ADDR`,缺省 `127.0.0.1:0`):需要 `ALWITH_RUNTIME_TOKEN`,
-//!   起来后在 stdout 打一行 `{"type":"ready","url":...}`。
+//! - `stdio://`: requests come in on stdin, responses and events go out on stdout (first a line
+//!   `{"type":"ready","transport":"stdio"}`), logs go to stderr. It exits on stdin EOF. No token is
+//!   needed; the pipe is the authorization.
+//! - `ws://IP:PORT` (a bare `ws://` reads `ALWITH_RUNTIME_ADDR`, default `127.0.0.1:0`): requires
+//!   `ALWITH_RUNTIME_TOKEN`, and once up prints a line `{"type":"ready","url":...}` on stdout.
 //!
-//! 模块:`ALWITH_MODULES_DIR` 指向应用的 `node_modules`,里面每个带 `alwith-module.json` 的包被 spawn 为
-//! 子进程,应用经 `modules/<name>/<method>` 调它,它的事件以 `{"type":"module"}` 广播。
+//! Modules: `ALWITH_MODULES_DIR` points at the app's `node_modules`; every package in it that carries an
+//! `alwith-module.json` is spawned as a child process. The app calls it through
+//! `modules/<name>/<method>`, and its events are broadcast as `{"type":"module"}`.
 //!
-//! 引擎表 `ALWITH_RUNTIME_ENGINES`(JSON):
+//! Engine table `ALWITH_RUNTIME_ENGINES` (JSON):
 //! ```json
 //! { "codex": { "command": "/path/codex-acp-v2", "args": [], "env": { "CODEX_PATH": "/path/codex" } } }
 //! ```
-//! `start` 请求的 `launch` 形状:`{ "engine": "codex", "cwd": "...", "args": [...], "env": {...}, "provider": "...", "model": "..." }`。
-//! `cwd`、`args` 与 `env` 追加在引擎表之上;`provider` / `model` 只是给运行态看的标签,Runtime 不解释。
+//! Shape of the `launch` field of a `start` request:
+//! `{ "engine": "codex", "cwd": "...", "args": [...], "env": {...}, "provider": "...", "model": "..." }`.
+//! `cwd`, `args` and `env` are appended on top of the engine table; `provider` / `model` are only labels
+//! for the run state, and Runtime does not interpret them.
 
 use std::collections::HashMap;
 use std::env;
@@ -44,7 +49,7 @@ struct EngineSpec {
 struct StartParams {
     engine: String,
     cwd: Option<String>,
-    /// 追加在引擎表 `args` 之后的进程参数(如 alwith_dev 的执行策略)。
+    /// Process arguments appended after the engine table's `args` (e.g. alwith_dev's execution policy).
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -55,7 +60,8 @@ struct StartParams {
     provider: String,
     #[serde(default)]
     model: String,
-    /// 运行态里显示的连接标签(如 "DeepSeek API"),宿主给,Runtime 不解释。
+    /// Connection label shown in the run state (e.g. "DeepSeek API"); supplied by the host, not interpreted
+    /// by Runtime.
     #[serde(default)]
     connection: String,
 }
@@ -129,8 +135,9 @@ fn required(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
 
-/// `ALWITH_RUNTIME_PARENT_PID` 指定的父进程没了就完成 —— 和收到信号走同一条收尾路径
-/// (停模块、kill_all 所有 agent),不能 `process::exit` 跳过它们留下孤儿。
+/// Completes when the parent process given by `ALWITH_RUNTIME_PARENT_PID` is gone. It takes the same
+/// shutdown path as a signal (stop modules, `kill_all` every agent); it must not `process::exit`
+/// past them and leave orphans.
 #[cfg(unix)]
 async fn parent_gone() {
     let Some(parent) = env::var("ALWITH_RUNTIME_PARENT_PID").ok().and_then(|value| value.parse::<u32>().ok()) else {
@@ -161,7 +168,7 @@ fn raise_file_descriptor_limit() {
     }
 }
 
-/// 三种退出信号走同一条收尾:Ctrl-C、SIGTERM、父进程消失。
+/// The three exit triggers share one shutdown path: Ctrl-C, SIGTERM, parent process gone.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -180,7 +187,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// `--listen` 的两种形态。
+/// The two forms of `--listen`.
 enum Listen {
     Stdio,
     Ws(SocketAddr),
@@ -238,7 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Listen::Stdio => String::new(),
         Listen::Ws(_) => required("ALWITH_RUNTIME_TOKEN"),
     };
-    // 模块:`ALWITH_MODULES_DIR`(应用的 node_modules)里每个带 alwith-module.json 的包一个子进程。
+    // Modules: one child process per package carrying an alwith-module.json under `ALWITH_MODULES_DIR`
+    // (the app's node_modules).
     let modules_dir = env::var_os("ALWITH_MODULES_DIR").map(std::path::PathBuf::from);
     let module_host = ModuleHost::new(Arc::clone(&runtime), env!("CARGO_PKG_VERSION"));
     let extension = Arc::new(ModuleExtension(Arc::clone(&module_host)));

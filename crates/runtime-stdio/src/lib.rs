@@ -1,13 +1,17 @@
-//! Runtime 的 stdio 入口。宿主 spawn `alwith-runtime`,stdin 进一行一帧的请求,stdout 出响应与事件,
-//! 帧的形状与 `alwith-runtime-ws` 完全相同(请求 `{id, method, params}`,响应 `{id, result | error}`,
-//! 事件带 `type`)。stdout 上只有协议,日志一律走 stderr。
+//! The Runtime stdio entry. The host spawns `alwith-runtime`; requests come in on stdin one frame per line,
+//! responses and events go out on stdout.
 //!
-//! 与 ws 的差别只有三处:
-//! - 一个进程一条连接,属主固定为 `stdio`,不做 token 握手——管道本身就是授权。
-//! - stdin 到 EOF 视为宿主离开:停扩展、`kill_all`、返回。
-//! - 事件队列有界。ws 上慢连接会被断开、由客户端按 sequence 补齐;stdio 断不了,所以队列满时
-//!   丢弃事件并计数,队列腾出后先补一条 `{"type":"lagged","dropped":n}`,客户端据此用
-//!   `sessionEvents` 回放。审批与错误不会静默消失:它们都在会话日志里。
+//! Frame shapes are exactly the same as `alwith-runtime-ws` (requests `{id, method, params}`, responses
+//! `{id, result | error}`, events carry `type`). Only protocol goes to stdout; logs always go to stderr.
+//!
+//! It differs from ws in only three ways:
+//! - One process, one connection, with the owner fixed to `stdio` and no token handshake: the pipe itself
+//!   is the authorization.
+//! - stdin reaching EOF means the host has left: stop extensions, `kill_all`, return.
+//! - The event queue is bounded. On ws a slow connection is disconnected and the client catches up by
+//!   sequence; stdio cannot be disconnected, so when the queue is full events are dropped and counted, and
+//!   once the queue drains a `{"type":"lagged","dropped":n}` is sent first, on which the client replays
+//!   via `sessionEvents`. Approvals and errors do not vanish silently: they are all in the session journal.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +24,7 @@ use tokio::sync::mpsc::error::TrySendError;
 
 pub const OWNER_ID: &str = "stdio";
 pub const EVENT_QUEUE_CAPACITY: usize = 8_192;
-/// 收尾后给写端排空队列的窗口;宿主已经不读了就到点放弃。
+/// Window for the writer to drain the queue after shutdown; give up when the host has stopped reading.
 pub const WRITER_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct QueueEventSink {
@@ -40,12 +44,16 @@ impl RuntimeEventSink for QueueEventSink {
     }
 }
 
-/// 在任意一对读写流上跑一条 Runtime 连接;`serve_stdio` 把它接到进程的 stdin / stdout。
+/// Runs one Runtime connection over any read/write pair; `serve_stdio` wires it to the process's
+/// stdin / stdout.
 ///
-/// 主循环只读不写:写由独立任务做,stdout 没人读(宿主卡住)也堵不住 `shutdown`、断开与 stdin 的处理。
-/// 宿主主动走有两条路,效果相同:stdin EOF,或发一条 `{"id":n,"method":"shutdown"}`(先收到回执,再收尾)
-/// —— 起子进程的宿主不一定能关自己那头的 stdin(Tauri 的 sidecar 就不能),所以给一个方法。
-/// 返回时所有 agent 已被 `kill_all`。
+/// The main loop only reads, never writes: writing is done by a separate task, so a stdout nobody reads
+/// (a stuck host) cannot block `shutdown`, disconnects or stdin handling.
+/// The host can leave on its own by two routes with the same effect: stdin EOF, or a
+/// `{"id":n,"method":"shutdown"}` request (the receipt arrives first, then shutdown proceeds)
+/// -- a host that spawns a child cannot always close its end of stdin (Tauri's sidecar cannot), so a
+/// method is provided.
+/// On return every agent has been `kill_all`ed.
 pub async fn serve<R, W>(
     server: RuntimeServer, input: R, output: W, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()>
@@ -79,12 +87,13 @@ where
                 };
                 if line.trim().is_empty() { continue }
                 if let Some(id) = shutdown_request_id(&line) {
-                    // 回执排进队列(写端会送出),然后走与 stdin EOF 相同的收尾。
+                    // The receipt is queued (the writer will send it), then the same shutdown as stdin EOF runs.
                     let receipt = serde_json::json!({ "id": id, "result": null, "error": null }).to_string();
                     let _ = event_sender.send(receipt).await;
                     break Ok(());
                 }
-                // 请求并发处理(同 ws):响应经同一条事件队列回到写端。用 send 而不是 try_send,响应不许丢。
+                // Requests are handled concurrently (as on ws): the response returns to the writer through the same
+                // event queue. Use send rather than try_send; responses must not be dropped.
                 let server = server.clone();
                 let connection = Arc::clone(&connection);
                 let out = event_sender.clone();
@@ -103,7 +112,8 @@ where
     server.runtime.detach_owners_under(OWNER_ID);
     let _ = tokio::time::timeout(SHUTDOWN_FORCE_WINDOW, server.extension.shutdown()).await;
     server.runtime.kill_all();
-    // 给写端一个窗口把回执与最后的事件送出去;宿主不读就不等它。
+    // Give the writer a window to flush the receipt and the last events; do not wait if the host is not
+    // reading.
     drop(sink);
     drop(event_sender);
     let _ = tokio::time::timeout(WRITER_DRAIN_WINDOW, &mut writer).await;
@@ -111,7 +121,8 @@ where
     result
 }
 
-/// 写端:事件与响应从同一条队列出去。队列曾满过就先补一条 `lagged`。写失败即宿主没了,通知主循环。
+/// The writer: events and responses leave through the same queue. If the queue was ever full, a `lagged`
+/// is sent first. A write failure means the host is gone; notify the main loop.
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut output: W, mut events: mpsc::Receiver<String>, dropped: Arc<AtomicU64>, failed: Arc<tokio::sync::Notify>,
 ) {
@@ -131,14 +142,15 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     }
 }
 
-/// `{"id":n,"method":"shutdown"}` 的 id;别的请求为 None。
+/// The id of `{"id":n,"method":"shutdown"}`; None for any other request.
 fn shutdown_request_id(line: &str) -> Option<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     (value.get("method").and_then(serde_json::Value::as_str) == Some("shutdown"))
         .then(|| value.get("id").cloned().unwrap_or(serde_json::Value::Null))
 }
 
-/// 进程的 stdin / stdout 上的一条连接。先打一行 `{"type":"ready","transport":"stdio"}`,宿主据此开始发请求。
+/// A connection over the process's stdin / stdout. It first prints a line
+/// `{"type":"ready","transport":"stdio"}`, on which the host starts sending requests.
 pub async fn serve_stdio(
     server: RuntimeServer, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
@@ -202,7 +214,8 @@ mod tests {
         RuntimeServer::new(runtime, Arc::new(CatLauncher), Arc::new(NoExtension), String::new())
     }
 
-    /// 起一条连接:返回 (写请求, 读帧, 服务任务)。读端跳过事件帧,只回响应。
+    /// Starts a connection: returns (request writer, frame reader, service task). The reader skips event
+    /// frames and returns only responses.
     async fn connect() -> (tokio::io::DuplexStream, BufReader<tokio::io::DuplexStream>, tokio::task::JoinHandle<()>) {
         let (client_in, server_out) = tokio::io::duplex(64 * 1024);
         let (server_in, client_out) = tokio::io::duplex(64 * 1024);
@@ -280,7 +293,8 @@ mod tests {
             .unwrap();
     }
 
-    /// 宿主不读 stdout 时写端会卡住;主循环不写,所以 shutdown 照样立刻生效。
+    /// The writer stalls when the host does not read stdout; the main loop does not write, so shutdown
+    /// still takes effect immediately.
     #[tokio::test]
     async fn a_host_that_stops_reading_cannot_block_shutdown() {
         let (_client_in, server_out) = tokio::io::duplex(256);
@@ -292,7 +306,8 @@ mod tests {
             })
             .await
         });
-        // 一批 ping 的响应远超 256 字节的管道:写端在第几条上堵住都行,主循环必须还在读。
+        // The responses to a batch of pings far exceed a 256-byte pipe: the writer may block on any of them,
+        // but the main loop must still be reading.
         for id in 0..200u64 {
             let request = serde_json::json!({ "id": id, "method": "ping" }).to_string() + "\n";
             client_out.write_all(request.as_bytes()).await.unwrap();
@@ -317,7 +332,7 @@ mod tests {
         let sent =
             call(&mut writer, &mut reader, 2, "send", serde_json::json!({ "agentId": "cat", "line": prompt })).await;
         assert!(sent.error.is_none(), "{:?}", sent.error);
-        // cat 回显后 Runtime 广播 `lines` 事件;它必须出现在同一条 stdout 上。
+        // After cat echoes, Runtime broadcasts a `lines` event; it must appear on the same stdout.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let mut line = String::new();

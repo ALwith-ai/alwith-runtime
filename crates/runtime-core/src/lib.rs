@@ -20,7 +20,8 @@ pub use runtime::{
 
 const AGENT_REPLAY_CAPACITY: usize = 1_000;
 
-/// 生命周期帧:prompt、权限请求、工具状态迁移。不含 AI 正文,供观察面与跨窗接管重建事实流。
+/// Lifecycle frames: prompt, permission requests, tool state transitions. Carries no AI body text;
+/// lets the observer and cross-window takeover rebuild the fact stream.
 pub fn is_lifecycle_line(value: &Value) -> bool {
     let method = value.get("method").and_then(Value::as_str);
     method == Some("session/prompt")
@@ -39,11 +40,12 @@ struct AgentTrack {
     owner_id: String,
     outbound: HashMap<String, OutboundRequest>,
     sessions: Vec<String>,
-    /// 原生 resume 发给引擎前保留身份，响应后转为 sessions 或释放。
+    /// Native resume keeps the identity before it is sent to the engine; after the response it
+    /// becomes a session or is released.
     reserved_sessions: HashSet<String>,
     prompt_inflight: HashMap<String, u32>,
     used_sessions: HashSet<String>,
-    /// agent 用 `state_update` 帧报来的状态,按 sessionId 记最新一条。
+    /// State reported by the agent via `state_update` frames, latest one per sessionId.
     reported_states: HashMap<String, RunState>,
     pending_permissions: HashMap<String, String>,
     working_directories: HashMap<String, String>,
@@ -75,11 +77,14 @@ impl AgentTrack {
         self.current_session_id = Some(session_id.to_string());
     }
 
-    /// 会话当前状态。
+    /// Current session state.
     ///
-    /// ACP v2 起 agent 用 `state_update` 帧直报(running / idle / requires_action),这里优先用它 ——
-    /// 自己从流量推导会在「后台活动在 idle 期间继续发 update」这类情形上误判(协议明写这不改变
-    /// 状态,而计数式推导会把它当成又在跑)。帧还没到过的会话(刚建、尚未发过 prompt)回退到计数。
+    /// Since ACP v2 the agent reports it directly through `state_update` frames (running / idle /
+    /// requires_action), and this takes priority here --
+    /// deriving it from traffic ourselves misjudges cases such as "background activity keeps
+    /// sending updates while idle" (the protocol explicitly says this does not change the
+    /// state, whereas count-based derivation would treat it as running again). Sessions no frame
+    /// has arrived for yet (just created, no prompt sent) fall back to counting.
     fn state(&self, session_id: &str) -> RunState {
         if let Some(reported) = self.reported_states.get(session_id) {
             return *reported;
@@ -98,20 +103,27 @@ impl AgentTrack {
 pub struct RuntimeRegistry {
     tracks: HashMap<String, AgentTrack>,
     run_states: HashMap<String, SessionRunState>,
-    /// sessionId → 已知会话标题。两个来源:桌面前端推来的「正在显示的标题」(含手动改名与
-    /// 启动恢复)和 ACP 标题帧。**必须与 run_states 分开存**:标题帧每会话只在 prompt 流程发
-    /// 一次,resume 回来的会话在下次发消息前根本收不到帧;标题也可能先于 run_states 条目到达。
-    /// 条目建立时从这里回填,否则移动端只能显示「新会话」。会话收尾不清此表 —— 同一个
-    /// sessionId 之后还会 resume 回来,清了就又回到没标题。
+    /// sessionId -> known session title. Two sources: the "title currently shown" pushed by the
+    /// desktop frontend (including manual renames and
+    /// startup restore) and ACP title frames. **Must be stored separately from run_states**: a
+    /// title frame is sent only once per session, in the prompt flow,
+    /// a resumed session receives no frame before its next message, and a title may also arrive
+    /// before its run_states entry.
+    /// It is back-filled from here when the entry is created, otherwise mobile could only show "New
+    /// session". Session teardown does not clear this table --
+    /// the same sessionId will be resumed later, and clearing it would leave it untitled again.
     known_titles: HashMap<String, String>,
     inbound_replay: HashMap<String, VecDeque<String>>,
-    /// 处理帧时判定出的日志动作,由 runtime 在同一批处理后 `take_journal_ops` 取走落盘。
+    /// Journal actions decided while processing frames; the runtime takes them with
+    /// `take_journal_ops` after the same batch and persists them.
     journal_ops: Vec<JournalOp>,
 }
 
 impl RuntimeRegistry {
-    /// 开一条 agent 记录。`agent_id` 上不可能已有记录 —— `Runtime::start` 在进程还活着时直接拒绝,
-    /// 所以同名的两个进程不存在。返回值是这条记录建立时顺手清掉的会话(理论上为空)。
+    /// Open an agent record. There can be no existing record for `agent_id` -- `Runtime::start`
+    /// rejects outright while the process is alive,
+    /// so two processes with the same name do not exist. The return value is the sessions cleared
+    /// as a side effect when this record was created (in theory empty).
     pub fn begin_agent(&mut self, agent_id: String, owner_id: String) -> Vec<String> {
         self.inbound_replay.remove(&agent_id);
         let previous = self.tracks.insert(agent_id, AgentTrack::new(owner_id));
@@ -120,7 +132,8 @@ impl RuntimeRegistry {
         removed_sessions
     }
 
-    /// 返回运行态是否变化(要不要广播);这一批判定出的日志动作放进 `journal_ops`。
+    /// Returns whether the run state changed (whether to broadcast); the journal actions decided
+    /// for this batch go into `journal_ops`.
     pub fn record_outbound(&mut self, agent_id: &str, line: &str, now_ms: i64) -> bool {
         if !self.tracks.contains_key(agent_id) {
             return false;
@@ -174,16 +187,20 @@ impl RuntimeRegistry {
         changed
     }
 
-    /// 取走待落盘的日志动作。runtime 每处理一批帧就取一次,顺序即帧顺序。
+    /// Take the journal actions waiting to be persisted. The runtime takes them once per batch of
+    /// frames, in frame order.
     pub fn take_journal_ops(&mut self) -> Vec<JournalOp> {
         std::mem::take(&mut self.journal_ops)
     }
 
-    /// ACP v2 的 `state_update` 帧:agent 直报会话状态(running / idle / requires_action)。
+    /// ACP v2 `state_update` frame: the agent reports session state directly (running / idle /
+    /// requires_action).
     ///
-    /// 记进 track 后走同一条 refresh_session —— `Done` 的合成、去重与广播都不动,因为「完成没人看」
-    /// 是我们的产品态,协议不表达它。认不出的取值(协议给 state 留了扩展口)按报错记一笔后忽略:
-    /// 静默当成 idle 会让运行中的会话看起来已经结束。
+    /// Recorded into the track, then goes through the same refresh_session -- `Done` synthesis,
+    /// dedup and broadcast are untouched, because "finished but unseen"
+    /// is our product state, which the protocol does not express. Unrecognized values (the protocol
+    /// leaves state an extension point) are logged as an error and then ignored:
+    /// silently treating them as idle would make a running session look finished.
     fn apply_state_frame(&mut self, agent_id: &str, value: &Value, now_ms: i64) -> bool {
         if value.get("method").and_then(Value::as_str) != Some("session/update") {
             return false;
@@ -274,8 +291,10 @@ impl RuntimeRegistry {
         changed
     }
 
-    /// 执行租约显式释放:执行结束后把还挂着该 executionId 的会话运行态清掉。
-    /// 不清的下场:只读观察横幅挂死在一个早已结束的执行上(2026-07-30 审计批次二 #2)。
+    /// Explicit release of an execution lease: once execution ends, clear the run state of any
+    /// session still carrying that executionId.
+    /// What happens if it is not cleared: the read-only observer banner hangs on an execution that
+    /// ended long ago (2026-07-30 audit batch 2 #2).
     pub fn release_execution(&mut self, execution_id: &str) -> bool {
         let mut changed = false;
         for state in self.run_states.values_mut() {
@@ -297,9 +316,11 @@ impl RuntimeRegistry {
         true
     }
 
-    /// 记下这个会话的标题。**先进 known_titles 再谈条目**:没有条目不是异常,而是常态
-    /// (resume 前、标题帧先到),记下来等条目建立时回填。返回值只回答「要不要广播」——
-    /// 只有当下就摆在 run_states 里的条目被改动了才需要。
+    /// Record this session's title. **Write to known_titles first, then worry about the entry**:
+    /// having no entry is not an anomaly but the norm
+    /// (before resume, title frame arrived first); record it and back-fill when the entry is
+    /// created. The return value only answers "whether to broadcast" --
+    /// that is needed only when an entry currently sitting in run_states was changed.
     pub fn set_title(&mut self, session_id: &str, title: String) -> bool {
         self.known_titles.insert(session_id.to_string(), title.clone());
         let Some(state) = self.run_states.get_mut(session_id) else { return false };
@@ -336,8 +357,9 @@ impl RuntimeRegistry {
             .map(|(agent_id, _)| agent_id.clone())
     }
 
-    /// 记录占用:session/resume 发给引擎前占住记录身份,不同芯、不同进程不能同时恢复同一份记录;
-    /// 同一进程再次接回自己已激活的会话返回 `Ok(false)`。
+    /// Record claim: before session/resume is sent to the engine, claim the record identity;
+    /// different engines or different processes cannot resume the same record at once;
+    /// the same process re-attaching to a session it already activated returns `Ok(false)`.
     pub(crate) fn reserve_session(&mut self, agent_id: &str, session_id: &str) -> Result<bool, String> {
         if let Some(owner) = self.agent_id_for_session(session_id) {
             if owner == agent_id && self.tracks[agent_id].sessions.iter().any(|id| id == session_id) {
@@ -357,8 +379,10 @@ impl RuntimeRegistry {
         self.tracks.get_mut(agent_id).expect("reserved agent is tracked").reserved_sessions.remove(session_id);
     }
 
-    /// 该会话仍未答复的 `session/request_permission` 请求 id(JSON 原文形式,如 `9` 或 `"abc"`)。
-    /// 回放日志时只保留这些请求:已答过的一条也不能重放,否则会被答两次。
+    /// Request ids (raw JSON form, e.g. `9` or `"abc"`) of this session's
+    /// `session/request_permission` requests that are still unanswered.
+    /// When replaying the journal keep only these requests: an answered one must not be replayed
+    /// either, or it would be answered twice.
     pub fn pending_permission_ids(&self, session_id: &str) -> Vec<String> {
         self.tracks
             .values()
@@ -433,7 +457,8 @@ impl RuntimeRegistry {
             .collect()
     }
 
-    /// 判定这一帧要不要进会话日志,并刷新 `lastActivityAt`。落盘由 runtime 做。
+    /// Decide whether this frame enters the session journal, and refresh `lastActivityAt`.
+    /// Persisting is done by the runtime.
     fn record_content(&mut self, direction: FrameDirection, value: &Value, line: &str, now_ms: i64) -> bool {
         let method = value.get("method").and_then(Value::as_str);
         let resets_content = match method {
@@ -500,7 +525,8 @@ fn apply_outbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
             {
                 track.used_sessions.insert(session_id.to_string());
             }
-            // fork 的 params.sessionId 是源会话；新身份只能来自响应。
+            // The fork's params.sessionId is the source session; the new identity can only come
+            // from the response.
             let session_id = if value.get("method").and_then(Value::as_str) == Some("session/resume") {
                 value.pointer("/params/sessionId").and_then(Value::as_str).map(String::from)
             } else {
@@ -515,11 +541,16 @@ fn apply_outbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
     }
 }
 
-/// `$/cancel_request`(无 id 的通知):agent 取消自己发出的请求 —— `session/cancel` 时级联取消
-/// 挂起的权限 / 问卷(规范 Cancellation 页)。对应的 request_permission 从此不再等答复:不摘掉的话
-/// attach 会把它当未答权限重放成僵尸弹窗,用户一点又吐出一帧没有回合的 running。
-/// requestId 与登记时的 id 用同一种字符串化(JSON 值原样 to_string),数字 / 字符串 id 都对得上。
-/// 返回被撤下的权限所属会话;认不出的 requestId(已答过 / 不是权限)是空操作。
+/// `\$/cancel_request` (a notification with no id): the agent cancels a request it issued itself --
+/// on `session/cancel` it cascades to cancel
+/// pending permissions / questionnaires (spec Cancellation page). The corresponding
+/// request_permission no longer waits for an answer: if not removed,
+/// attach would replay it as an unanswered permission, a zombie dialog, and a click would emit a
+/// running frame with no turn.
+/// requestId is stringified the same way as the id at registration time (JSON value `to_string` as
+/// is), so numeric / string ids both match.
+/// Returns the session owning the withdrawn permission; an unrecognized requestId (already answered
+/// / not a permission) is a no-op.
 fn apply_cancel_request(track: &mut AgentTrack, value: &Value) -> Option<String> {
     let request_id = value.pointer("/params/requestId")?.to_string();
     track.pending_permissions.remove(&request_id)
@@ -585,8 +616,10 @@ fn upsert_run_state(
         return false;
     }
     let since = current.filter(|current| current.state == state).map_or(now_ms, |current| current.since);
-    // 条目还没有标题就从已知标题表回填 —— resume 回来的会话不会再发标题帧,不回填
-    // 移动端只能显示「新会话」。已有标题的条目不动:那是更新的那一份。
+    // If the entry has no title yet, back-fill from the known-titles table -- a resumed session
+    // sends no more title frames, and without back-fill
+    // mobile could only show "New session". An entry that already has a title is left alone: that
+    // is the newer one.
     let title = match current.map(|current| current.title.clone()) {
         Some(title) if !title.is_empty() => title,
         _ => known_title.unwrap_or_default(),
@@ -636,8 +669,9 @@ fn apply_task_frame(states: &mut HashMap<String, SessionRunState>, value: &Value
     let Some(update) = value.pointer("/params/update") else { return false };
     let Some(tool_call_id) = update.get("toolCallId").and_then(Value::as_str) else { return false };
     let Some(state) = states.get_mut(session_id) else { return false };
-    // v2 只有 tool_call_update 一种工具帧(upsert:没见过的 toolCallId 即新建),工具名走标准
-    // `name`(v1 时只能读 `_meta.claudeCode.toolName` 这条 vendor 扩展)。
+    // v2 has only one tool frame, tool_call_update (upsert: an unseen toolCallId means new); the
+    // tool name comes from the standard
+    // `name` (in v1 it could only be read from the `_meta.claudeCode.toolName` vendor extension).
     if update.get("sessionUpdate").and_then(Value::as_str) != Some("tool_call_update") {
         return false;
     }
@@ -657,8 +691,9 @@ fn apply_task_frame(states: &mut HashMap<String, SessionRunState>, value: &Value
     true
 }
 
-/// ACP 标题帧 → run_states。**帧先记进 known_titles 再谈条目**:帧可能早于条目建立到达,
-/// 那时丢掉这一帧就永远等不到第二帧(每会话只发一次)。
+/// ACP title frame -> run_states. **Record the frame in known_titles first, then worry about the
+/// entry**: the frame may arrive before the entry is created,
+/// and dropping it then means the second frame never comes (sent only once per session).
 fn apply_title_frame(
     states: &mut HashMap<String, SessionRunState>, known_titles: &mut HashMap<String, String>, value: &Value,
 ) -> bool {
@@ -735,7 +770,7 @@ mod tests {
         let state = &registry.run_states()[0];
         assert_eq!(state.execution_id, None);
         assert_eq!(state.execution_role, None);
-        // 已经没有这个租约:再释放一次不再报变化
+        // This lease is already gone: releasing again reports no change
         assert!(!registry.release_execution("exec-1"));
     }
 
@@ -781,12 +816,14 @@ mod tests {
         assert_eq!(registry.run_states()[0].state, RunState::Done);
     }
 
-    /// 标题先于条目到达是常态(桌面启动就把已知标题推来、resume 的会话不再发标题帧),
-    /// 记下来等条目建立时回填 —— 丢掉这一次就永远等不到第二次,手机只能显示「新会话」。
+    /// A title arriving before its entry is the norm (desktop pushes known titles at startup, a
+    /// resumed session sends no title frame),
+    /// record it and back-fill when the entry is created -- dropping this one means the second
+    /// never comes, and the phone could only show "New session".
     #[test]
     fn title_pushed_before_the_session_exists_is_backfilled() {
         let mut registry = RuntimeRegistry::default();
-        assert!(!registry.set_title("session-1", "改过的名字".into())); // 无条目可改 → 不广播
+        assert!(!registry.set_title("session-1", "改过的名字".into())); // no entry to change -> no broadcast
         registry.begin_agent("agent-1".into(), "main".into());
         registry.record_outbound(
             "agent-1",
@@ -862,7 +899,8 @@ mod tests {
         assert_eq!(registry.run_states()[0].owner_id, "browser");
     }
 
-    /// agent 级联取消(`$/cancel_request`)后,那条权限请求不再是「未答」:状态回落、attach 不再重放。
+    /// After an agent cascade cancel (`\$/cancel_request`), that permission request is no longer
+    /// "unanswered": state falls back and attach no longer replays it.
     #[test]
     fn cancel_request_drops_the_pending_permission() {
         let mut registry = RuntimeRegistry::default();
@@ -889,7 +927,7 @@ mod tests {
         ));
         assert_eq!(registry.run_states()[0].state, RunState::RequiresAction);
 
-        // 数字 id 与 requestId 同一种字符串化才对得上
+        // A numeric id matches requestId only when stringified the same way
         assert!(registry.record_inbound_batch(
             "agent-1",
             &[r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":9}}"#.into()],
@@ -899,7 +937,7 @@ mod tests {
         let attach = registry.attach("session-1", "browser".into()).expect("active session");
         assert!(attach.pending_agent_requests.is_empty());
 
-        // 取消一个不存在 / 已答的请求是空操作,不广播
+        // Cancelling a nonexistent / already-answered request is a no-op, no broadcast
         assert!(!registry.record_inbound_batch(
             "agent-1",
             &[r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":9}}"#.into()],
@@ -963,7 +1001,8 @@ mod tests {
         );
         assert_eq!(registry.take_journal_ops(), vec![JournalOp::Reset { session_id: "session-1".into() }]);
 
-        // 不带 replayFrom 的 resume 只恢复上下文,历史照留,也不进日志(它不是会话内容)。
+        // A resume without replayFrom only restores context; history stays, and it does not enter
+        // the journal (it is not session content).
         registry.record_outbound(
             "agent-1",
             r#"{"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":"session-1","cwd":"/project","replayFrom":null}}"#,
@@ -995,7 +1034,7 @@ mod tests {
             2,
         );
         assert_eq!(registry.pending_permission_ids("session-1"), vec!["8"]);
-        // 权限响应不是会话内容,不进日志。
+        // A permission response is not session content and does not enter the journal.
         assert!(registry.take_journal_ops().is_empty());
 
         registry.record_outbound(
@@ -1105,7 +1144,8 @@ mod tests {
         assert_eq!(registry.run_states()[0].state, RunState::Done);
     }
 
-    /// 收尾只发生一次:agent 记录被摘掉之后再收一次是空操作,不会把别人的会话也清了。
+    /// Teardown happens once: after the agent record is removed, a second teardown is a no-op and
+    /// does not clear anyone else's sessions.
     #[test]
     fn finishing_an_agent_twice_is_a_noop() {
         let mut registry = RuntimeRegistry::default();
@@ -1121,9 +1161,9 @@ mod tests {
             2,
         );
         assert_eq!(registry.run_states().len(), 1);
-        assert!(registry.finish_agent("agent-1"), "收尾清掉了它的会话");
+        assert!(registry.finish_agent("agent-1"), "teardown cleared its sessions");
         assert!(registry.run_states().is_empty());
-        assert!(!registry.finish_agent("agent-1"), "第二次没有东西可清");
+        assert!(!registry.finish_agent("agent-1"), "the second time there is nothing to clear");
     }
 
     #[test]
