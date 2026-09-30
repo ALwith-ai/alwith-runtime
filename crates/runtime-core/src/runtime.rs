@@ -165,6 +165,9 @@ struct AgentHandle {
     initialize_response: Option<Value>,
     /// Runtime 自己发出的 ACP 请求(id 形如 `rt-<n>`),等 agent 的响应。
     pending_acp: HashMap<String, oneshot::Sender<Result<Value, ResponseError>>>,
+    // Route IDs (such as "main") are not provider identities. Commit the supplied
+    // identity only when its matching providers/set request succeeds.
+    pending_providers: HashMap<String, String>,
     next_acp_id: u64,
 }
 
@@ -349,6 +352,7 @@ impl Runtime {
                 initialize_request_id: None,
                 initialize_response: None,
                 pending_acp: HashMap::new(),
+                pending_providers: HashMap::new(),
                 next_acp_id: 1,
             },
         );
@@ -468,6 +472,21 @@ impl Runtime {
                 .private_values
                 .remember(&value["params"], false);
         }
+        let provider_change = if method == Some("providers/set") {
+            match value.pointer("/params/_meta/alwith/providerId") {
+                Some(Value::String(provider)) if !provider.is_empty() => {
+                    let id = value
+                        .get("id")
+                        .filter(|id| id.is_string() || id.is_number())
+                        .ok_or("provider selection requires a request id")?;
+                    Some((id.to_string(), provider.clone()))
+                }
+                Some(_) => return Err("provider selection requires a non-empty providerId".into()),
+                None => None,
+            }
+        } else {
+            None
+        };
         let wire_line = value.to_string();
         let write_result = async {
             let mut writer = stdin.lock().await;
@@ -480,6 +499,15 @@ impl Runtime {
             let message = format!("send to agent {agent_id} failed: {error}");
             self.fail_agent(agent_id, message.clone());
             return Err(message);
+        }
+        if let Some((id, provider)) = provider_change {
+            self.agents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get_mut(agent_id)
+                .expect("agent under lane")
+                .pending_providers
+                .insert(id, provider);
         }
         if value.get("method").and_then(Value::as_str) == Some("initialize") {
             self.agents
@@ -731,6 +759,16 @@ impl Runtime {
         {
             let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
             let handle = agents.get_mut(agent_id).ok_or("agent stopped while receiving")?;
+            // Update before resolving the caller: an immediate attach must see the
+            // acknowledged provider, even if the original requester has disconnected.
+            if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
+                && let Some(id) = response.get("id")
+                && let Some(provider) = handle.pending_providers.remove(&id.to_string())
+                && response.get("error").is_none_or(Value::is_null)
+                && response.get("result").is_some()
+            {
+                handle.metadata.provider = provider;
+            }
             if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
                 && let Some(id) = response.get("id").and_then(Value::as_str)
                 && let Some(sender) = handle.pending_acp.remove(id)
@@ -1616,7 +1654,92 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn attach_returns_spawn_time_provider() {
+    async fn provider_switch_updates_attach_only_after_success() {
+        let runtime = Arc::new(test_runtime());
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import json,sys
+for line in sys.stdin:
+    frame=json.loads(line)
+    if frame['method']=='session/resume':
+        reply={'result':{'sessionId':frame['params']['sessionId']}}
+    elif frame['params']['_meta']['alwith']['providerId']=='rejected':
+        reply={'error':{'code':-32000,'message':'provider rejected'}}
+    else:
+        assert frame['params']['providerId']=='main'
+        reply={'result':{}}
+    print(json.dumps({'jsonrpc':'2.0','id':frame['id'],**reply}),flush=True)
+"#,
+        ]);
+        let mut initial = metadata("alwith");
+        initial.provider = "claude-plan".into();
+        runtime.start("agent".into(), initial, &mut command).await.unwrap();
+        runtime
+            .acp_request("agent", "session/resume", serde_json::json!({"sessionId":"session", "cwd":"/project"}), None)
+            .await
+            .unwrap();
+        assert_eq!(runtime.attach("session", "main".into()).await.unwrap().provider, "claude-plan");
+
+        runtime
+            .acp_request(
+                "agent",
+                "providers/set",
+                serde_json::json!({
+                    "providerId":"main", "apiType":"anthropic", "baseUrl":"https://fixture.invalid",
+                    "_meta":{"alwith":{"providerId":"litellm", "model":"deepseek-V4.1-flash"}}
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.agent_snapshots()[0].provider, "litellm");
+        assert_eq!(runtime.attach("session", "chat".into()).await.unwrap().provider, "litellm");
+
+        let error = runtime
+            .acp_request(
+                "agent",
+                "providers/set",
+                serde_json::json!({
+                    "providerId":"main", "apiType":"anthropic", "baseUrl":"https://fixture.invalid",
+                    "_meta":{"alwith":{"providerId":"rejected", "model":"other"}}
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "provider rejected");
+        assert_eq!(runtime.agent_snapshots()[0].provider, "litellm");
+        assert_eq!(runtime.attach("session", "main".into()).await.unwrap().provider, "litellm");
+        runtime.stop("agent").unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_provider_switch_does_not_change_attach_metadata() {
+        let runtime = dsh_runtime().await;
+        runtime
+            .send(
+                "agent",
+                serde_json::json!({
+                    "jsonrpc":"2.0", "id":7, "method":"providers/set", "params":{
+                        "providerId":"main", "_meta":{"alwith":{"providerId":"litellm"}}
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.agent_snapshots()[0].provider, "test");
+        runtime.accept_line("agent", serde_json::json!({"jsonrpc":"2.0","id":8,"result":{}}).to_string()).unwrap();
+        assert_eq!(runtime.agent_snapshots()[0].provider, "test");
+        runtime.accept_line("agent", serde_json::json!({"jsonrpc":"2.0","id":7,"result":{}}).to_string()).unwrap();
+        assert_eq!(runtime.agent_snapshots()[0].provider, "litellm");
+        runtime.stop("agent").unwrap();
+    }
+
+    #[tokio::test]
+    async fn attach_returns_initial_provider_before_any_switch() {
         let runtime = Arc::new(test_runtime());
         let mut command = Command::new("cat");
         runtime
@@ -1649,7 +1772,7 @@ for line in sys.stdin:
         }
 
         let info = runtime.attach("session-1", "browser".to_string()).await.expect("attach live agent");
-        // provider_id 必须是 spawn 时定死的 metadata.provider —— registry 层只填空串占位,
+        // 未热切时 provider 来自启动 metadata；registry 层只填空串占位,
         // 丢掉 runtime 层这次回填,空 providerId 会一路流到前端盖章
         assert_eq!(info.provider, "kimi");
     }

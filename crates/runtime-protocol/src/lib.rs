@@ -148,8 +148,8 @@ pub struct AttachInfo {
     pub agent_id: String,
     /// 该 agent spawn 时起的芯(AgentMetadata 权威值),由 `Runtime::attach` 填。
     pub engine: String,
-    /// 该 agent spawn 时定死的 provider(AgentMetadata 权威值)。attach 不 spawn,前端注册表
-    /// 只能从这里知道活进程跑的是哪家(prompt 逐轮下发的 _meta.alwith.providerId 依赖它)。
+    /// 该 agent 最近一次确认的 provider(启动配置或成功的 providers/set)。attach 不 spawn,
+    /// 前端据此标记当前供应商(prompt 逐轮下发的 _meta.alwith.providerId 依赖它)。
     /// registry 不持进程 metadata,由 `Runtime::attach`(唯一公开出口)填。
     pub provider: String,
     /// 仍没回答的 agent 请求,给新属主接着答。来源是入站回放缓冲,极端情况下可能已被冲掉。
