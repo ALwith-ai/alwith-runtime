@@ -421,7 +421,7 @@ impl Runtime {
             }
         }
         // ACP v2 handshakes once per connection; when a new owner (reload, attach) sends `initialize` again the Runtime
-            // replays the original response from cache instead of bothering the engine.
+        // replays the original response from cache instead of bothering the engine.
         let method = value.get("method").and_then(Value::as_str);
         let cached_initialize = method == Some("initialize")
             && self
@@ -1495,7 +1495,10 @@ for line in sys.stdin:
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap().unwrap();
             if let RuntimeEvent::Wire { outbound: true, lines, .. } = event {
-                assert!(lines[0].contains(r#""id":29"#), "a failed handshake leaves no cache, so this one goes to the engine as usual");
+                assert!(
+                    lines[0].contains(r#""id":29"#),
+                    "a failed handshake leaves no cache, so this one goes to the engine as usual"
+                );
                 break;
             }
         }
