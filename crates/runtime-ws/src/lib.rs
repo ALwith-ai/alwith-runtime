@@ -9,21 +9,21 @@
 //! Wire contract (`alwith-runtime-v1`):
 //!
 //! - Handshake: `Sec-WebSocket-Protocol` carries both `alwith-runtime-v1` and
-//! `alwith-auth.<token>`; missing either yields 401.
+//!   `alwith-auth.<token>`; missing either yields 401.
 //! - Request: `{ "id": u64, "method": "camelCase", "params": {...} }` -> `{ "id", "result" |
-//! "error" }`.
+//!   "error" }`.
 //!   A failed envelope parse also replies with the original `id` (0 if unavailable); otherwise the
-//! client's pending entry keyed by id would wait forever.
+//!   client's pending entry keyed by id would wait forever.
 //! - Events: JSON frames on the same connection as requests, discriminated by `type`: `wire` /
-//! `lines` / `outbound` / `stderr` /
+//!   `lines` / `outbound` / `stderr` /
 //!   `exit` / `runStates` (the serde form of [`RuntimeEvent`]); host extension events also carry
-//! `type`.
+//!   `type`.
 //! - Events are broadcast globally to all authenticated connections; write operations (send / stop
-//! / release) accept only the owner connection.
+//!   / release) accept only the owner connection.
 //! - Sub-owners: write and attach requests may carry `owner` (the desktop window label); the owner
-//! is recorded as `<connection>:<owner>`; the connection itself
+//!   is recorded as `<connection>:<owner>`; the connection itself
 //!   has write access to the agents of its sub-owners, and `detachOwner` reassigns a sub-owner's
-//! agents to no owner.
+//!   agents to no owner.
 
 use std::future::IntoFuture;
 use std::sync::{Arc, Mutex};
@@ -801,6 +801,7 @@ mod tests {
                     owner_id: owner_id.into(),
                     engine,
                     provider: "test".into(),
+                    provider_revision: None,
                     model: "test".into(),
                     connection: "test".into(),
                 },

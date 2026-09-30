@@ -167,6 +167,8 @@ pub struct AttachInfo {
     /// with every prompt depends on it).
     /// The registry holds no process metadata; filled by `Runtime::attach` (the only public exit).
     pub provider: String,
+    /// Provider configuration acknowledged by this process; absent for unmanaged launches.
+    pub provider_revision: Option<u64>,
     /// Agent requests still unanswered, for the new owner to answer. Sourced from the inbound
     /// replay buffer, which may have been flushed in extreme cases.
     pub pending_agent_requests: Vec<PendingAgentRequest>,
@@ -198,6 +200,8 @@ pub struct AgentMetadata {
     /// does not spawn, so the frontend can only learn it here.
     pub engine: String,
     pub provider: String,
+    /// Provider configuration acknowledged by this process; absent for unmanaged launches.
+    pub provider_revision: Option<u64>,
     pub model: String,
     pub connection: String,
 }

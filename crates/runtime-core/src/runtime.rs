@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
@@ -153,6 +153,11 @@ pub trait RuntimeEventSink: Send + Sync {
     fn publish(&self, event: RuntimeEvent);
 }
 
+struct ProviderUpdate {
+    provider: String,
+    revision: Option<u64>,
+}
+
 struct AgentHandle {
     tool_owner: Option<String>,
     private_tool_ids: HashSet<String>,
@@ -167,7 +172,8 @@ struct AgentHandle {
     pending_acp: HashMap<String, oneshot::Sender<Result<Value, ResponseError>>>,
     // Route IDs (such as "main") are not provider identities. Commit the supplied
     // identity only when its matching providers/set request succeeds.
-    pending_providers: HashMap<String, String>,
+    pending_providers: HashMap<String, Option<ProviderUpdate>>,
+    provider_changes: watch::Sender<()>,
     next_acp_id: u64,
 }
 
@@ -356,6 +362,7 @@ impl Runtime {
                 initialize_response: None,
                 pending_acp: HashMap::new(),
                 pending_providers: HashMap::new(),
+                provider_changes: watch::channel(()).0,
                 next_acp_id: 1,
             },
         );
@@ -385,21 +392,53 @@ impl Runtime {
     }
 
     pub async fn send(self: &Arc<Self>, agent_id: &str, line: String) -> Result<(), String> {
-        if !self.agents.lock().map_err(|error| error.to_string())?.contains_key(agent_id) {
-            return Err(format!("no agent process {agent_id}"));
-        }
-        let runtime = Arc::clone(self);
-        let agent_id = agent_id.to_string();
-        // An accepted request is held by the Runtime until delivery bookkeeping ends; a disconnect cannot cancel it between intent and result.
-        tokio::spawn(async move { runtime.send_inner(&agent_id, line).await })
-            .await
-            .map_err(|error| format!("Runtime send task failed: {error}"))?
-    }
-
-    async fn send_inner(&self, agent_id: &str, line: String) -> Result<(), String> {
         if line.len() > MAX_MESSAGE_BYTES {
             return Err(format!("ACP message exceeds {MAX_MESSAGE_BYTES} bytes"));
         }
+        let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        let provider_request = if value.get("method").and_then(Value::as_str) == Some("providers/set") {
+            Some(
+                value
+                    .get("id")
+                    .filter(|id| id.is_string() || id.is_number())
+                    .ok_or("provider selection requires a request id")?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        {
+            let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
+            let handle = agents.get_mut(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
+            if let Some(id) = &provider_request {
+                if handle.pending_providers.contains_key(id) {
+                    return Err("provider request id is already pending".into());
+                }
+                // Both raw send and ACP requests reserve before their first await.
+                handle.pending_providers.insert(id.clone(), None);
+            }
+        }
+        let runtime = Arc::clone(self);
+        let agent_id = agent_id.to_string();
+        // Delivery and failure cleanup survive cancellation of the requesting connection.
+        tokio::spawn(async move {
+            let result = runtime.send_inner(&agent_id, value).await;
+            if result.is_err()
+                && let Some(id) = provider_request
+            {
+                let mut agents = runtime.agents.lock().map_err(|error| error.to_string())?;
+                if let Some(handle) = agents.get_mut(&agent_id) {
+                    handle.pending_providers.remove(&id);
+                    handle.provider_changes.send_replace(());
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|error| format!("Runtime send task failed: {error}"))?
+    }
+
+    async fn send_inner(&self, agent_id: &str, value: Value) -> Result<(), String> {
         self.slow_mode_wait().await;
         let lane = self.lane(agent_id);
         let _operation = lane.lock().await;
@@ -411,7 +450,6 @@ impl Runtime {
             }
             Arc::clone(&handle.stdin)
         };
-        let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
         if value.get("method").is_none()
             && let Some(id) = value.get("id")
         {
@@ -478,17 +516,23 @@ impl Runtime {
                 .remember(&value["params"], false);
         }
         let provider_change = if method == Some("providers/set") {
-            match value.pointer("/params/_meta/alwith/providerId") {
+            let revision = match value.pointer("/params/_meta/alwith/providerRevision") {
+                None | Some(Value::Null) => None,
+                Some(revision) => Some(revision.as_u64().ok_or("providerRevision must be a non-negative integer")?),
+            };
+            let id = value
+                .get("id")
+                .filter(|id| id.is_string() || id.is_number())
+                .ok_or("provider selection requires a request id")?
+                .to_string();
+            let update = match value.pointer("/params/_meta/alwith/providerId") {
                 Some(Value::String(provider)) if !provider.is_empty() => {
-                    let id = value
-                        .get("id")
-                        .filter(|id| id.is_string() || id.is_number())
-                        .ok_or("provider selection requires a request id")?;
-                    Some((id.to_string(), provider.clone()))
+                    Some(ProviderUpdate { provider: provider.clone(), revision })
                 }
                 Some(_) => return Err("provider selection requires a non-empty providerId".into()),
                 None => None,
-            }
+            };
+            Some((id, update))
         } else {
             None
         };
@@ -523,10 +567,7 @@ impl Runtime {
                 .initialize_request_id = value.get("id").cloned();
         }
         let public_wire = self.public_agent_line(agent_id, &public_request_line(&value));
-        let line = self.public_agent_line(
-            agent_id,
-            &public_request_line(&serde_json::from_str::<Value>(&line).expect("validated ACP frame")),
-        );
+        let line = public_wire.clone();
         self.publish(RuntimeEvent::Wire { agent_id: agent_id.to_string(), outbound: true, lines: vec![public_wire] });
         let changed =
             self.registry.lock().map_err(|error| error.to_string())?.record_outbound(agent_id, &line, now_ms());
@@ -713,8 +754,8 @@ impl Runtime {
             let agent_id =
                 self.registry.lock().expect("runtime registry lock poisoned").agent_id_for_session(session_id)?;
             let lane = self.lane(&agent_id);
-            let _operation = lane.lock().await;
-            let info = {
+            let operation = lane.lock().await;
+            let state = {
                 let mut registry = self.registry.lock().expect("runtime registry lock poisoned");
                 // The holder may have changed while waiting; locate the matching agent lane again.
                 if registry.agent_id_for_session(session_id).as_deref() != Some(agent_id.as_str()) {
@@ -722,11 +763,27 @@ impl Runtime {
                 }
                 let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
                 let handle = agents.get_mut(&agent_id)?;
-                let mut info = registry.attach(session_id, owner_id.clone())?;
-                handle.metadata.owner_id = owner_id.clone();
-                info.engine = handle.metadata.engine.clone();
-                info.provider = handle.metadata.provider.clone();
-                info
+                if !handle.pending_providers.is_empty() {
+                    Err(handle.provider_changes.subscribe())
+                } else {
+                    let mut info = registry.attach(session_id, owner_id.clone())?;
+                    handle.metadata.owner_id = owner_id.clone();
+                    info.engine = handle.metadata.engine.clone();
+                    info.provider = handle.metadata.provider.clone();
+                    info.provider_revision = handle.metadata.provider_revision;
+                    Ok(info)
+                }
+            };
+            let info = match state {
+                Ok(info) => info,
+                Err(mut pending) => {
+                    // Responses need the lane; subscription and the decision to wait were atomic with the snapshot.
+                    drop(operation);
+                    if pending.changed().await.is_err() {
+                        return None;
+                    }
+                    continue;
+                }
             };
             self.publish_run_states();
             return Some(info);
@@ -769,11 +826,15 @@ impl Runtime {
             // acknowledged provider, even if the original requester has disconnected.
             if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
                 && let Some(id) = response.get("id")
-                && let Some(provider) = handle.pending_providers.remove(&id.to_string())
-                && response.get("error").is_none_or(Value::is_null)
-                && response.get("result").is_some()
+                && let Some(update) = handle.pending_providers.remove(&id.to_string())
             {
-                handle.metadata.provider = provider;
+                if response.get("error").is_none_or(Value::is_null) && response.get("result").is_some() {
+                    handle.metadata.provider_revision = update.as_ref().and_then(|update| update.revision);
+                    if let Some(update) = update {
+                        handle.metadata.provider = update.provider;
+                    }
+                }
+                handle.provider_changes.send_replace(());
             }
             if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
                 && let Some(id) = response.get("id").and_then(Value::as_str)
@@ -1346,6 +1407,7 @@ time.sleep(.1)
             owner_id: "main".into(),
             engine: engine.into(),
             provider: "test".into(),
+            provider_revision: None,
             model: "test".into(),
             connection: "test".into(),
         }
@@ -1752,6 +1814,156 @@ for line in sys.stdin:
         runtime.stop("agent").unwrap();
     }
 
+    fn register_provider_test_session(runtime: &Runtime) {
+        let mut registry = runtime.registry.lock().unwrap();
+        registry.record_outbound(
+            "agent",
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/resume","params":{"sessionId":"session","cwd":"/project"}}"#,
+            1,
+        );
+        registry.record_inbound_batch(
+            "agent",
+            &[r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session"}}"#.into()],
+            2,
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_waits_for_provider_confirmation_without_holding_the_agent_lane() {
+        for succeeds in [true, false] {
+            let runtime = dsh_runtime().await;
+            register_provider_test_session(&runtime);
+            runtime.agents.lock().unwrap().get_mut("agent").unwrap().metadata.provider_revision = Some(7);
+            runtime.send("agent", serde_json::json!({
+                "jsonrpc":"2.0", "id":7, "method":"providers/set",
+                "params":{"providerId":"main", "_meta":{"alwith":{"providerId":"litellm", "providerRevision":8}}}
+            }).to_string()).await.unwrap();
+            let attaching = runtime.attach("session", "chat".into());
+            tokio::pin!(attaching);
+            assert!(futures_util::poll!(&mut attaching).is_pending());
+            assert!(runtime.owns_agent("agent", "main"));
+            let lane = runtime.lane("agent");
+            let operation = lane.lock().await;
+            let reply = if succeeds {
+                serde_json::json!({"id":7,"result":{}})
+            } else {
+                serde_json::json!({"id":7,"error":{"code":-1,"message":"rejected"}})
+            };
+            runtime.accept_line("agent", reply.to_string()).unwrap();
+            drop(operation);
+            let attached = tokio::time::timeout(Duration::from_secs(2), attaching).await.unwrap().unwrap();
+            assert_eq!(attached.provider, if succeeds { "litellm" } else { "test" });
+            assert_eq!(attached.provider_revision, Some(if succeeds { 8 } else { 7 }));
+            runtime.stop("agent").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_waits_for_accepted_raw_provider_send_before_it_is_written() {
+        let runtime = dsh_runtime().await;
+        register_provider_test_session(&runtime);
+        let sending = runtime.send(
+            "agent",
+            serde_json::json!({"id":7,"method":"providers/set","params":{
+                "_meta":{"alwith":{"providerId":"litellm","providerRevision":0}}
+            }})
+            .to_string(),
+        );
+        tokio::pin!(sending);
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        let attaching = runtime.attach("session", "chat".into());
+        tokio::pin!(attaching);
+        assert!(futures_util::poll!(&mut attaching).is_pending());
+        sending.await.unwrap();
+        runtime.accept_line("agent", r#"{"id":7,"result":{}}"#.into()).unwrap();
+        let attached = tokio::time::timeout(Duration::from_secs(2), attaching).await.unwrap().unwrap();
+        assert_eq!(attached.provider_revision, Some(0));
+        assert_eq!(attached.provider, "litellm");
+        runtime.stop("agent").unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_provider_send_cleans_up_even_when_its_caller_is_dropped() {
+        let runtime = dsh_runtime().await;
+        register_provider_test_session(&runtime);
+        {
+            let sending = runtime.send(
+                "agent",
+                serde_json::json!({"id":7,"method":"providers/set","params":{
+                    "_meta":{"alwith":{"providerId":"bad","providerRevision":-1}}
+                }})
+                .to_string(),
+            );
+            tokio::pin!(sending);
+            assert!(futures_util::poll!(&mut sending).is_pending());
+        }
+        let attached = tokio::time::timeout(Duration::from_secs(2), runtime.attach("session", "chat".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attached.provider, "test");
+        assert_eq!(attached.provider_revision, None);
+        runtime.stop("agent").unwrap();
+    }
+
+    #[tokio::test]
+    async fn attach_stops_waiting_when_an_unconfirmed_provider_process_exits() {
+        let runtime = dsh_runtime().await;
+        register_provider_test_session(&runtime);
+        runtime
+            .send(
+                "agent",
+                serde_json::json!({"id":7,"method":"providers/set","params":{
+                    "_meta":{"alwith":{"providerId":"litellm","providerRevision":0}}
+                }})
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let attaching = runtime.attach("session", "chat".into());
+        tokio::pin!(attaching);
+        assert!(futures_util::poll!(&mut attaching).is_pending());
+        runtime.stop("agent").unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), attaching).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_revision_is_zero_or_unknown_only_when_confirmed() {
+        let runtime = dsh_runtime().await;
+        register_provider_test_session(&runtime);
+        for revision in [serde_json::json!(0), Value::Null] {
+            let mut meta = serde_json::json!({"providerId":"litellm"});
+            if !revision.is_null() {
+                meta["providerRevision"] = revision.clone();
+            }
+            runtime
+                .send(
+                    "agent",
+                    serde_json::json!({"id":7,"method":"providers/set","params":{"_meta":{"alwith":meta}}}).to_string(),
+                )
+                .await
+                .unwrap();
+            runtime.accept_line("agent", r#"{"id":7,"result":{}}"#.into()).unwrap();
+            let attached = runtime.attach("session", "main".into()).await.unwrap();
+            assert_eq!(attached.provider, "litellm");
+            assert_eq!(attached.provider_revision, revision.as_u64());
+        }
+        assert!(
+            runtime
+                .send(
+                    "agent",
+                    serde_json::json!({"id":8,"method":"providers/set","params":{
+                        "_meta":{"alwith":{"providerId":"bad","providerRevision":-1}}
+                    }})
+                    .to_string()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.attach("session", "main".into()).await.unwrap().provider, "litellm");
+        runtime.stop("agent").unwrap();
+    }
+
     #[tokio::test]
     async fn attach_returns_initial_provider_before_any_switch() {
         let runtime = Arc::new(test_runtime());
@@ -1763,6 +1975,7 @@ for line in sys.stdin:
                     owner_id: "main".to_string(),
                     engine: "alwith".to_string(),
                     provider: "kimi".to_string(),
+                    provider_revision: None,
                     model: "test".to_string(),
                     connection: "test".to_string(),
                 },

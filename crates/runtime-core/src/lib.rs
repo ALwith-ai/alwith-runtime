@@ -258,7 +258,13 @@ impl RuntimeRegistry {
             }
         }
         let pending_agent_requests = self.pending_agent_requests(&agent_id, &pending_ids);
-        Some(AttachInfo { agent_id, engine: String::new(), provider: String::new(), pending_agent_requests })
+        Some(AttachInfo {
+            agent_id,
+            engine: String::new(),
+            provider: String::new(),
+            provider_revision: None,
+            pending_agent_requests,
+        })
     }
 
     pub fn release_session(&mut self, session_id: &str, owner_id: &str) -> bool {

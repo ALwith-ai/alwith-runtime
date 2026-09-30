@@ -190,6 +190,7 @@ mod tests {
                     owner_id: owner_id.into(),
                     engine: "cat".into(),
                     provider: "test".into(),
+                    provider_revision: None,
                     model: "test".into(),
                     connection: "test".into(),
                 },

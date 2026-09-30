@@ -58,6 +58,7 @@ struct StartParams {
     env_remove: Vec<String>,
     #[serde(default)]
     provider: String,
+    provider_revision: Option<u64>,
     #[serde(default)]
     model: String,
     /// Connection label shown in the run state (e.g. "DeepSeek API"); supplied by the host, not interpreted
@@ -120,6 +121,7 @@ impl AgentLauncher for TableLauncher {
                 owner_id: owner_id.to_string(),
                 engine: params.engine,
                 provider: params.provider,
+                provider_revision: params.provider_revision,
                 model: params.model,
                 connection: params.connection,
             },
@@ -368,6 +370,18 @@ mod tests {
         assert_eq!(metadata.owner_id, "app");
         assert_eq!(metadata.provider, "custom-provider");
         assert_eq!(metadata.model, "custom-model");
+        assert_eq!(metadata.provider_revision, None);
+        let (_, confirmed) = launcher
+            .prepare(
+                "versioned",
+                "app",
+                serde_json::json!({
+                    "engine":"company-agent", "provider":"custom-provider", "providerRevision":0
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.provider_revision, Some(0));
         let command = command.as_std();
         assert_eq!(command.get_args().collect::<Vec<_>>(), ["--acp", "--extra"]);
         let environment: HashMap<_, _> = command.get_envs().collect();
