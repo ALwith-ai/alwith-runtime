@@ -214,7 +214,12 @@ impl RuntimeRegistry {
         };
         let reported = match update.and_then(|u| u.get("state")).and_then(Value::as_str) {
             Some("running") => RunState::Running,
-            Some("idle") if update.and_then(|u| u.get("stopReason")).and_then(Value::as_str) == Some("_error") => {
+            Some("idle")
+                if matches!(
+                    update.and_then(|u| u.get("stopReason")).and_then(Value::as_str),
+                    Some("error" | "_error" | "refusal" | "max_tokens" | "max_turn_requests")
+                ) =>
+            {
                 RunState::RequiresAction
             }
             Some("idle") => RunState::Idle,
@@ -1140,10 +1145,12 @@ mod tests {
             .to_string()
         };
         registry.record_inbound_batch("agent", &[frame("running", None)], 1);
-        registry.record_inbound_batch("agent", &[frame("idle", Some("_error"))], 2);
-        assert_eq!(registry.run_states()[0].state, RunState::RequiresAction);
-        registry.mark_read("session");
-        assert_eq!(registry.run_states()[0].state, RunState::RequiresAction);
+        for reason in ["error", "_error", "refusal", "max_tokens", "max_turn_requests"] {
+            registry.record_inbound_batch("agent", &[frame("idle", Some(reason))], 2);
+            assert_eq!(registry.run_states()[0].state, RunState::RequiresAction, "{reason}");
+            registry.mark_read("session");
+            assert_eq!(registry.run_states()[0].state, RunState::RequiresAction, "{reason}");
+        }
         registry.record_inbound_batch("agent", &[frame("running", None)], 4);
         assert_eq!(registry.run_states()[0].state, RunState::Running);
         registry.record_inbound_batch("agent", &[frame("idle", Some("end_turn"))], 5);
