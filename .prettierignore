@@ -1,0 +1,13 @@
+# Dependencies and generated artifacts
+bun.lock
+**/node_modules/**
+**/dist/**
+**/target/**
+**/licenses/**
+**/bin/**
+**/*.svg
+
+# Keep document tables and package manifests in their maintained layout.
+**/*.md
+**/*.html
+**/package.json

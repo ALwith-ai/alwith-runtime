@@ -1,0 +1,13 @@
+{
+  "name": "alwith-runtime-workspace",
+  "private": true,
+  "scripts": {
+    "format": "bun prettier --experimental-cli --write .",
+    "format:rust": "cargo fmt --all",
+    "format:all": "bun run format:rust && bun run format"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.9",
+    "prettier-plugin-tailwindcss": "^0.8.1"
+  }
+}

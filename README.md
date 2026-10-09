@@ -153,3 +153,11 @@ bun scripts/check-windows-runtime.ts target/x86_64-pc-windows-msvc/release/alwit
 Before a release, also verify on a clean Windows machine without the VC++ Redistributable that the new build prints `ready`.
 A security update to the static CRT requires rebuilding and republishing the Runtime; existing npm packages do not change when the source is fixed,
 so consumers must update to the new release and repackage their app.
+
+## Formatting
+
+Run `bun install --frozen-lockfile` to install the repository's formatting tools.
+`bun run format` formats JavaScript, TypeScript, CSS and supported configuration files;
+`bun run format:rust` formats the Rust workspace; `bun run format:all` runs both.
+Prettier and its Tailwind plugin match ALwith Desktop's versions; Prettier and Rustfmt settings match Desktop's rules.
+Generated artifacts, dependency directories, licenses and Markdown are excluded from Prettier.

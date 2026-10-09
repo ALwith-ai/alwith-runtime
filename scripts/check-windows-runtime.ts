@@ -7,9 +7,13 @@ export function assertStaticWindowsCrt(report: string): void {
   // --coff-imports includes both Import and DelayImport entries.
   const dependencies = Array.from(report.matchAll(/^\s*Name: (\S+\.dll)\s*$/gim), match => match[1]!)
   if (dependencies.length === 0) throw new Error("No Windows DLL imports found; refusing an unchecked binary")
-  const dynamicCrt = dependencies.filter(name => /^(vcruntime|msvcp|msvcr|concrt|vccorlib|ucrtbase|api-ms-win-crt-|ext-ms-win-crt-).*\.dll$/i.test(name))
+  const dynamicCrt = dependencies.filter(name =>
+    /^(vcruntime|msvcp|msvcr|concrt|vccorlib|ucrtbase|api-ms-win-crt-|ext-ms-win-crt-).*\.dll$/i.test(name)
+  )
   if (dynamicCrt.length > 0) {
-    throw new Error(`Windows Runtime requires dynamic CRT DLLs: ${dynamicCrt.join(", ")}. Rebuild with -C target-feature=+crt-static.`)
+    throw new Error(
+      `Windows Runtime requires dynamic CRT DLLs: ${dynamicCrt.join(", ")}. Rebuild with -C target-feature=+crt-static.`
+    )
   }
 }
 

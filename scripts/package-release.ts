@@ -22,7 +22,8 @@ const platforms: Record<string, [string, string]> = {
 
 const root = resolve(import.meta.dirname, "..")
 const target = process.argv[2]
-if (!target || !platforms[target]) throw new Error(`Usage: bun scripts/package-release.ts <${Object.keys(platforms).join("|")}>`)
+if (!target || !platforms[target])
+  throw new Error(`Usage: bun scripts/package-release.ts <${Object.keys(platforms).join("|")}>`)
 const [os, cpu] = platforms[target]!
 const exe = os === "win32" ? ".exe" : ""
 const binary = join(root, "target", target, "release", `alwith-runtime${exe}`)
@@ -43,14 +44,29 @@ cpSync(join(root, "LICENSE"), join(stage, "LICENSE"))
 // included; a crate without a license file is filled in from a known upstream location, and the script
 // fails if that is not possible -- a missing one is a distribution violation and must not pass silently.
 const metadata = await $`cargo metadata --format-version 1 --filter-platform ${target}`.cwd(root).json()
-const notices = ["# Runtime third-party notices", "", "ALwith implementations remain proprietary. Third-party software retains its own licences.", ""]
+const notices = [
+  "# Runtime third-party notices",
+  "",
+  "ALwith implementations remain proprietary. Third-party software retains its own licences.",
+  ""
+]
 const known: Record<string, string> = {
   "https://github.com/whatisinternet/inflector": "LICENSE.md",
   "https://github.com/knurling-rs/defmt": "LICENSE-MIT",
   "https://github.com/madsmtm/objc2": "LICENSE.md",
   "https://github.com/specta-rs/specta": "LICENSE"
 }
-const packages = (metadata.packages as Array<{ name: string; version: string; source: string | null; manifest_path: string; license: string | null; license_file: string | null; repository: string | null }>)
+const packages = (
+  metadata.packages as Array<{
+    name: string
+    version: string
+    source: string | null
+    manifest_path: string
+    license: string | null
+    license_file: string | null
+    repository: string | null
+  }>
+)
   .filter(pkg => pkg.source)
   .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
 for (const pkg of packages) {
@@ -61,7 +77,8 @@ for (const pkg of packages) {
   mkdirSync(dest, { recursive: true })
   if (files.length === 0) {
     const name = pkg.repository ? known[pkg.repository] : undefined
-    if (!name) throw new Error(`Missing licence text for ${pkg.name}@${pkg.version} (${pkg.repository ?? "no repository"})`)
+    if (!name)
+      throw new Error(`Missing licence text for ${pkg.name}@${pkg.version} (${pkg.repository ?? "no repository"})`)
     const revision = JSON.parse(readFileSync(join(directory, ".cargo_vcs_info.json"), "utf8")).git.sha1
     if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error(`Invalid upstream revision for ${pkg.name}`)
     const url = `${pkg.repository!.replace("github.com", "raw.githubusercontent.com")}/${revision}/${name}`
@@ -69,7 +86,9 @@ for (const pkg of packages) {
     if (!response.ok) throw new Error(`Licence ${url}: HTTP ${response.status}`)
     writeFileSync(join(dest, name), await response.text())
     if (pkg.repository === "https://github.com/madsmtm/objc2") {
-      const mit = await fetch("https://raw.githubusercontent.com/madsmtm/objc2/1adc004a387af7491d30209063c9570cddb75981/LICENSE-MIT.txt")
+      const mit = await fetch(
+        "https://raw.githubusercontent.com/madsmtm/objc2/1adc004a387af7491d30209063c9570cddb75981/LICENSE-MIT.txt"
+      )
       if (!mit.ok) throw new Error("Failed to obtain objc2 MIT licence text")
       writeFileSync(join(dest, "LICENSE-MIT.txt"), await mit.text())
     }
@@ -77,19 +96,34 @@ for (const pkg of packages) {
     continue
   }
   for (const name of files) cpSync(join(directory, name), join(dest, name), { recursive: true })
-  notices.push(`- ${pkg.name}@${pkg.version}: ${pkg.license ?? "see licence files"}; licenses/${pkg.name}-${pkg.version}/`)
+  notices.push(
+    `- ${pkg.name}@${pkg.version}: ${pkg.license ?? "see licence files"}; licenses/${pkg.name}-${pkg.version}/`
+  )
 }
 writeFileSync(join(stage, "THIRD_PARTY_NOTICES.md"), notices.join("\n") + "\n")
 
 const sourceRevision = (await $`git rev-parse HEAD`.cwd(root).text()).trim()
 const sha256 = new Bun.CryptoHasher("sha256").update(readFileSync(join(stage, `alwith-runtime${exe}`))).digest("hex")
-writeFileSync(join(stage, "artifact.json"), JSON.stringify({ version, target, binary: `alwith-runtime${exe}`, sha256, sourceRevision }, null, 2) + "\n")
-writeFileSync(join(stage, "package.json"), JSON.stringify({
-  name: `@alwith/runtime-${os}-${cpu}`, version, os: [os], cpu: [cpu],
-  description: `ALwith Runtime binary for ${target}; installed by @alwith/runtime, staged by its stageRuntime()`,
-  license: "SEE LICENSE IN LICENSE",
-  files: [`alwith-runtime${exe}`, "artifact.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "licenses"],
-  publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
-  repository: { type: "git", url: "git+https://github.com/ALwith-ai/alwith-runtime.git" }
-}, null, 2) + "\n")
+writeFileSync(
+  join(stage, "artifact.json"),
+  JSON.stringify({ version, target, binary: `alwith-runtime${exe}`, sha256, sourceRevision }, null, 2) + "\n"
+)
+writeFileSync(
+  join(stage, "package.json"),
+  JSON.stringify(
+    {
+      name: `@alwith/runtime-${os}-${cpu}`,
+      version,
+      os: [os],
+      cpu: [cpu],
+      description: `ALwith Runtime binary for ${target}; installed by @alwith/runtime, staged by its stageRuntime()`,
+      license: "SEE LICENSE IN LICENSE",
+      files: [`alwith-runtime${exe}`, "artifact.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "licenses"],
+      publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
+      repository: { type: "git", url: "git+https://github.com/ALwith-ai/alwith-runtime.git" }
+    },
+    null,
+    2
+  ) + "\n"
+)
 console.log(`${stage}: @alwith/runtime-${os}-${cpu}@${version}, ${packages.length} third-party crates`)

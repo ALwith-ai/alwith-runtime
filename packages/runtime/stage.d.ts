@@ -4,4 +4,4 @@
  * `binaries/alwith-runtime-<triple>`), and its LICENSE, THIRD_PARTY_NOTICES.md and licenses/ under
  * `licenses`/alwith-runtime. Returns `destination`.
  */
-export declare function stageRuntime(target: string, destination: string, licenses: string): string;
+export declare function stageRuntime(target: string, destination: string, licenses: string): string
