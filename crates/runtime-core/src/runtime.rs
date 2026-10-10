@@ -934,24 +934,35 @@ impl Runtime {
                     if tool_calls.contains_key(&key) {
                         continue;
                     }
-                    let (owner, stdin) = {
+                    let owner = {
+                        let agents = self.agents.lock().expect("runtime agents lock poisoned");
+                        agents.get(&agent_id).expect("agent under lane").tool_owner.clone()
+                    };
+                    // Tools declared by an application connection (an agent started by a page, not by a
+                    // module) run in that application: the call travels to the client as an ordinary agent
+                    // request and the client answers it, exactly like a permission request.
+                    let Some(owner) = owner else {
+                        public_batch.push(line);
+                        continue;
+                    };
+                    let stdin = {
                         let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
                         let handle = agents.get_mut(&agent_id).expect("agent under lane");
                         handle.private_tool_ids.insert(key.clone());
-                        (handle.tool_owner.clone(), Arc::clone(&handle.stdin))
+                        Arc::clone(&handle.stdin)
                     };
                     let dispatch = self.tool_dispatch.get().cloned();
                     let params = frame.get("params").cloned().unwrap_or(Value::Null);
                     let caller = agent_id.clone();
                     let task_key = key.clone();
                     let abort = tool_tasks.spawn(async move {
-                        let result = match (owner, dispatch) {
-                            (Some(owner), Some(dispatch)) => {
+                        let result = match dispatch {
+                            Some(dispatch) => {
                                 tokio::time::timeout(Duration::from_secs(1800), dispatch(owner, caller, params))
                                     .await
                                     .unwrap_or_else(|_| Err(ResponseError::runtime("client tool timed out")))
                             }
-                            _ => Err(ResponseError::method_not_found(TOOL_CALL_METHOD)),
+                            None => Err(ResponseError::method_not_found(TOOL_CALL_METHOD)),
                         };
                         let response = match result {
                             Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
@@ -1332,6 +1343,53 @@ print(json.dumps({'method':'test/finished','params':{}}),flush=True)
             }
         }
         assert!(finished);
+    }
+
+    /// An agent started by an application connection has no module tool owner: its `_alwith/tool/call`
+    /// reaches that application as an ordinary agent request, and the application's reply is accepted.
+    #[tokio::test]
+    async fn tool_calls_of_application_owned_agents_are_forwarded_to_the_client() {
+        let runtime = Arc::new(test_runtime());
+        runtime.set_tool_dispatch(Arc::new(|_, _, _| {
+            Box::pin(async { panic!("module dispatch must not run for an application-owned agent") })
+        }));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import json,sys
+print(json.dumps({'jsonrpc':'2.0','id':9,'method':'_alwith/tool/call','params':{'name':'client-read','arguments':{}}}),flush=True)
+reply=json.loads(sys.stdin.readline())
+assert reply['id']==9 and reply['result']['contentItems'][0]['text']=='page-tool-result', reply
+print(json.dumps({'method':'test/finished','params':{}}),flush=True)
+"#,
+        ]);
+        runtime.start("page-agent".into(), metadata("codex"), &mut command).await.unwrap();
+        let mut forwarded = false;
+        let mut finished = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            match &event {
+                RuntimeEvent::AcpAgentRequest { agent_id, id, method, params, .. } if method == TOOL_CALL_METHOD => {
+                    assert_eq!(agent_id, "page-agent");
+                    assert_eq!(params["name"], "client-read");
+                    forwarded = true;
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"success": true, "contentItems": [{"type": "text", "text": "page-tool-result"}]}
+                    });
+                    runtime.send("page-agent", reply.to_string()).await.unwrap();
+                }
+                RuntimeEvent::AcpNotification { method, .. } if method == "test/finished" => finished = true,
+                RuntimeEvent::Exit { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(forwarded, "tool call never reached the client");
+        assert!(finished, "agent did not accept the client's tool result");
     }
 
     #[tokio::test]
