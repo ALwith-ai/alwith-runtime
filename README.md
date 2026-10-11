@@ -104,6 +104,11 @@ Requests `{id, method, params}` → `{id, result | error}`. Methods: `start`, `s
 `attachSession` accept an optional `owner` (a sub-owner label such as a window); the owner is recorded as
 `<connection>:<owner>`, the connection itself may write to every sub-owner's agent.
 
+`stopSession` stops the entire agent process that owns the session. For agents that host multiple
+sessions and support ACP `session/close`, send that ACP request to close only one session. Runtime
+removes its run-state and pending permissions only after a successful close response; other sessions
+and process ownership remain unchanged. A later successful `session/resume` makes it active again.
+
 Events on the same socket, discriminated by `type`: `wire`, `inbound`, `outbound`, `stderr`,
 `exit`, `runStates`. Events go to every authenticated connection; `send`, `stop` and
 `releaseSession` only succeed for the owning connection (`attachSession` takes ownership). On stdio the

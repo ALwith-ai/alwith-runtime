@@ -33,6 +33,7 @@ pub fn is_lifecycle_line(value: &Value) -> bool {
 enum OutboundRequest {
     Prompt { session_id: String },
     SessionInit { session_id: Option<String>, cwd: Option<String> },
+    SessionClose { session_id: String },
 }
 
 #[derive(Debug)]
@@ -43,6 +44,7 @@ struct AgentTrack {
     /// Native resume keeps the identity before it is sent to the engine; after the response it
     /// becomes a session or is released.
     reserved_sessions: HashSet<String>,
+    closed_sessions: HashSet<String>,
     prompt_inflight: HashMap<String, u32>,
     used_sessions: HashSet<String>,
     /// State reported by the agent via `state_update` frames, latest one per sessionId.
@@ -60,6 +62,7 @@ impl AgentTrack {
             outbound: HashMap::new(),
             sessions: Vec::new(),
             reserved_sessions: HashSet::new(),
+            closed_sessions: HashSet::new(),
             prompt_inflight: HashMap::new(),
             used_sessions: HashSet::new(),
             reported_states: HashMap::new(),
@@ -166,6 +169,31 @@ impl RuntimeRegistry {
                 Err(_) => continue,
             };
             changed |= self.record_content(FrameDirection::In, &value, line, now_ms);
+            // Close is session-scoped. Only its successful response retires the record;
+            // the shared agent and every other session remain owned and available.
+            if value.get("method").is_none()
+                && let Some(id) = value.get("id").map(ToString::to_string)
+                && let Some(track) = self.tracks.get_mut(agent_id)
+                && matches!(track.outbound.get(&id), Some(OutboundRequest::SessionClose { .. }))
+            {
+                let Some(OutboundRequest::SessionClose { session_id }) = track.outbound.remove(&id) else {
+                    unreachable!()
+                };
+                if value.get("error").is_none_or(Value::is_null) && value.get("result").is_some() {
+                    track.sessions.retain(|session| session != &session_id);
+                    track.reserved_sessions.remove(&session_id);
+                    track.closed_sessions.insert(session_id.clone());
+                    track.prompt_inflight.remove(&session_id);
+                    track.reported_states.remove(&session_id);
+                    track.pending_permissions.retain(|_, session| session != &session_id);
+                    track.working_directories.remove(&session_id);
+                    if track.current_session_id.as_ref() == Some(&session_id) {
+                        track.current_session_id = None;
+                    }
+                    changed |= self.run_states.remove(&session_id).is_some();
+                }
+                continue;
+            }
             if value.get("id").is_none() {
                 if value.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
                     let cancelled = self.tracks.get_mut(agent_id).and_then(|track| apply_cancel_request(track, &value));
@@ -230,6 +258,9 @@ impl RuntimeRegistry {
             }
         };
         let Some(track) = self.tracks.get_mut(agent_id) else { return false };
+        if track.closed_sessions.contains(session_id) {
+            return false;
+        }
         track.activate_session(session_id);
         track.reported_states.insert(session_id.to_string(), reported);
         let session_id = session_id.to_string();
@@ -518,6 +549,11 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, capacity: usize) {
 fn apply_outbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
     let id = value.get("id").map(ToString::to_string)?;
     match value.get("method").and_then(Value::as_str) {
+        Some("session/close") => {
+            let session_id = value.pointer("/params/sessionId").and_then(Value::as_str)?;
+            track.outbound.insert(id, OutboundRequest::SessionClose { session_id: session_id.to_string() });
+            None
+        }
         Some("session/prompt") => {
             let session_id = value.pointer("/params/sessionId").and_then(Value::as_str)?;
             track.activate_session(session_id);
@@ -572,6 +608,9 @@ fn apply_inbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
     match value.get("method").and_then(Value::as_str) {
         Some("session/request_permission") => {
             let session_id = value.pointer("/params/sessionId").and_then(Value::as_str)?;
+            if track.closed_sessions.contains(session_id) {
+                return None;
+            }
             if !track.sessions.iter().any(|tracked| tracked == session_id) {
                 track.sessions.push(session_id.to_string());
             }
@@ -581,6 +620,9 @@ fn apply_inbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
         Some(_) => None,
         None => match track.outbound.remove(&id)? {
             OutboundRequest::Prompt { session_id } => {
+                if track.closed_sessions.contains(&session_id) {
+                    return None;
+                }
                 if let Some(inflight) = track.prompt_inflight.get_mut(&session_id) {
                     *inflight = inflight.saturating_sub(1);
                 }
@@ -593,12 +635,14 @@ fn apply_inbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
                 value.get("result")?;
                 let session_id = session_id
                     .or_else(|| value.pointer("/result/sessionId").and_then(Value::as_str).map(String::from))?;
+                track.closed_sessions.remove(&session_id);
                 track.activate_session(&session_id);
                 if let Some(cwd) = cwd {
                     track.working_directories.insert(session_id.clone(), cwd);
                 }
                 Some(session_id)
             }
+            OutboundRequest::SessionClose { .. } => unreachable!("close responses are handled by the registry"),
         },
     }
 }
@@ -729,6 +773,75 @@ fn apply_title_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_retires_only_the_acknowledged_session_and_resume_reactivates_it() {
+        let mut registry = RuntimeRegistry::default();
+        registry.begin_agent("a".into(), "main".into());
+        for session in ["one", "two"] {
+            registry.record_outbound(
+                "a",
+                &serde_json::json!({"id":session,"method":"session/new","params":{"cwd":"/p"}}).to_string(),
+                1,
+            );
+            registry.record_inbound_batch(
+                "a",
+                &[serde_json::json!({"id":session,"result":{"sessionId":session}}).to_string()],
+                2,
+            );
+            registry.record_inbound_batch("a", &[serde_json::json!({"method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"state_update","state":"running"}}}).to_string()], 3);
+        }
+        registry.record_inbound_batch(
+            "a",
+            &[r#"{"id":7,"method":"session/request_permission","params":{"sessionId":"one"}}"#.into()],
+            4,
+        );
+        registry.record_outbound("a", r#"{"id":8,"method":"session/close","params":{"sessionId":"one"}}"#, 5);
+        assert_eq!(registry.run_states().len(), 2);
+        assert!(registry.record_inbound_batch("a", &[r#"{"id":8,"result":{}}"#.into()], 6));
+        assert_eq!(registry.agent_id_for_session("one"), None);
+        assert_eq!(registry.agent_id_for_session("two").as_deref(), Some("a"));
+        assert!(registry.pending_permission_ids("one").is_empty());
+        let states = registry.run_states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].session_id, "two");
+        assert_eq!(states[0].state, RunState::Running);
+        assert_eq!(states[0].owner_id, "main");
+        registry.record_inbound_batch("a", &[r#"{"method":"session/update","params":{"sessionId":"one","update":{"sessionUpdate":"state_update","state":"idle"}}}"#.into()], 7);
+        assert_eq!(registry.run_states().len(), 1);
+        assert!(registry.reserve_session("a", "one").unwrap());
+        registry.record_outbound(
+            "a",
+            r#"{"id":9,"method":"session/resume","params":{"sessionId":"one","cwd":"/p"}}"#,
+            8,
+        );
+        registry.record_inbound_batch("a", &[r#"{"id":9,"result":{}}"#.into()], 9);
+        assert_eq!(registry.run_states().len(), 2);
+        assert_eq!(registry.agent_id_for_session("one").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn rejected_close_keeps_the_session_and_its_pending_permissions() {
+        let mut registry = RuntimeRegistry::default();
+        registry.begin_agent("a".into(), "main".into());
+        registry.record_outbound("a", r#"{"id":1,"method":"session/new","params":{}}"#, 1);
+        registry.record_inbound_batch("a", &[r#"{"id":1,"result":{"sessionId":"one"}}"#.into()], 2);
+        registry.record_inbound_batch(
+            "a",
+            &[r#"{"id":7,"method":"session/request_permission","params":{"sessionId":"one"}}"#.into()],
+            3,
+        );
+        let before = registry.run_states();
+        registry.record_outbound("a", r#"{"id":"close","method":"session/close","params":{"sessionId":"one"}}"#, 4);
+        registry.record_inbound_batch(
+            "a",
+            &[r#"{"id":"close","result":null,"error":{"code":-1,"message":"failed"}}"#.into()],
+            5,
+        );
+        assert_eq!(registry.run_states(), before);
+        assert_eq!(registry.pending_permission_ids("one"), vec!["7"]);
+        assert_eq!(registry.agent_id_for_session("one").as_deref(), Some("a"));
+    }
 
     #[test]
     fn native_resume_reservation_is_exclusive_and_released_on_protocol_error() {
