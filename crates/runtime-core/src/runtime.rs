@@ -1723,9 +1723,9 @@ for line in sys.stdin:
             states_sorted(runtime.run_states())
         );
 
-        assert!(!runtime.mark_read("finished", Some(5)), "an older confirmation does not clear a newer state");
-        assert!(runtime.mark_read("finished", Some(6)));
-        assert_eq!(runtime.run_states().iter().find(|state| state.session_id == "finished").unwrap().version, 7);
+        assert!(!runtime.mark_read("finished", Some(4)), "an older confirmation does not clear a newer state");
+        assert!(runtime.mark_read("finished", Some(5)));
+        assert_eq!(runtime.run_states().iter().find(|state| state.session_id == "finished").unwrap().version, 6);
     }
 
     fn states_sorted(mut states: Vec<SessionRunState>) -> Vec<SessionRunState> {
