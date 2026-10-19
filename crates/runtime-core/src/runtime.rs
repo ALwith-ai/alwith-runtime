@@ -17,7 +17,10 @@ use crate::attention::{self, AttentionStore, ProcessLease};
 use crate::claims::{AbortOutcome, ClaimError, ClaimKey, Claims};
 use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
-use crate::{ClaimOutcome, ClaimRetirement, ClaimStatus, ClaimTarget, DeletionOutcome, DeletionStage, SessionDeletion};
+use crate::{
+    ClaimOutcome, ClaimRetirement, ClaimStatus, ClaimTarget, DeletionOutcome, DeletionStage, ReplacementStage,
+    SessionDeletion, SessionReplacement,
+};
 use crate::{MAX_MESSAGE_BYTES, protocol_lines};
 
 /// Default journal directory: under the system cache directory, so "Settings → Cache → Clear" reclaims it in one go.
@@ -999,6 +1002,82 @@ impl Runtime {
             ClaimTarget::Stopped => self.stop_session(&status.session_id).map_err(ResponseError::runtime)?,
         }
         Ok(status)
+    }
+
+    // ---- Replacement (2.4) ----
+
+    /// Record the intent to replace the process under a live claim; nothing changes until commit.
+    pub fn replace_begin(
+        &self, claim_token: &str, owner_id: &str, replacement_id: &str, input_digest: &str,
+    ) -> Result<SessionReplacement, ResponseError> {
+        self.claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .replace_begin(claim_token, owner_id, replacement_id, input_digest)
+            .map_err(claim_error)
+    }
+
+    /// The point of no return: the claim enters `replacing`, the old process is stopped and waited
+    /// for, and the answer is the `stopped` stage -- the holder starts the new process and resumes
+    /// the session, which publishes the successor claim. Re-asked after a lost answer, it reports
+    /// the current stage.
+    pub async fn replace_commit(
+        &self, replacement_id: &str, owner_id: &str,
+    ) -> Result<SessionReplacement, ResponseError> {
+        let committed = self
+            .claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .replace_commit(replacement_id, owner_id)
+            .map_err(claim_error)?;
+        if committed.stage != ReplacementStage::Prepared {
+            return Ok(committed);
+        }
+        loop {
+            let exited = self.agent_exited.notified();
+            tokio::pin!(exited);
+            exited.as_mut().enable();
+            let Some(agent_id) = self.agent_id_for_session(&committed.session_id) else { break };
+            self.stop(&agent_id).map_err(ResponseError::runtime)?;
+            exited.await;
+        }
+        Ok(self
+            .claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .replace_stopped(replacement_id)
+            .expect("the replacement was just committed"))
+    }
+
+    pub fn replace_status(&self, replacement_id: &str) -> Option<SessionReplacement> {
+        self.claims.lock().expect("runtime claims lock poisoned").replacement(replacement_id)
+    }
+
+    /// Withdraw a replacement at whatever stage it is; a published successor is released or
+    /// stopped per `target`.
+    pub fn replace_abort(
+        &self, replacement_id: &str, owner_id: &str, target: ClaimTarget,
+    ) -> Result<SessionReplacement, ResponseError> {
+        let how = match target {
+            ClaimTarget::Released => ClaimRetirement::Released,
+            ClaimTarget::Stopped => ClaimRetirement::Stopped,
+        };
+        let before = self.replace_status(replacement_id);
+        let aborted = self
+            .claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .replace_abort(replacement_id, owner_id, how)
+            .map_err(claim_error)?;
+        if let Some(SessionReplacement { stage: ReplacementStage::Published { claim }, .. }) = before {
+            match target {
+                ClaimTarget::Released => {
+                    self.release_session(&claim.session_id, owner_id);
+                }
+                ClaimTarget::Stopped => self.stop_session(&claim.session_id).map_err(ResponseError::runtime)?,
+            }
+        }
+        Ok(aborted)
     }
 
     // ---- Deletion (1.4) ----
@@ -2078,6 +2157,52 @@ for line in sys.stdin:
         assert_eq!(
             runtime.claim("s", "a3", "digest", "win-1", "conn:main".into()).await.unwrap().claim.phase,
             ClaimPhase::Reserved
+        );
+    }
+
+    /// Replacing the process under a claim: commit stops the old one and waits, the holder's new
+    /// process resuming the session publishes a successor claim under a new token.
+    #[tokio::test]
+    async fn a_replacement_stops_the_old_process_and_publishes_the_successor_on_the_new_one() {
+        let runtime = Arc::new(test_runtime());
+        runtime.start("agent".into(), metadata("dsh"), &mut Command::new("cat")).await.unwrap();
+        let resume = r#"{"jsonrpc":"2.0","id":1,"method":"session/resume","params":{"sessionId":"s","cwd":"/work"}}"#;
+        runtime.send("agent", resume.into()).await.unwrap();
+        runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s"}}"#.into()).unwrap();
+        let mine = runtime.claim("s", "a1", "digest", "win-1", "conn:main".into()).await.unwrap();
+        let token = mine.claim.claim_token.clone();
+
+        runtime.replace_begin(&token, "conn:main", "r1", "new-provider").unwrap();
+        let stopped = runtime.replace_commit("r1", "conn:main").await.unwrap();
+        assert_eq!(stopped.stage, ReplacementStage::Stopped);
+        assert_eq!(runtime.agent_id_for_session("s"), None, "the old process is gone");
+        assert_eq!(
+            runtime.replace_commit("r1", "conn:main").await.unwrap().stage,
+            ReplacementStage::Stopped,
+            "re-asked"
+        );
+
+        // The holder starts the new process under its own name, as a window does.
+        let mut owned = metadata("dsh");
+        owned.owner_id = "conn:main".into();
+        runtime.start("agent".into(), owned, &mut Command::new("cat")).await.unwrap();
+        runtime.send("agent", resume.into()).await.unwrap();
+        runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s"}}"#.into()).unwrap();
+        let successor = runtime.claim_status("win-1", "a1").unwrap();
+        assert_ne!(successor.claim_token, token);
+        assert!(matches!(&successor.phase, ClaimPhase::Active { agent_id, .. } if agent_id == "agent"));
+        assert_eq!(
+            runtime.replace_status("r1").unwrap().stage,
+            ReplacementStage::Published { claim: successor.clone() }
+        );
+        assert_eq!(
+            runtime.release_claim(&token, "conn:main", ClaimTarget::Released).unwrap_err().message,
+            "claim/not_active",
+            "the old token is dead"
+        );
+        assert_eq!(
+            runtime.release_claim(&successor.claim_token, "conn:main", ClaimTarget::Released).unwrap().phase,
+            ClaimPhase::Retired { how: ClaimRetirement::Released }
         );
     }
 

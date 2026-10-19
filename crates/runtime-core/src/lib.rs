@@ -13,8 +13,8 @@ mod runtime;
 
 pub use alwith_runtime_protocol::{
     AgentMetadata, AttachInfo, ClaimOutcome, ClaimPhase, ClaimRetirement, ClaimStatus, ClaimTarget, DeletionOutcome,
-    DeletionStage, FrameDirection, PendingAgentRequest, ResponseError, RunState, RuntimeEvent, SessionDeletion,
-    SessionEventFrame, SessionLifecycleFrame, SessionRunState, SessionTask,
+    DeletionStage, FrameDirection, PendingAgentRequest, ReplacementStage, ResponseError, RunState, RuntimeEvent,
+    SessionDeletion, SessionEventFrame, SessionLifecycleFrame, SessionReplacement, SessionRunState, SessionTask,
 };
 pub use attention::{AttentionStore, ProcessLease, RUNTIME_RESTARTED};
 pub use claims::{AbortOutcome, ClaimError, ClaimKey, Claims};

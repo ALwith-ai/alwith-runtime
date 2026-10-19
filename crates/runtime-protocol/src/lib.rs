@@ -299,6 +299,9 @@ pub enum ClaimRetirement {
     Transferred,
     /// The session entered deletion.
     Deleted,
+    /// A replacement (`replaceCommit`) retired this ownership; the successor claim carries the
+    /// same attempt under a new token.
+    Replaced,
 }
 
 /// Where a claim stands. `reserved`: no live process ran the session, the claimant starts one and
@@ -310,9 +313,21 @@ pub enum ClaimRetirement {
 #[serde(tag = "phase", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum ClaimPhase {
     Reserved,
-    Active { agent_id: String, agent_instance_id: String },
-    Retired { how: ClaimRetirement },
-    Failed { reason: String },
+    Active {
+        agent_id: String,
+        agent_instance_id: String,
+    },
+    /// `replaceCommit` passed: the old process is being stopped or is gone, and the claim turns
+    /// active again (under a new token) when the holder's new agent resumes the session.
+    Replacing {
+        replacement_id: String,
+    },
+    Retired {
+        how: ClaimRetirement,
+    },
+    Failed {
+        reason: String,
+    },
     Aborted,
 }
 
@@ -364,6 +379,30 @@ pub struct SessionDeletion {
     pub session_id: String,
     pub stage: DeletionStage,
     pub began_at: i64,
+}
+
+/// Where a replacement (`docs/plans/2026-10-19-session-lifecycle.md` 2.4) stands. `prepared`: the
+/// intent is recorded, the old claim untouched. `stopped`: committed, the old process is gone, the
+/// holder starts the new one. `published`: the new process runs the session under `claim`.
+/// `aborted` / `transferred` are terminal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReplacementStage {
+    Prepared,
+    Stopped,
+    Published { claim: ClaimStatus },
+    Aborted,
+    Transferred,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReplacement {
+    pub replacement_id: String,
+    pub session_id: String,
+    /// The claim being replaced.
+    pub claim_token: String,
+    pub stage: ReplacementStage,
 }
 
 /// How `sessionDeleteEnd` reports the unlink.
