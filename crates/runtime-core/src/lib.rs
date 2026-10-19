@@ -120,7 +120,9 @@ pub struct RuntimeRegistry {
     /// the same sessionId will be resumed later, and clearing it would leave it untitled again.
     known_titles: HashMap<String, String>,
     /// The run states as last published (`commit_run_states`), version included. A version names
-    /// exactly one content of one session: it moves only when the content differs from this copy.
+    /// one attention state of one session: it moves when the state or the interruption differs
+    /// from this copy, not with activity (`last_activity_at`, ports, tasks) in the same state --
+    /// otherwise a reader's confirmation of `done` could be refused by a tick it never saw.
     published: HashMap<String, SessionRunState>,
     inbound_replay: HashMap<String, VecDeque<String>>,
     /// Journal actions decided while processing frames; the runtime takes them with
@@ -378,13 +380,13 @@ impl RuntimeRegistry {
         }
     }
 
-    /// The snapshot to publish and persist. Every entry whose content differs from the last
-    /// snapshot takes the next version; a new entry starts at 1 (0 = never published).
+    /// The snapshot to publish and persist. Every entry whose attention state differs from the
+    /// last snapshot takes the next version; a new entry starts at 1 (0 = never published).
     pub fn commit_run_states(&mut self) -> Vec<SessionRunState> {
         self.published.retain(|session_id, _| self.run_states.contains_key(session_id));
         for state in self.run_states.values_mut() {
             state.version = match self.published.get(&state.session_id) {
-                Some(previous) if same_content(previous, state) => previous.version,
+                Some(previous) if same_attention(previous, state) => previous.version,
                 Some(previous) => previous.version + 1,
                 None => state.version + 1,
             };
@@ -743,8 +745,8 @@ fn upsert_run_state(
     true
 }
 
-fn same_content(left: &SessionRunState, right: &SessionRunState) -> bool {
-    SessionRunState { version: 0, ..left.clone() } == SessionRunState { version: 0, ..right.clone() }
+fn same_attention(left: &SessionRunState, right: &SessionRunState) -> bool {
+    left.state == right.state && left.interruption == right.interruption
 }
 
 fn apply_execution_metadata(states: &mut HashMap<String, SessionRunState>, session_id: &str, value: &Value) -> bool {
@@ -1314,8 +1316,8 @@ mod tests {
         assert_eq!(registry.run_states()[0].state, RunState::Done);
     }
 
-    /// A version names one content of one session: it moves only when the published content
-    /// differs, and a confirmation names the version it saw.
+    /// A version names one attention state of one session: it moves when the state changes, not
+    /// with activity in the same state, and a confirmation names the version it saw.
     #[test]
     fn versions_move_with_content_and_gate_confirmation() {
         let mut registry = RuntimeRegistry::default();
@@ -1331,7 +1333,7 @@ mod tests {
         registry.record_inbound_batch("agent", &[frame("running")], 1);
         assert_eq!(registry.commit_run_states()[0].version, 1);
         registry.record_inbound_batch("agent", &[frame("running")], 2);
-        assert_eq!(registry.commit_run_states()[0].version, 1, "same content, same version");
+        assert_eq!(registry.commit_run_states()[0].version, 1, "activity in the same state keeps the version");
         registry.record_inbound_batch("agent", &[frame("idle")], 3);
         let done = registry.commit_run_states()[0].clone();
         assert_eq!((done.state, done.version), (RunState::Done, 2));

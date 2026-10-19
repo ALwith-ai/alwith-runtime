@@ -144,9 +144,9 @@ pub struct SessionRunState {
     pub execution_id: Option<String>,
     pub execution_role: Option<String>,
     pub last_activity_at: i64,
-    /// Monotonic per session: moves with every change the Runtime publishes, so a version names
-    /// exactly one content. `markRead` carries the version it confirms; a confirmation of an older
-    /// version does not clear a newer `done`.
+    /// Monotonic per session: moves when the state or the interruption changes (not with activity
+    /// in the same state), so a version names one attention state. `markRead` carries the version
+    /// it confirms; a confirmation of an older version does not clear a newer `done`.
     pub version: u64,
     /// Why the Runtime holds this session in `requires_action` without the agent asking: the
     /// session was `running` when the Runtime stopped, so its turn was cut short. Cleared by the

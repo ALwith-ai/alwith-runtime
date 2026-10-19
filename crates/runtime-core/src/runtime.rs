@@ -1716,7 +1716,7 @@ for line in sys.stdin:
         assert!(states[0].listening_ports.is_empty());
         assert_eq!(states[0].version, 4, "the interruption is a change, so the version moved once");
         assert_eq!(states[1].state, crate::RunState::Done);
-        assert_eq!(states[1].version, 6, "the owner went away with the old Runtime");
+        assert_eq!(states[1].version, 5, "same state, same version: losing the owner is not an attention change");
         assert!(AttentionStore::open(&root).unwrap().read_leases().unwrap().is_empty());
         assert_eq!(
             states_sorted(AttentionStore::open(&root).unwrap().read_run_states().unwrap()),
