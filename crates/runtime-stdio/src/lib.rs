@@ -211,7 +211,10 @@ mod tests {
 
     fn server() -> RuntimeServer {
         let root = tempfile::tempdir().unwrap().keep();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(root).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(root.join("sessions")).unwrap(),
+            alwith_runtime_core::AttentionStore::open(root).unwrap(),
+        ));
         RuntimeServer::new(runtime, Arc::new(CatLauncher), Arc::new(NoExtension), String::new())
     }
 

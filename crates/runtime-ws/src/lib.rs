@@ -174,6 +174,8 @@ pub enum RuntimeCommand {
     },
     MarkRead {
         session_id: String,
+        #[serde(default)]
+        version: Option<u64>,
     },
     SetSessionTitle {
         session_id: String,
@@ -645,8 +647,8 @@ pub async fn execute(
             runtime.set_slow_mode(delay_ms);
             Ok(Value::Null)
         }
-        RuntimeCommand::MarkRead { session_id } => {
-            runtime.mark_read(&session_id);
+        RuntimeCommand::MarkRead { session_id, version } => {
+            runtime.mark_read(&session_id, version);
             Ok(Value::Null)
         }
         RuntimeCommand::SetSessionTitle { session_id, title } => {

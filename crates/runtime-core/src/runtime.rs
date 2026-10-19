@@ -13,6 +13,7 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{oneshot, watch};
 
+use crate::attention::{self, AttentionStore, ProcessLease};
 use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
 use crate::{MAX_MESSAGE_BYTES, protocol_lines};
@@ -20,6 +21,12 @@ use crate::{MAX_MESSAGE_BYTES, protocol_lines};
 /// Default journal directory: under the system cache directory, so "Settings → Cache → Clear" reclaims it in one go.
 pub fn default_journal_root() -> std::path::PathBuf {
     dirs::cache_dir().expect("platform cache directory").join("alwith").join("Runtime").join("sessions")
+}
+
+/// Where the attention state and the process leases live: data, not cache -- an unread `done` or
+/// an interrupted turn is a fact the user has not seen yet, and clearing a cache must not erase it.
+pub fn default_attention_root() -> std::path::PathBuf {
+    dirs::data_dir().expect("platform data directory").join("alwith").join("Runtime")
 }
 
 /// Maximum frames one `session_events` call returns; clients page by `sequence`.
@@ -179,6 +186,8 @@ struct AgentHandle {
     initialize_response: Option<Value>,
     /// ACP requests the Runtime sent (its own carry ids like `rt-<n>`), waiting for the agent's response.
     pending_acp: HashMap<String, PendingAcp>,
+    /// This process as the attention store knows it (`None` once it was gone before it could be read).
+    lease: Option<ProcessLease>,
     /// Ids retracted with `$/cancel_request` after their holder let go: the agent still answers them, and the answer is dropped here.
     retracted_acp: HashSet<String>,
     // Route IDs (such as "main") are not provider identities. Commit the supplied
@@ -208,6 +217,7 @@ pub struct Runtime {
     tool_dispatch: OnceLock<PrivateToolDispatch>,
     registry: Mutex<RuntimeRegistry>,
     journal: Journal,
+    attention: AttentionStore,
     agents: Mutex<HashMap<String, AgentHandle>>,
     // Creation across generations, sends, receives and exit of one agent are serialized; different agents never wait on each other.
     lanes: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -220,24 +230,68 @@ pub struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         let root = default_journal_root();
-        Self::with_journal(
+        let attention_root = default_attention_root();
+        Self::with_storage(
             Journal::open(&root).unwrap_or_else(|error| panic!("open Runtime journal at {}: {error}", root.display())),
+            AttentionStore::open(&attention_root).unwrap_or_else(|error| {
+                panic!("open Runtime attention store at {}: {error}", attention_root.display())
+            }),
         )
     }
 }
 
 impl Runtime {
-    pub fn with_journal(journal: Journal) -> Self {
-        Self {
+    /// Open on the given storage and settle what the previous Runtime left there (`attention`):
+    /// its agent processes are reclaimed and its sessions come back, a running one as interrupted.
+    pub fn with_storage(journal: Journal, attention: AttentionStore) -> Self {
+        let runtime = Self {
             tool_dispatch: OnceLock::new(),
             registry: Mutex::default(),
             journal,
+            attention,
             agents: Mutex::default(),
             lanes: Mutex::default(),
             sinks: Mutex::default(),
             next_sink_id: AtomicU64::default(),
             slow_mode_delay_ms: AtomicU64::default(),
             port_scanner_started: AtomicBool::default(),
+        };
+        runtime.recover();
+        runtime
+    }
+
+    fn recover(&self) {
+        let store = self.attention.root().display();
+        let leases =
+            self.attention.read_leases().unwrap_or_else(|error| panic!("Runtime attention store {store}: {error}"));
+        for lease in attention::reclaim_orphans(&leases) {
+            log::warn!(
+                "reclaimed agent {} (pid {}) left running by the previous Runtime",
+                lease.agent_id,
+                lease.process_id
+            );
+        }
+        self.attention.write_leases(&[]).unwrap_or_else(|error| panic!("Runtime attention store {store}: {error}"));
+        let persisted =
+            self.attention.read_run_states().unwrap_or_else(|error| panic!("Runtime attention store {store}: {error}"));
+        if persisted.is_empty() {
+            return;
+        }
+        self.registry.lock().expect("runtime registry lock poisoned").restore_run_states(persisted, now_ms());
+        self.publish_run_states();
+    }
+
+    /// The leases of every agent process currently held, written whenever one starts or is reaped.
+    fn persist_leases(&self) {
+        let leases = self
+            .agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .values()
+            .filter_map(|handle| handle.lease.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = self.attention.write_leases(&leases) {
+            log::error!("persist agent leases: {error}");
         }
     }
 
@@ -353,6 +407,7 @@ impl Runtime {
 
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = AgentProcess::spawn(command).map_err(|error| format!("spawn ACP agent: {error}"))?;
+        let lease = child.id().and_then(|process_id| attention::lease_for(&agent_id, process_id));
         let stdin = child.inner().stdin.take().ok_or("ACP agent has no stdin")?;
         let stdout = child.inner().stdout.take().ok_or("ACP agent has no stdout")?;
         let stderr = child.inner().stderr.take().ok_or("ACP agent has no stderr")?;
@@ -369,6 +424,7 @@ impl Runtime {
                 child,
                 metadata,
                 failure: None,
+                lease,
                 initialize_request_id: None,
                 initialize_response: None,
                 pending_acp: HashMap::new(),
@@ -719,8 +775,8 @@ impl Runtime {
         filter_answered_permissions(frames, &pending)
     }
 
-    pub fn mark_read(&self, session_id: &str) -> bool {
-        let changed = self.registry.lock().expect("runtime registry lock poisoned").mark_read(session_id);
+    pub fn mark_read(&self, session_id: &str, version: Option<u64>) -> bool {
+        let changed = self.registry.lock().expect("runtime registry lock poisoned").mark_read(session_id, version);
         if changed {
             self.publish_run_states();
         }
@@ -1078,6 +1134,7 @@ impl Runtime {
         // The old process was already torn down by the replacement; its Exit must not reach the new process's subscribers.
         let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
         let mut handle = self.agents.lock().expect("runtime agents lock poisoned").remove(&agent_id);
+        self.persist_leases();
         if let Some(handle) = &mut handle {
             for (_, pending) in handle.pending_acp.drain() {
                 let _ = pending.sender.send(Err(ResponseError::runtime(format!("agent {agent_id} exited"))));
@@ -1222,8 +1279,15 @@ impl Runtime {
         .await
     }
 
+    /// Every change goes out and to disk from here: the registry stamps versions on commit, the
+    /// snapshot is persisted, then broadcast. A persistence failure is logged, not fatal -- the
+    /// session itself lives in the engine's record, this is the attention over it.
     fn publish_run_states(&self) {
-        self.publish(RuntimeEvent::RunStates { sessions: self.run_states() });
+        let sessions = self.registry.lock().expect("runtime registry lock poisoned").commit_run_states();
+        if let Err(error) = self.attention.write_run_states(&sessions) {
+            log::error!("persist run states: {error}");
+        }
+        self.publish(RuntimeEvent::RunStates { sessions });
     }
 
     fn start_port_scanner(self: &Arc<Self>) {
@@ -1604,7 +1668,69 @@ for line in sys.stdin:
 
     fn test_runtime() -> Runtime {
         let root = tempfile::tempdir().expect("temp journal dir").keep();
-        Runtime::with_journal(Journal::open(root).expect("open test journal"))
+        Runtime::with_storage(
+            Journal::open(root.join("sessions")).expect("open test journal"),
+            AttentionStore::open(root).expect("open test attention store"),
+        )
+    }
+
+    /// The attention over a session outlives the Runtime: a session caught running comes back
+    /// needing the user with the reason on it, an unread `done` stays unread, and versions carry on.
+    #[test]
+    fn run_states_come_back_after_a_restart_with_the_interruption_named() {
+        let root = tempfile::tempdir().expect("temp dir").keep();
+        let session = |id: &str, state: crate::RunState, version: u64| SessionRunState {
+            session_id: id.into(),
+            state,
+            reusable_draft: false,
+            owner_id: "main".into(),
+            cwd: "/work".into(),
+            title: "Title".into(),
+            since: 10,
+            tasks: Vec::new(),
+            listening_ports: vec![3000],
+            execution_id: None,
+            execution_role: None,
+            last_activity_at: 12,
+            version,
+            interruption: None,
+        };
+        let previous = AttentionStore::open(&root).unwrap();
+        previous
+            .write_run_states(&[
+                session("cut", crate::RunState::Running, 3),
+                session("finished", crate::RunState::Done, 5),
+            ])
+            .unwrap();
+        previous
+            .write_leases(&[ProcessLease { agent_id: "ghost".into(), process_id: u32::MAX - 2, started_at: 1 }])
+            .unwrap();
+
+        let runtime =
+            Runtime::with_storage(Journal::open(root.join("sessions")).unwrap(), AttentionStore::open(&root).unwrap());
+        let mut states = runtime.run_states();
+        states.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        assert_eq!(states[0].state, crate::RunState::RequiresAction);
+        assert_eq!(states[0].interruption.as_deref(), Some(crate::RUNTIME_RESTARTED));
+        assert_eq!(states[0].owner_id, "");
+        assert!(states[0].listening_ports.is_empty());
+        assert_eq!(states[0].version, 4, "the interruption is a change, so the version moved once");
+        assert_eq!(states[1].state, crate::RunState::Done);
+        assert_eq!(states[1].version, 6, "the owner went away with the old Runtime");
+        assert!(AttentionStore::open(&root).unwrap().read_leases().unwrap().is_empty());
+        assert_eq!(
+            states_sorted(AttentionStore::open(&root).unwrap().read_run_states().unwrap()),
+            states_sorted(runtime.run_states())
+        );
+
+        assert!(!runtime.mark_read("finished", Some(5)), "an older confirmation does not clear a newer state");
+        assert!(runtime.mark_read("finished", Some(6)));
+        assert_eq!(runtime.run_states().iter().find(|state| state.session_id == "finished").unwrap().version, 7);
+    }
+
+    fn states_sorted(mut states: Vec<SessionRunState>) -> Vec<SessionRunState> {
+        states.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        states
     }
 
     struct ChannelSink {

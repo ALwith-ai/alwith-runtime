@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
+mod attention;
 mod framing;
 mod journal;
 pub use framing::{MAX_BUFFERED_BYTES, MAX_MESSAGE_BYTES, ProtocolLines, protocol_lines};
@@ -13,9 +14,11 @@ pub use alwith_runtime_protocol::{
     AgentMetadata, AttachInfo, FrameDirection, PendingAgentRequest, ResponseError, RunState, RuntimeEvent,
     SessionEventFrame, SessionLifecycleFrame, SessionRunState, SessionTask,
 };
+pub use attention::{AttentionStore, ProcessLease, RUNTIME_RESTARTED};
 pub use journal::{Journal, JournalOp, SESSION_JOURNAL_MAX_BYTES};
 pub use runtime::{
-    AgentSnapshot, PrivateToolDispatch, Runtime, RuntimeEventSink, SESSION_EVENTS_PAGE, default_journal_root,
+    AgentSnapshot, PrivateToolDispatch, Runtime, RuntimeEventSink, SESSION_EVENTS_PAGE, default_attention_root,
+    default_journal_root,
 };
 
 const AGENT_REPLAY_CAPACITY: usize = 1_000;
@@ -116,6 +119,9 @@ pub struct RuntimeRegistry {
     /// session". Session teardown does not clear this table --
     /// the same sessionId will be resumed later, and clearing it would leave it untitled again.
     known_titles: HashMap<String, String>,
+    /// The run states as last published (`commit_run_states`), version included. A version names
+    /// exactly one content of one session: it moves only when the content differs from this copy.
+    published: HashMap<String, SessionRunState>,
     inbound_replay: HashMap<String, VecDeque<String>>,
     /// Journal actions decided while processing frames; the runtime takes them with
     /// `take_journal_ops` after the same batch and persists them.
@@ -349,13 +355,42 @@ impl RuntimeRegistry {
         changed
     }
 
-    pub fn mark_read(&mut self, session_id: &str) -> bool {
+    /// `version`: the state the reader saw. A confirmation of an older version does not clear a
+    /// newer `done` (the session finished again since); `None` confirms whatever is current.
+    pub fn mark_read(&mut self, session_id: &str, version: Option<u64>) -> bool {
         let Some(state) = self.run_states.get_mut(session_id) else { return false };
         if state.state != RunState::Done {
             return false;
         }
+        if version.is_some_and(|version| version != state.version) {
+            return false;
+        }
         state.state = RunState::Idle;
         true
+    }
+
+    /// Bring back the sessions a previous Runtime persisted, in their recovered form
+    /// (`attention::recovered`); their versions continue from where that Runtime left them.
+    pub fn restore_run_states(&mut self, persisted: Vec<SessionRunState>, now_ms: i64) {
+        for state in persisted {
+            self.published.insert(state.session_id.clone(), state.clone());
+            self.run_states.insert(state.session_id.clone(), attention::recovered(state, now_ms));
+        }
+    }
+
+    /// The snapshot to publish and persist. Every entry whose content differs from the last
+    /// snapshot takes the next version; a new entry starts at 1 (0 = never published).
+    pub fn commit_run_states(&mut self) -> Vec<SessionRunState> {
+        self.published.retain(|session_id, _| self.run_states.contains_key(session_id));
+        for state in self.run_states.values_mut() {
+            state.version = match self.published.get(&state.session_id) {
+                Some(previous) if same_content(previous, state) => previous.version,
+                Some(previous) => previous.version + 1,
+                None => state.version + 1,
+            };
+            self.published.insert(state.session_id.clone(), state.clone());
+        }
+        self.run_states()
     }
 
     /// Record this session's title. **Write to known_titles first, then worry about the entry**:
@@ -667,6 +702,7 @@ fn upsert_run_state(
             && current.cwd == cwd
             && current.reusable_draft == reusable_draft
             && current.listening_ports == listening_ports
+            && current.interruption.is_none()
     }) {
         return false;
     }
@@ -683,6 +719,7 @@ fn upsert_run_state(
     let execution_id = current.and_then(|current| current.execution_id.clone());
     let execution_role = current.and_then(|current| current.execution_role.clone());
     let last_activity_at = current.map_or(now_ms, |current| current.last_activity_at);
+    let version = current.map_or(0, |current| current.version);
     states.insert(
         session_id.clone(),
         SessionRunState {
@@ -698,9 +735,16 @@ fn upsert_run_state(
             execution_id,
             execution_role,
             last_activity_at,
+            version,
+            // The agent spoke again: whatever cut the session short is over.
+            interruption: None,
         },
     );
     true
+}
+
+fn same_content(left: &SessionRunState, right: &SessionRunState) -> bool {
+    SessionRunState { version: 0, ..left.clone() } == SessionRunState { version: 0, ..right.clone() }
 }
 
 fn apply_execution_metadata(states: &mut HashMap<String, SessionRunState>, session_id: &str, value: &Value) -> bool {
@@ -1261,13 +1305,42 @@ mod tests {
         for reason in ["error", "_error", "refusal", "max_tokens", "max_turn_requests"] {
             registry.record_inbound_batch("agent", &[frame("idle", Some(reason))], 2);
             assert_eq!(registry.run_states()[0].state, RunState::RequiresAction, "{reason}");
-            registry.mark_read("session");
+            registry.mark_read("session", None);
             assert_eq!(registry.run_states()[0].state, RunState::RequiresAction, "{reason}");
         }
         registry.record_inbound_batch("agent", &[frame("running", None)], 4);
         assert_eq!(registry.run_states()[0].state, RunState::Running);
         registry.record_inbound_batch("agent", &[frame("idle", Some("end_turn"))], 5);
         assert_eq!(registry.run_states()[0].state, RunState::Done);
+    }
+
+    /// A version names one content of one session: it moves only when the published content
+    /// differs, and a confirmation names the version it saw.
+    #[test]
+    fn versions_move_with_content_and_gate_confirmation() {
+        let mut registry = RuntimeRegistry::default();
+        registry.begin_agent("agent".into(), "main".into());
+        let frame = |state: &str| {
+            serde_json::json!({
+                "jsonrpc":"2.0", "method":"session/update", "params": {
+                    "sessionId":"session", "update": { "sessionUpdate":"state_update", "state":state }
+                }
+            })
+            .to_string()
+        };
+        registry.record_inbound_batch("agent", &[frame("running")], 1);
+        assert_eq!(registry.commit_run_states()[0].version, 1);
+        registry.record_inbound_batch("agent", &[frame("running")], 2);
+        assert_eq!(registry.commit_run_states()[0].version, 1, "same content, same version");
+        registry.record_inbound_batch("agent", &[frame("idle")], 3);
+        let done = registry.commit_run_states()[0].clone();
+        assert_eq!((done.state, done.version), (RunState::Done, 2));
+        assert!(!registry.mark_read("session", Some(1)), "confirming the running state clears nothing");
+        assert_eq!(registry.run_states()[0].state, RunState::Done);
+        assert!(registry.mark_read("session", Some(2)));
+        assert_eq!(registry.commit_run_states()[0].version, 3);
+        registry.finish_agent("agent");
+        assert!(registry.commit_run_states().is_empty());
     }
 
     /// Teardown happens once: after the agent record is removed, a second teardown is a no-op and
