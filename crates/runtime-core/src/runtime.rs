@@ -17,10 +17,7 @@ use crate::attention::{self, AttentionStore, ProcessLease};
 use crate::claims::{AbortOutcome, ClaimError, ClaimKey, Claims};
 use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
-use crate::{
-    ClaimOutcome, ClaimPhase, ClaimRetirement, ClaimStatus, ClaimTarget, DeletionOutcome, DeletionStage,
-    SessionDeletion,
-};
+use crate::{ClaimOutcome, ClaimRetirement, ClaimStatus, ClaimTarget, DeletionOutcome, DeletionStage, SessionDeletion};
 use crate::{MAX_MESSAGE_BYTES, protocol_lines};
 
 /// Default journal directory: under the system cache directory, so "Settings → Cache → Clear" reclaims it in one go.
@@ -1654,6 +1651,7 @@ fn now_ms() -> i64 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::ClaimPhase;
     use tokio::sync::mpsc;
 
     #[test]
