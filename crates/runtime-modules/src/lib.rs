@@ -27,7 +27,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use alwith_runtime_core::{ResponseError, Runtime, RuntimeEvent, RuntimeEventSink};
+use alwith_runtime_core::{AttentionStore, ResponseError, Runtime, RuntimeEvent, RuntimeEventSink};
 use alwith_runtime_ws::{ConnectionState, Extension};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -775,7 +775,13 @@ for line in sys.stdin:
     #[test]
     fn delegated_requests_are_bound_to_module_call_and_live_connection() {
         let journal = tempfile::tempdir().unwrap();
-        let host = ModuleHost::new(Arc::new(Runtime::with_journal(Journal::open(journal.path()).unwrap())), "0.3.0");
+        let host = ModuleHost::new(
+            Arc::new(Runtime::with_storage(
+                Journal::open(journal.path().join("sessions")).unwrap(),
+                AttentionStore::open(journal.path()).unwrap(),
+            )),
+            "0.3.0",
+        );
         let (events, _) = mpsc::channel(1);
         host.subscribers.lock().unwrap().push(Subscriber {
             id: 7,
@@ -820,7 +826,10 @@ for line in sys.stdin:
         let root = tempfile::tempdir().unwrap();
         write_module(root.path(), "reverse");
         let journal = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal.path()).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(journal.path().join("sessions")).unwrap(),
+            AttentionStore::open(journal.path()).unwrap(),
+        ));
         let host = ModuleHost::new(runtime, "0.3.0");
         let weak_host = Arc::downgrade(&host);
         let (completed, received) = oneshot::channel();
@@ -858,7 +867,10 @@ for line in sys.stdin:
         let root = tempfile::tempdir().unwrap();
         write_module(root.path(), "closing");
         let journal = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal.path()).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(journal.path().join("sessions")).unwrap(),
+            AttentionStore::open(journal.path()).unwrap(),
+        ));
         let host = ModuleHost::new(runtime, "0.3.0");
         let started = Arc::new(Notify::new());
         let dropped = Arc::new(Notify::new());
@@ -891,7 +903,10 @@ for line in sys.stdin:
         let root = tempfile::tempdir().unwrap();
         write_module(root.path(), "echo");
         let journal = tempfile::tempdir().unwrap().keep();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(journal.join("sessions")).unwrap(),
+            AttentionStore::open(&journal).unwrap(),
+        ));
         let host = ModuleHost::new(Arc::clone(&runtime), "0.3.0");
         let server = RuntimeServer::new(
             runtime,
@@ -979,7 +994,10 @@ for line in sys.stdin:
     #[tokio::test]
     async fn a_full_event_queue_disconnects_the_slow_connection_instead_of_dropping_its_subscription() {
         let journal = tempfile::tempdir().unwrap().keep();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(journal.join("sessions")).unwrap(),
+            AttentionStore::open(&journal).unwrap(),
+        ));
         let host = ModuleHost::new(runtime, "0.3.0");
         let extension = ModuleExtension(Arc::clone(&host));
         let (events, mut receiver) = mpsc::channel::<String>(1);
@@ -1015,7 +1033,10 @@ for line in sys.stdin:
         manifest["runtime"] = Value::String(">=9.0.0".into());
         std::fs::write(&manifest_path, manifest.to_string()).unwrap();
         let journal = tempfile::tempdir().unwrap().keep();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(journal).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(journal.join("sessions")).unwrap(),
+            AttentionStore::open(&journal).unwrap(),
+        ));
         let host = ModuleHost::new(runtime, "0.3.0");
         let statuses = host.load_dir(root.path()).await;
         assert!(statuses.is_empty(), "{statuses:?}");
@@ -1024,7 +1045,10 @@ for line in sys.stdin:
     #[tokio::test]
     async fn private_module_operations_are_not_public_rpc() {
         let root = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(root.path()).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(root.path().join("sessions")).unwrap(),
+            AttentionStore::open(root.path()).unwrap(),
+        ));
         let extension = ModuleExtension(ModuleHost::new(runtime, "0.4.0"));
         let (events, _receiver) = mpsc::channel(8);
         let connection = extension.connect("client", events, Arc::new(Notify::new()));
@@ -1040,7 +1064,10 @@ for line in sys.stdin:
     #[tokio::test]
     async fn service_events_only_reach_the_connection_routed_to_that_module() {
         let root = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(root.path()).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(root.path().join("sessions")).unwrap(),
+            AttentionStore::open(root.path()).unwrap(),
+        ));
         let host = ModuleHost::new(runtime, "0.4.0");
         let extension = ModuleExtension(Arc::clone(&host));
         let (first, mut first_events) = mpsc::channel(8);
