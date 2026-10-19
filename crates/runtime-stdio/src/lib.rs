@@ -109,7 +109,7 @@ where
     server.extension.disconnect(&connection).await;
     drop(connection);
     server.runtime.remove_sink(sink_id);
-    server.runtime.detach_owners_under(OWNER_ID);
+    server.runtime.detach_owners_under(OWNER_ID).await;
     let _ = tokio::time::timeout(SHUTDOWN_FORCE_WINDOW, server.extension.shutdown()).await;
     server.runtime.kill_all();
     // Give the writer a window to flush the receipt and the last events; do not wait if the host is not

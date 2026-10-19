@@ -158,6 +158,15 @@ struct ProviderUpdate {
     revision: Option<u64>,
 }
 
+/// A request the Runtime sent to the agent that is still unanswered. `owner_id` is the holder it was sent for: ""
+/// when the Runtime itself asked, and for a prompt once its holder let go, because the turn belongs to the session.
+struct PendingAcp {
+    sender: oneshot::Sender<Result<Value, ResponseError>>,
+    owner_id: String,
+    method: String,
+    id: Value,
+}
+
 struct AgentHandle {
     tool_owner: Option<String>,
     private_tool_ids: HashSet<String>,
@@ -168,8 +177,10 @@ struct AgentHandle {
     failure: Option<String>,
     initialize_request_id: Option<Value>,
     initialize_response: Option<Value>,
-    /// ACP requests the Runtime itself sent (ids like `rt-<n>`), waiting for the agent's response.
-    pending_acp: HashMap<String, oneshot::Sender<Result<Value, ResponseError>>>,
+    /// ACP requests the Runtime sent (its own carry ids like `rt-<n>`), waiting for the agent's response.
+    pending_acp: HashMap<String, PendingAcp>,
+    /// Ids retracted with `$/cancel_request` after their holder let go: the agent still answers them, and the answer is dropped here.
+    retracted_acp: HashSet<String>,
     // Route IDs (such as "main") are not provider identities. Commit the supplied
     // identity only when its matching providers/set request succeeds.
     pending_providers: HashMap<String, Option<ProviderUpdate>>,
@@ -361,6 +372,7 @@ impl Runtime {
                 initialize_request_id: None,
                 initialize_response: None,
                 pending_acp: HashMap::new(),
+                retracted_acp: HashSet::new(),
                 pending_providers: HashMap::new(),
                 provider_changes: watch::channel(()).0,
                 next_acp_id: 1,
@@ -649,7 +661,7 @@ impl Runtime {
     }
 
     /// A connection dropped: it (`root`) and every sub-owner under it (`root:<label>`) become unowned together.
-    pub fn detach_owners_under(&self, root: &str) -> bool {
+    pub async fn detach_owners_under(self: &Arc<Self>, root: &str) -> bool {
         let prefix = format!("{root}:");
         let mut owners: std::collections::BTreeSet<String> = self
             .agents
@@ -662,9 +674,9 @@ impl Runtime {
         owners.extend(
             self.run_states().into_iter().map(|state| state.owner_id).filter(|owner| owner.starts_with(&prefix)),
         );
-        let mut changed = self.detach_owner(root);
+        let mut changed = self.detach_owner(root).await;
         for owner in owners {
-            changed |= self.detach_owner(&owner);
+            changed |= self.detach_owner(&owner).await;
         }
         changed
     }
@@ -732,15 +744,46 @@ impl Runtime {
         changed
     }
 
-    pub fn detach_owner(&self, owner_id: &str) -> bool {
-        for handle in self
-            .agents
-            .lock()
-            .expect("runtime agents lock poisoned")
-            .values_mut()
-            .filter(|handle| handle.metadata.owner_id == owner_id)
-        {
-            handle.metadata.owner_id.clear();
+    /// A holder let go (its connection closed, or it released explicitly). What it was still waiting on and nobody
+    /// took over, nobody will collect: the agent is told with `$/cancel_request` (it MAY stop the work and MUST
+    /// still answer; the answer is dropped here) and the waiting caller fails at once. A `session/prompt` is the
+    /// session's turn, not the holder's request: it goes on for the next holder and is only ever ended by
+    /// `session/cancel`.
+    pub async fn detach_owner(self: &Arc<Self>, owner_id: &str) -> bool {
+        let retracted = {
+            let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
+            let mut retracted = Vec::new();
+            for (agent_id, handle) in agents.iter_mut() {
+                if handle.metadata.owner_id == owner_id {
+                    handle.metadata.owner_id.clear();
+                }
+                let abandoned: Vec<String> = handle
+                    .pending_acp
+                    .iter()
+                    .filter(|(_, pending)| pending.owner_id == owner_id && pending.method != "session/prompt")
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in abandoned {
+                    let pending = handle.pending_acp.remove(&id).expect("abandoned request was just listed");
+                    let _ = pending.sender.send(Err(ResponseError::runtime(format!(
+                        "{} retracted: its holder {owner_id} let go",
+                        pending.method
+                    ))));
+                    handle.retracted_acp.insert(id);
+                    retracted.push((agent_id.clone(), pending.id));
+                }
+                for pending in handle.pending_acp.values_mut().filter(|pending| pending.owner_id == owner_id) {
+                    pending.owner_id.clear();
+                }
+            }
+            retracted
+        };
+        for (agent_id, id) in retracted {
+            let frame =
+                serde_json::json!({ "jsonrpc": "2.0", "method": "$/cancel_request", "params": { "requestId": id } });
+            if let Err(error) = self.send(&agent_id, frame.to_string()).await {
+                log::error!("Runtime: could not retract request {id} on agent {agent_id}: {error}");
+            }
         }
         let changed = self.registry.lock().expect("runtime registry lock poisoned").detach_owner(owner_id);
         if changed {
@@ -767,7 +810,14 @@ impl Runtime {
                     Err(handle.provider_changes.subscribe())
                 } else {
                     let mut info = registry.attach(session_id, owner_id.clone())?;
-                    handle.metadata.owner_id = owner_id.clone();
+                    // A takeover: what the previous holder was still waiting on now belongs to the new one, so the
+                    // previous holder letting go later retracts none of it.
+                    let previous = std::mem::replace(&mut handle.metadata.owner_id, owner_id.clone());
+                    if !previous.is_empty() && previous != owner_id {
+                        for pending in handle.pending_acp.values_mut().filter(|pending| pending.owner_id == previous) {
+                            pending.owner_id = owner_id.clone();
+                        }
+                    }
                     info.engine = handle.metadata.engine.clone();
                     info.provider = handle.metadata.provider.clone();
                     info.provider_revision = handle.metadata.provider_revision;
@@ -838,14 +888,18 @@ impl Runtime {
             }
             if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
                 && let Some(id) = response.get("id").and_then(Value::as_str)
-                && let Some(sender) = handle.pending_acp.remove(id)
             {
-                let outcome = match response.get("error") {
-                    Some(error) if !error.is_null() => Err(ResponseError::parse(error)),
-                    _ => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
-                };
-                let _ = sender.send(outcome);
-                answered_runtime_request = true;
+                if let Some(pending) = handle.pending_acp.remove(id) {
+                    let outcome = match response.get("error") {
+                        Some(error) if !error.is_null() => Err(ResponseError::parse(error)),
+                        _ => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
+                    };
+                    let _ = pending.sender.send(outcome);
+                    answered_runtime_request = true;
+                } else if handle.retracted_acp.remove(id) {
+                    // The answer the protocol owes a retracted request: nobody is waiting for it.
+                    answered_runtime_request = true;
+                }
             }
             // ACP v2 handshakes once per connection; later windows attaching read this original response.
             if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
@@ -1025,8 +1079,8 @@ impl Runtime {
         let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
         let mut handle = self.agents.lock().expect("runtime agents lock poisoned").remove(&agent_id);
         if let Some(handle) = &mut handle {
-            for (_, sender) in handle.pending_acp.drain() {
-                let _ = sender.send(Err(ResponseError::runtime(format!("agent {agent_id} exited"))));
+            for (_, pending) in handle.pending_acp.drain() {
+                let _ = pending.sender.send(Err(ResponseError::runtime(format!("agent {agent_id} exited"))));
             }
             // A closed stdout ends the ACP channel; a still-running process must not hold the agent lane forever.
             if let Err(error) = handle.child.stop_and_wait().await {
@@ -1076,9 +1130,10 @@ impl Runtime {
     /// the agent exited midway, `ResponseError::RUNTIME`) and ACP errors from the agent (code / data as is).
     /// `request_id`: a JSON-RPC id (string or number) chosen by the app, needed only to withdraw it with
     /// `$/cancel_request`; when omitted the Runtime assigns one (`rt-<n>`). Ids still pending on the same agent
-    /// cannot be reused.
+    /// cannot be reused. `owner_id` is the holder the request is sent for ("" for the Runtime itself): a takeover
+    /// transfers what it is still waiting on to the new holder, letting go retracts it (see `detach_owner`).
     pub async fn acp_request(
-        self: &Arc<Self>, agent_id: &str, method: &str, params: Value, request_id: Option<Value>,
+        self: &Arc<Self>, agent_id: &str, method: &str, params: Value, request_id: Option<Value>, owner_id: &str,
     ) -> Result<Value, ResponseError> {
         let (id, receiver) = {
             let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
@@ -1088,9 +1143,9 @@ impl Runtime {
             {
                 return Ok(cached.clone());
             }
-            let id = match request_id {
-                Some(Value::String(id)) => id,
-                Some(Value::Number(id)) => id.to_string(),
+            let (id, id_value) = match request_id {
+                Some(Value::String(id)) => (id.clone(), Value::String(id)),
+                Some(Value::Number(id)) => (id.to_string(), Value::Number(id)),
                 Some(other) => {
                     return Err(ResponseError::invalid_params(format!(
                         "request id must be a string or number, got {other}"
@@ -1099,7 +1154,7 @@ impl Runtime {
                 None => {
                     let id = format!("{ACP_REQUEST_ID_PREFIX}{}", handle.next_acp_id);
                     handle.next_acp_id += 1;
-                    id
+                    (id.clone(), Value::String(id))
                 }
             };
             if handle.pending_acp.contains_key(&id) {
@@ -1108,7 +1163,10 @@ impl Runtime {
                 )));
             }
             let (sender, receiver) = oneshot::channel();
-            handle.pending_acp.insert(id.clone(), sender);
+            handle.pending_acp.insert(
+                id.clone(),
+                PendingAcp { sender, owner_id: owner_id.to_string(), method: method.to_string(), id: id_value },
+            );
             (id, receiver)
         };
         let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
@@ -1159,6 +1217,7 @@ impl Runtime {
                 "capabilities": capabilities.unwrap_or_else(|| serde_json::json!({}))
             }),
             None,
+            "",
         )
         .await
     }
@@ -1445,6 +1504,104 @@ time.sleep(.1)
         }
     }
 
+    #[tokio::test]
+    async fn letting_go_retracts_the_holders_requests_but_not_the_sessions_turn() {
+        let runtime = Arc::new(test_runtime());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
+        runtime.add_sink(&sink);
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import json,sys
+for line in sys.stdin:
+    frame=json.loads(line)
+    if frame.get('method')=='$/cancel_request':
+        rid=frame['params']['requestId']
+        print(json.dumps({'jsonrpc':'2.0','method':'test/cancelled','params':{'requestId':rid}}),flush=True)
+        print(json.dumps({'jsonrpc':'2.0','id':rid,'error':{'code':-32800,'message':'Request cancelled'}}),flush=True)
+    elif frame.get('method')=='test/finish':
+        print(json.dumps({'jsonrpc':'2.0','method':'test/finished','params':{}}),flush=True)
+"#,
+        ]);
+        let mut meta = metadata("codex");
+        meta.owner_id = "window:1".into();
+        runtime.start("agent".into(), meta, &mut command).await.unwrap();
+        let request = |method: &'static str, id: &'static str| {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .acp_request(
+                        "agent",
+                        method,
+                        serde_json::json!({"sessionId":"s"}),
+                        Some(serde_json::json!(id)),
+                        "window:1",
+                    )
+                    .await
+            })
+        };
+        let list = request("session/list", "list-1");
+        let prompt = request("session/prompt", "prompt-1");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pending = runtime
+                    .agents
+                    .lock()
+                    .expect("runtime agents lock poisoned")
+                    .get("agent")
+                    .map_or(0, |handle| handle.pending_acp.len());
+                if pending == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both requests reach the agent");
+
+        runtime.detach_owner("window:1").await;
+
+        let error = list.await.unwrap().unwrap_err();
+        assert_eq!(error.message, "session/list retracted: its holder window:1 let go");
+        assert!(!prompt.is_finished(), "the turn is the session's, not the holder's");
+
+        runtime.acp_notify("agent", "test/finish", serde_json::json!({})).await.unwrap();
+        let mut cancelled = Vec::new();
+        let mut late_answers = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = receiver.recv().await {
+                if let RuntimeEvent::Inbound { lines, .. } = event {
+                    let mut finished = false;
+                    for line in lines {
+                        let frame: Value = serde_json::from_str(&line).unwrap();
+                        match frame["method"].as_str() {
+                            Some("test/cancelled") => cancelled.push(frame["params"]["requestId"].clone()),
+                            Some("test/finished") => finished = true,
+                            _ => {
+                                if frame.get("id").is_some() && frame.get("method").is_none() {
+                                    late_answers.push(frame["id"].clone());
+                                }
+                            }
+                        }
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the agent reports what it was told");
+        assert_eq!(cancelled, vec![serde_json::json!("list-1")], "only the holder's own request is retracted");
+        assert!(late_answers.is_empty(), "the answer owed to a retracted request is dropped, not forwarded");
+        assert!(!prompt.is_finished());
+
+        runtime.stop("agent").unwrap();
+        assert!(prompt.await.unwrap().is_err());
+    }
+
     fn test_runtime() -> Runtime {
         let root = tempfile::tempdir().expect("temp journal dir").keep();
         Runtime::with_journal(Journal::open(root).expect("open test journal"))
@@ -1506,6 +1663,7 @@ for line in sys.stdin:
                     "_meta":{"codex":{"bearerToken":"private-provider-token"}}
                 }),
                 None,
+                "main",
             )
             .await
             .unwrap();
@@ -1811,7 +1969,13 @@ for line in sys.stdin:
         initial.provider = "claude-plan".into();
         runtime.start("agent".into(), initial, &mut command).await.unwrap();
         runtime
-            .acp_request("agent", "session/resume", serde_json::json!({"sessionId":"session", "cwd":"/project"}), None)
+            .acp_request(
+                "agent",
+                "session/resume",
+                serde_json::json!({"sessionId":"session", "cwd":"/project"}),
+                None,
+                "main",
+            )
             .await
             .unwrap();
         assert_eq!(runtime.attach("session", "main".into()).await.unwrap().provider, "claude-plan");
@@ -1825,6 +1989,7 @@ for line in sys.stdin:
                     "_meta":{"alwith":{"providerId":"litellm", "model":"deepseek-V4.1-flash"}}
                 }),
                 None,
+                "main",
             )
             .await
             .unwrap();
@@ -1840,6 +2005,7 @@ for line in sys.stdin:
                     "_meta":{"alwith":{"providerId":"rejected", "model":"other"}}
                 }),
                 None,
+                "main",
             )
             .await
             .unwrap_err();

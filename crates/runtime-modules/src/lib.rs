@@ -428,7 +428,7 @@ impl ModuleHost {
                 }
             }
             host.runtime.remove_sink(sink_id);
-            host.runtime.detach_owners_under(&format!("module:{name}"));
+            host.runtime.detach_owners_under(&format!("module:{name}")).await;
             let pending: Vec<_> = pending.lock().expect("pending lock poisoned").drain().collect();
             for (_, sender) in pending {
                 let _ = sender.send(Err(ResponseError::connection_lost(format!("module {name} exited"))));
