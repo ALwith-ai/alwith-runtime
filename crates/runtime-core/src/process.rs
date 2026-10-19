@@ -40,6 +40,11 @@ impl AgentProcess {
         self.child.id()
     }
 
+    /// Whether a stop was asked for (`start_kill`), as opposed to the process ending on its own.
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+
     pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
         if self.stop_requested {
             return Ok(());
