@@ -17,11 +17,11 @@
     }
   },
   "optionalDependencies": {
-    "@alwith/runtime-darwin-arm64": "0.1.9",
-    "@alwith/runtime-linux-arm64": "0.1.9",
-    "@alwith/runtime-linux-x64": "0.1.9",
-    "@alwith/runtime-win32-arm64": "0.1.9",
-    "@alwith/runtime-win32-x64": "0.1.9"
+    "@alwith/runtime-darwin-arm64": "0.1.10",
+    "@alwith/runtime-linux-arm64": "0.1.10",
+    "@alwith/runtime-linux-x64": "0.1.10",
+    "@alwith/runtime-win32-arm64": "0.1.10",
+    "@alwith/runtime-win32-x64": "0.1.10"
   },
   "publishConfig": {
     "access": "public",
