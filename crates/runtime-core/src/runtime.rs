@@ -889,11 +889,11 @@ impl Runtime {
 
     /// The process is gone: the claims it carried failed, deletions waiting on it may unlink, and
     /// whoever waits for an exit is woken.
-    fn settle_exited_agent(&self, agent_id: &str, stopped: bool) {
+    fn settle_exited_agent(&self, agent_id: &str) {
         let mut persist = false;
         {
             let mut claims = self.claims.lock().expect("runtime claims lock poisoned");
-            claims.agent_exited(agent_id, stopped);
+            claims.agent_exited(agent_id);
             let stopping: Vec<String> = claims
                 .deletions()
                 .into_iter()
@@ -1384,10 +1384,7 @@ impl Runtime {
         let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
         let mut handle = self.agents.lock().expect("runtime agents lock poisoned").remove(&agent_id);
         self.persist_leases();
-        // A stop the holder asked for retires its claims; a Runtime-initiated kill after a protocol
-        // failure (`fail_agent`) is not the holder's doing, so those claims fail like any other exit.
-        let stopped = handle.as_ref().is_some_and(|handle| handle.child.stop_requested() && handle.failure.is_none());
-        self.settle_exited_agent(&agent_id, stopped);
+        self.settle_exited_agent(&agent_id);
         if let Some(handle) = &mut handle {
             for (_, pending) in handle.pending_acp.drain() {
                 let _ = pending.sender.send(Err(ResponseError::runtime(format!("agent {agent_id} exited"))));
@@ -2061,10 +2058,9 @@ for line in sys.stdin:
             runtime.claim_status("win-1", "a1").unwrap().phase,
             ClaimPhase::Retired { how: ClaimRetirement::Deleted }
         );
-        assert_eq!(
-            runtime.claim_status("win-1", "a2").unwrap().phase,
-            ClaimPhase::Retired { how: ClaimRetirement::Stopped },
-            "t's process was stopped on request (by the deletion), so its claim retired as stopped"
+        assert!(
+            matches!(runtime.claim_status("win-1", "a2").unwrap().phase, ClaimPhase::Failed { .. }),
+            "t's claim died with the process"
         );
         assert_eq!(
             runtime.claim("s", "a3", "digest", "win-1", "conn:main".into()).await.unwrap_err().message,

@@ -225,21 +225,16 @@ impl Claims {
         }
     }
 
-    /// The process under these claims is gone. `stopped`: its holder asked for that (the Runtime's
-    /// `stop`), so the claims retire as `stopped`; otherwise they failed.
-    pub fn agent_exited(&mut self, agent_id: &str, stopped: bool) -> Vec<ClaimStatus> {
-        let mut settled = Vec::new();
+    /// The process under these claims is gone: they failed.
+    pub fn agent_exited(&mut self, agent_id: &str) -> Vec<ClaimStatus> {
+        let mut failed = Vec::new();
         for claim in self.by_token.values_mut() {
             if matches!(&claim.status.phase, ClaimPhase::Active { agent_id: held, .. } if held == agent_id) {
-                claim.status.phase = if stopped {
-                    ClaimPhase::Retired { how: ClaimRetirement::Stopped }
-                } else {
-                    ClaimPhase::Failed { reason: format!("agent {agent_id} exited") }
-                };
-                settled.push(claim.status.clone());
+                claim.status.phase = ClaimPhase::Failed { reason: format!("agent {agent_id} exited") };
+                failed.push(claim.status.clone());
             }
         }
-        settled
+        failed
     }
 
     /// The holder itself is gone (its connection or window closed): what it reserved is aborted,
@@ -418,12 +413,9 @@ mod tests {
         let mut claims = Claims::new("rt".into());
         claims.claim(key("a"), "w1", "s", "d", live()).unwrap();
         claims.claim(key("r"), "w1", "t", "d", None).unwrap();
-        let failed = claims.agent_exited("agent", false);
+        let failed = claims.agent_exited("agent");
         assert_eq!(failed.len(), 1);
         assert!(matches!(&failed[0].phase, ClaimPhase::Failed { reason } if reason.contains("agent")));
-        claims.claim(key("s2"), "w1", "u", "d", Some(("agent-2".into(), "agent-2#1".into()))).unwrap();
-        let stopped = claims.agent_exited("agent-2", true);
-        assert_eq!(stopped[0].phase, ClaimPhase::Retired { how: ClaimRetirement::Stopped });
         let gone = claims.owner_gone("w1");
         assert_eq!(gone.len(), 1, "the failed one is already terminal");
         assert_eq!(gone[0].phase, ClaimPhase::Aborted);
