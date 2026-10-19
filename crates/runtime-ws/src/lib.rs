@@ -28,7 +28,10 @@
 use std::future::IntoFuture;
 use std::sync::{Arc, Mutex};
 
-use alwith_runtime_core::{AgentMetadata, ResponseError, Runtime, RuntimeEvent, RuntimeEventSink, SESSION_EVENTS_PAGE};
+use alwith_runtime_core::{
+    AgentMetadata, ClaimTarget, DeletionOutcome, ResponseError, Runtime, RuntimeEvent, RuntimeEventSink,
+    SESSION_EVENTS_PAGE,
+};
 use async_trait::async_trait;
 use axum::Router;
 use axum::extract::State;
@@ -156,6 +159,49 @@ pub enum RuntimeCommand {
     DetachOwner {
         owner: String,
     },
+    /// Take a session for an attempt (docs/plans/2026-10-19-session-lifecycle.md 1.1): idempotent
+    /// on `(callerInstanceId, attemptId)`, refused under a different `inputDigest`.
+    SessionClaim {
+        session_id: String,
+        attempt_id: String,
+        input_digest: String,
+        caller_instance_id: String,
+        #[serde(default)]
+        owner: Option<String>,
+    },
+    /// Withdraw an attempt; may arrive before its claim.
+    SessionClaimAbort {
+        caller_instance_id: String,
+        attempt_id: String,
+        #[serde(default)]
+        owner: Option<String>,
+    },
+    SessionClaimStatus {
+        caller_instance_id: String,
+        attempt_id: String,
+    },
+    /// Let go of a live claim by its token: `released` keeps the process headless, `stopped` ends it.
+    ReleaseClaim {
+        claim_token: String,
+        target: ClaimTarget,
+        #[serde(default)]
+        owner: Option<String>,
+    },
+    /// Begin deleting a session (1.4): claims retire, new ones are refused, the process is stopped
+    /// and waited for; answers at `unlinking`.
+    SessionDeleteBegin {
+        session_id: String,
+    },
+    /// Report the unlink: `{ outcome: "deleted" }` or `{ outcome: "failed", actualResourceState }`.
+    SessionDeleteEnd {
+        session_id: String,
+        #[serde(flatten)]
+        outcome: DeletionOutcome,
+    },
+    SessionDeleteAbandon {
+        session_id: String,
+    },
+    SessionDeletions,
     /// Explicit execution lease release (alwith_dev execution finished).
     ReleaseExecution {
         execution_id: String,
@@ -615,8 +661,45 @@ pub async fn execute(
             Ok(Value::Null)
         }
         RuntimeCommand::AttachSession { session_id, owner } => {
+            if let Some(deletion) = runtime.deleting(&session_id) {
+                let mut error = ResponseError::runtime("claim/deleting");
+                error.data = Some(
+                    serde_json::json!({ "message": format!("session {session_id} is being deleted"), "deletion": deletion }),
+                );
+                return Err(error);
+            }
             let info = runtime.attach(&session_id, owner_of(connection, owner)).await;
             serde_json::to_value(info).map_err(|error| ResponseError::runtime(error.to_string()))
+        }
+        RuntimeCommand::SessionClaim { session_id, attempt_id, input_digest, caller_instance_id, owner } => {
+            let outcome = runtime
+                .claim(&session_id, &attempt_id, &input_digest, &caller_instance_id, owner_of(connection, owner))
+                .await?;
+            serde_json::to_value(outcome).map_err(|error| ResponseError::runtime(error.to_string()))
+        }
+        RuntimeCommand::SessionClaimAbort { caller_instance_id, attempt_id, owner } => {
+            let status = runtime.claim_abort(&caller_instance_id, &attempt_id, &owner_of(connection, owner))?;
+            serde_json::to_value(status).map_err(|error| ResponseError::runtime(error.to_string()))
+        }
+        RuntimeCommand::SessionClaimStatus { caller_instance_id, attempt_id } => {
+            serde_json::to_value(runtime.claim_status(&caller_instance_id, &attempt_id))
+                .map_err(|error| ResponseError::runtime(error.to_string()))
+        }
+        RuntimeCommand::ReleaseClaim { claim_token, target, owner } => {
+            let status = runtime.release_claim(&claim_token, &owner_of(connection, owner), target)?;
+            serde_json::to_value(status).map_err(|error| ResponseError::runtime(error.to_string()))
+        }
+        RuntimeCommand::SessionDeleteBegin { session_id } => {
+            serde_json::to_value(runtime.delete_begin(&session_id).await?)
+                .map_err(|error| ResponseError::runtime(error.to_string()))
+        }
+        RuntimeCommand::SessionDeleteEnd { session_id, outcome } => {
+            serde_json::to_value(runtime.delete_end(&session_id, outcome)?)
+                .map_err(|error| ResponseError::runtime(error.to_string()))
+        }
+        RuntimeCommand::SessionDeleteAbandon { session_id } => Ok(Value::Bool(runtime.delete_abandon(&session_id))),
+        RuntimeCommand::SessionDeletions => {
+            serde_json::to_value(runtime.deletions()).map_err(|error| ResponseError::runtime(error.to_string()))
         }
         RuntimeCommand::ReleaseSession { session_id, owner } => {
             let owner_id = owner_of(connection, owner);

@@ -166,6 +166,9 @@ pub struct SessionLifecycleFrame {
 #[serde(rename_all = "camelCase")]
 pub struct AttachInfo {
     pub agent_id: String,
+    /// This process, as distinct from any earlier or later process under the same `agent_id`:
+    /// every claim and every request names the instance it was made on.
+    pub agent_instance_id: String,
     /// The core this agent was spawned with (authoritative AgentMetadata value), filled by
     /// `Runtime::attach`.
     pub engine: String,
@@ -282,4 +285,91 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence: Option<u64>,
     },
+}
+
+/// How a claim ended when it neither failed nor was aborted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimRetirement {
+    /// The holder let go; the process stays, headless.
+    Released,
+    /// The holder stopped the process.
+    Stopped,
+    /// A later claimant took the session over; its requests and unanswered permissions moved with it.
+    Transferred,
+    /// The session entered deletion.
+    Deleted,
+}
+
+/// Where a claim stands. `reserved`: no live process ran the session, the claimant starts one and
+/// resumes the session, and the claim turns `active` the moment the session appears on an agent of
+/// that claimant. `active`: a live agent runs the session under this claim. The rest are terminal
+/// and never come back: `retired` (see `ClaimRetirement`), `failed` (the agent died under it),
+/// `aborted` (the claimant withdrew, possibly before the claim ever arrived).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ClaimPhase {
+    Reserved,
+    Active { agent_id: String, agent_instance_id: String },
+    Retired { how: ClaimRetirement },
+    Failed { reason: String },
+    Aborted,
+}
+
+/// A claim as the Runtime records it. `(callerInstanceId, attemptId)` is the idempotency key the
+/// claimant chose; `claimToken` is the Runtime's name for the resource ownership, carried by every
+/// later operation on it. Tokens belong to this Runtime instance and die with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimStatus {
+    /// Empty for an abort that arrived before its claim.
+    pub session_id: String,
+    pub caller_instance_id: String,
+    pub attempt_id: String,
+    pub claim_token: String,
+    pub phase: ClaimPhase,
+}
+
+/// The answer to `sessionClaim`. `attach` is present when a live process already ran the session
+/// and the claim took it over on the spot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimOutcome {
+    pub claim: ClaimStatus,
+    pub attach: Option<AttachInfo>,
+}
+
+/// What a claimant does with a live claim it lets go of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimTarget {
+    Released,
+    Stopped,
+}
+
+/// Where a session's deletion stands. `stopping`: the process running it is being stopped;
+/// `unlinking`: no process runs it, the record may be unlinked; `failed`: unlinking did not
+/// complete, with the resource state as the deleter found it. A finished deletion leaves no entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum DeletionStage {
+    Stopping,
+    Unlinking,
+    Failed { actual_resource_state: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDeletion {
+    pub session_id: String,
+    pub stage: DeletionStage,
+    pub began_at: i64,
+}
+
+/// How `sessionDeleteEnd` reports the unlink.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum DeletionOutcome {
+    Deleted,
+    Failed { actual_resource_state: String },
 }

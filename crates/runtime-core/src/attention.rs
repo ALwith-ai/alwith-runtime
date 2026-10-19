@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use alwith_runtime_protocol::{RunState, SessionRunState};
+use alwith_runtime_protocol::{RunState, SessionDeletion, SessionRunState};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -46,6 +46,13 @@ struct LeasesFile {
     agents: Vec<ProcessLease>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionsFile {
+    format: u32,
+    sessions: Vec<SessionDeletion>,
+}
+
 pub struct AttentionStore {
     root: PathBuf,
 }
@@ -73,6 +80,20 @@ impl AttentionStore {
 
     fn leases_path(&self) -> PathBuf {
         self.root.join("agents.json")
+    }
+
+    fn deletions_path(&self) -> PathBuf {
+        self.root.join("deleting.json")
+    }
+
+    /// Deletions in progress: intent and stage, so a restart resumes them instead of letting the
+    /// session be claimed again half-deleted.
+    pub fn write_deletions(&self, sessions: &[SessionDeletion]) -> Result<(), String> {
+        write_json(&self.deletions_path(), &DeletionsFile { format: FORMAT, sessions: sessions.to_vec() })
+    }
+
+    pub fn read_deletions(&self) -> Result<Vec<SessionDeletion>, String> {
+        Ok(read_json::<DeletionsFile>(&self.deletions_path())?.map_or_else(Vec::new, |file| file.sessions))
     }
 
     pub fn write_run_states(&self, sessions: &[SessionRunState]) -> Result<(), String> {

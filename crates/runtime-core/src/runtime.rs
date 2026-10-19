@@ -14,8 +14,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{oneshot, watch};
 
 use crate::attention::{self, AttentionStore, ProcessLease};
+use crate::claims::{AbortOutcome, ClaimError, ClaimKey, Claims};
 use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
+use crate::{ClaimOutcome, ClaimRetirement, ClaimStatus, ClaimTarget, DeletionOutcome, DeletionStage, SessionDeletion};
 use crate::{MAX_MESSAGE_BYTES, protocol_lines};
 
 /// Default journal directory: under the system cache directory, so "Settings → Cache → Clear" reclaims it in one go.
@@ -181,6 +183,8 @@ struct AgentHandle {
     stdin: Arc<AsyncMutex<ChildStdin>>,
     child: AgentProcess,
     metadata: AgentMetadata,
+    /// This process as distinct from any other under the same agent id (see `AttachInfo`).
+    instance_id: String,
     failure: Option<String>,
     initialize_request_id: Option<Value>,
     initialize_response: Option<Value>,
@@ -218,6 +222,13 @@ pub struct Runtime {
     registry: Mutex<RuntimeRegistry>,
     journal: Journal,
     attention: AttentionStore,
+    claims: Mutex<Claims>,
+    /// Signalled whenever an agent process has been reaped (`delete_begin` waits on it).
+    agent_exited: tokio::sync::Notify,
+    /// Names this Runtime process; claim tokens and agent instance ids carry it, so nothing minted
+    /// by an earlier Runtime can be mistaken for ours.
+    runtime_instance: String,
+    next_agent_instance: AtomicU64,
     agents: Mutex<HashMap<String, AgentHandle>>,
     // Creation across generations, sends, receives and exit of one agent are serialized; different agents never wait on each other.
     lanes: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -244,11 +255,19 @@ impl Runtime {
     /// Open on the given storage and settle what the previous Runtime left there (`attention`):
     /// its agent processes are reclaimed and its sessions come back, a running one as interrupted.
     pub fn with_storage(journal: Journal, attention: AttentionStore) -> Self {
+        let runtime_instance = {
+            use std::hash::{BuildHasher, RandomState};
+            format!("{:x}", RandomState::new().hash_one((now_ms(), std::process::id())))
+        };
         let runtime = Self {
             tool_dispatch: OnceLock::new(),
             registry: Mutex::default(),
             journal,
             attention,
+            claims: Mutex::new(Claims::new(runtime_instance.clone())),
+            agent_exited: tokio::sync::Notify::new(),
+            runtime_instance,
+            next_agent_instance: AtomicU64::default(),
             agents: Mutex::default(),
             lanes: Mutex::default(),
             sinks: Mutex::default(),
@@ -272,6 +291,12 @@ impl Runtime {
             );
         }
         self.attention.write_leases(&[]).unwrap_or_else(|error| panic!("Runtime attention store {store}: {error}"));
+        let deletions =
+            self.attention.read_deletions().unwrap_or_else(|error| panic!("Runtime attention store {store}: {error}"));
+        if !deletions.is_empty() {
+            self.claims.lock().expect("runtime claims lock poisoned").restore_deletions(deletions);
+            self.persist_deletions();
+        }
         let persisted =
             self.attention.read_run_states().unwrap_or_else(|error| panic!("Runtime attention store {store}: {error}"));
         if persisted.is_empty() {
@@ -279,6 +304,13 @@ impl Runtime {
         }
         self.registry.lock().expect("runtime registry lock poisoned").restore_run_states(persisted, now_ms());
         self.publish_run_states();
+    }
+
+    fn persist_deletions(&self) {
+        let deletions = self.claims.lock().expect("runtime claims lock poisoned").deletions();
+        if let Err(error) = self.attention.write_deletions(&deletions) {
+            log::error!("persist session deletions: {error}");
+        }
     }
 
     /// The leases of every agent process currently held, written whenever one starts or is reaped.
@@ -408,6 +440,11 @@ impl Runtime {
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = AgentProcess::spawn(command).map_err(|error| format!("spawn ACP agent: {error}"))?;
         let lease = child.id().and_then(|process_id| attention::lease_for(&agent_id, process_id));
+        let instance_id = format!(
+            "{agent_id}#{}.{}",
+            self.runtime_instance,
+            self.next_agent_instance.fetch_add(1, Ordering::AcqRel) + 1
+        );
         let stdin = child.inner().stdin.take().ok_or("ACP agent has no stdin")?;
         let stdout = child.inner().stdout.take().ok_or("ACP agent has no stdout")?;
         let stderr = child.inner().stderr.take().ok_or("ACP agent has no stderr")?;
@@ -423,6 +460,7 @@ impl Runtime {
                 stdin: Arc::new(AsyncMutex::new(stdin)),
                 child,
                 metadata,
+                instance_id,
                 failure: None,
                 lease,
                 initialize_request_id: None,
@@ -842,10 +880,193 @@ impl Runtime {
             }
         }
         let changed = self.registry.lock().expect("runtime registry lock poisoned").detach_owner(owner_id);
+        self.claims.lock().expect("runtime claims lock poisoned").owner_gone(owner_id);
         if changed {
             self.publish_run_states();
         }
         changed
+    }
+
+    /// The process is gone: the claims it carried failed, deletions waiting on it may unlink, and
+    /// whoever waits for an exit is woken.
+    fn settle_exited_agent(&self, agent_id: &str) {
+        let mut persist = false;
+        {
+            let mut claims = self.claims.lock().expect("runtime claims lock poisoned");
+            claims.agent_exited(agent_id);
+            let stopping: Vec<String> = claims
+                .deletions()
+                .into_iter()
+                .filter(|deletion| deletion.stage == DeletionStage::Stopping)
+                .map(|deletion| deletion.session_id)
+                .collect();
+            for session_id in stopping {
+                if self.agent_id_for_session(&session_id).is_none() {
+                    claims.delete_stage(&session_id, DeletionStage::Unlinking);
+                    persist = true;
+                }
+            }
+        }
+        if persist {
+            self.persist_deletions();
+        }
+        self.agent_exited.notify_waiters();
+    }
+
+    // ---- Claims (docs/plans/2026-10-19-session-lifecycle.md 1.1-1.4) ----
+
+    /// Take the session for `(caller_instance_id, attempt_id)`. A live process running it is
+    /// attached on the spot (taking it over from any other holder); otherwise the claim is
+    /// `reserved` and turns active when the claimant's agent resumes the session.
+    pub async fn claim(
+        &self, session_id: &str, attempt_id: &str, input_digest: &str, caller_instance_id: &str, owner_id: String,
+    ) -> Result<ClaimOutcome, ResponseError> {
+        let key = ClaimKey { caller_instance_id: caller_instance_id.to_string(), attempt_id: attempt_id.to_string() };
+        {
+            let mut claims = self.claims.lock().expect("runtime claims lock poisoned");
+            if let Some(deletion) = claims.deletion(session_id)
+                && claims.status(&key).is_none()
+            {
+                return Err(claim_error(ClaimError {
+                    code: "claim/deleting",
+                    message: format!("session {session_id} is being deleted ({:?})", deletion.stage),
+                }));
+            }
+            if claims.status(&key).is_some() {
+                // Idempotent: the same attempt gets its recorded answer; the state machine checks
+                // the digest, no process work is involved.
+                let claim = claims.claim(key, &owner_id, session_id, input_digest, None).map_err(claim_error)?;
+                return Ok(ClaimOutcome { claim, attach: None });
+            }
+        }
+        let attach = self.attach(session_id, owner_id.clone()).await;
+        let live = attach.as_ref().map(|info| (info.agent_id.clone(), info.agent_instance_id.clone()));
+        let claim = self
+            .claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .claim(key, &owner_id, session_id, input_digest, live)
+            .map_err(claim_error)?;
+        Ok(ClaimOutcome { claim, attach })
+    }
+
+    /// Withdraw an attempt, before or after its claim arrived. A claim this attempt alone held is
+    /// released (the process stays, headless); one taken over by a later claimant is reported as
+    /// `claim/transferred` and left alone.
+    pub fn claim_abort(
+        &self, caller_instance_id: &str, attempt_id: &str, owner_id: &str,
+    ) -> Result<ClaimStatus, ResponseError> {
+        let key = ClaimKey { caller_instance_id: caller_instance_id.to_string(), attempt_id: attempt_id.to_string() };
+        let outcome = self.claims.lock().expect("runtime claims lock poisoned").abort(key);
+        match outcome {
+            AbortOutcome::Aborted(status) | AbortOutcome::Terminal(status) => Ok(status),
+            AbortOutcome::ReleaseAndAbort { session_id, status } => {
+                self.release_session(&session_id, owner_id);
+                Ok(status)
+            }
+            AbortOutcome::Transferred(status) => {
+                let mut error = ResponseError::runtime("claim/transferred");
+                error.data = Some(serde_json::to_value(status).expect("claim status serializes"));
+                Err(error)
+            }
+        }
+    }
+
+    pub fn claim_status(&self, caller_instance_id: &str, attempt_id: &str) -> Option<ClaimStatus> {
+        let key = ClaimKey { caller_instance_id: caller_instance_id.to_string(), attempt_id: attempt_id.to_string() };
+        self.claims.lock().expect("runtime claims lock poisoned").status(&key)
+    }
+
+    /// The holder lets go of a live claim: `released` keeps the process (headless), `stopped`
+    /// ends it. Checked against the token and the holder.
+    pub fn release_claim(
+        &self, claim_token: &str, owner_id: &str, target: ClaimTarget,
+    ) -> Result<ClaimStatus, ResponseError> {
+        let how = match target {
+            ClaimTarget::Released => ClaimRetirement::Released,
+            ClaimTarget::Stopped => ClaimRetirement::Stopped,
+        };
+        let status = self
+            .claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .retire(claim_token, owner_id, how)
+            .map_err(claim_error)?;
+        match target {
+            ClaimTarget::Released => {
+                self.release_session(&status.session_id, owner_id);
+            }
+            ClaimTarget::Stopped => self.stop_session(&status.session_id).map_err(ResponseError::runtime)?,
+        }
+        Ok(status)
+    }
+
+    // ---- Deletion (1.4) ----
+
+    pub fn deleting(&self, session_id: &str) -> Option<SessionDeletion> {
+        self.claims.lock().expect("runtime claims lock poisoned").deletion(session_id).cloned()
+    }
+
+    pub fn deletions(&self) -> Vec<SessionDeletion> {
+        self.claims.lock().expect("runtime claims lock poisoned").deletions()
+    }
+
+    /// Begin deleting a session: its claims retire, new ones are refused, the process running it
+    /// is stopped and waited for. Returns at `unlinking`: no process runs the session, the record
+    /// may be unlinked (`delete_end` reports how that went). Intent and stage are persisted first,
+    /// so a crash in between resumes here.
+    pub async fn delete_begin(&self, session_id: &str) -> Result<SessionDeletion, ResponseError> {
+        let deletion = self.claims.lock().expect("runtime claims lock poisoned").delete_begin(session_id, now_ms());
+        self.persist_deletions();
+        if deletion.stage != DeletionStage::Stopping {
+            return Ok(deletion);
+        }
+        loop {
+            let exited = self.agent_exited.notified();
+            tokio::pin!(exited);
+            exited.as_mut().enable();
+            let Some(agent_id) = self.agent_id_for_session(session_id) else { break };
+            self.stop(&agent_id).map_err(ResponseError::runtime)?;
+            exited.await;
+        }
+        let deletion = self
+            .claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .delete_stage(session_id, DeletionStage::Unlinking)
+            .expect("deletion was just begun");
+        self.persist_deletions();
+        Ok(deletion)
+    }
+
+    /// The deleter reports the unlink. `deleted` forgets the session (attention entry included);
+    /// a failure keeps the deletion with the state the deleter found.
+    pub fn delete_end(
+        &self, session_id: &str, outcome: DeletionOutcome,
+    ) -> Result<Option<SessionDeletion>, ResponseError> {
+        let deletion = self
+            .claims
+            .lock()
+            .expect("runtime claims lock poisoned")
+            .delete_end(session_id, outcome)
+            .map_err(claim_error)?;
+        self.persist_deletions();
+        if deletion.is_none() {
+            let forgotten = self.registry.lock().expect("runtime registry lock poisoned").forget_session(session_id);
+            if forgotten {
+                self.publish_run_states();
+            }
+        }
+        Ok(deletion)
+    }
+
+    /// The user gives the deletion up: the session may be claimed again.
+    pub fn delete_abandon(&self, session_id: &str) -> bool {
+        let abandoned = self.claims.lock().expect("runtime claims lock poisoned").delete_abandon(session_id);
+        if abandoned {
+            self.persist_deletions();
+        }
+        abandoned
     }
 
     pub async fn attach(&self, session_id: &str, owner_id: String) -> Option<AttachInfo> {
@@ -874,6 +1095,7 @@ impl Runtime {
                             pending.owner_id = owner_id.clone();
                         }
                     }
+                    info.agent_instance_id = handle.instance_id.clone();
                     info.engine = handle.metadata.engine.clone();
                     info.provider = handle.metadata.provider.clone();
                     info.provider_revision = handle.metadata.provider_revision;
@@ -976,7 +1198,34 @@ impl Runtime {
             now_ms(),
         );
         let stamp = journal_stamp(self.commit_journal());
+        self.activate_claims(agent_id);
         Ok(if answered_runtime_request { None } else { Some(AcceptedLine { line, stamp }) })
+    }
+
+    /// A session the holder reserved a claim for has appeared on the holder's agent: the claim is
+    /// active from now on. Runs after every inbound frame; cheap when nothing is reserved.
+    fn activate_claims(&self, agent_id: &str) {
+        let Some((owner_id, sessions)) =
+            self.registry.lock().expect("runtime registry lock poisoned").agent_sessions(agent_id)
+        else {
+            return;
+        };
+        if owner_id.is_empty() {
+            return;
+        }
+        let Some(instance_id) = self
+            .agents
+            .lock()
+            .expect("runtime agents lock poisoned")
+            .get(agent_id)
+            .map(|handle| handle.instance_id.clone())
+        else {
+            return;
+        };
+        let mut claims = self.claims.lock().expect("runtime claims lock poisoned");
+        for session_id in sessions {
+            claims.activate(&owner_id, &session_id, agent_id, &instance_id);
+        }
     }
 
     async fn pump_stdout(self: Arc<Self>, agent_id: String, stdout: tokio::process::ChildStdout) {
@@ -1135,6 +1384,7 @@ impl Runtime {
         let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
         let mut handle = self.agents.lock().expect("runtime agents lock poisoned").remove(&agent_id);
         self.persist_leases();
+        self.settle_exited_agent(&agent_id);
         if let Some(handle) = &mut handle {
             for (_, pending) in handle.pending_acp.drain() {
                 let _ = pending.sender.send(Err(ResponseError::runtime(format!("agent {agent_id} exited"))));
@@ -1386,6 +1636,12 @@ fn filter_answered_permissions(frames: Vec<SessionEventFrame>, pending_ids: &[St
             value.get("id").map(ToString::to_string).is_some_and(|id| pending_ids.contains(&id))
         })
         .collect()
+}
+
+fn claim_error(error: ClaimError) -> ResponseError {
+    let mut response = ResponseError::runtime(error.code);
+    response.data = Some(serde_json::json!({ "message": error.message }));
+    response
 }
 
 fn now_ms() -> i64 {
@@ -1752,6 +2008,72 @@ for line in sys.stdin:
             model: "test".into(),
             connection: "test".into(),
         }
+    }
+
+    /// A claim on a session a live agent runs takes it on the spot; one on a session nobody runs is
+    /// reserved and turns active when the holder's agent resumes it; deletion retires the claims,
+    /// stops the process, waits for it, and only `delete_end` forgets the session.
+    #[tokio::test]
+    async fn claims_follow_the_process_and_deletion_waits_for_it() {
+        let runtime = Arc::new(test_runtime());
+        runtime.start("agent".into(), metadata("dsh"), &mut Command::new("cat")).await.unwrap();
+        let resume = |id: u64, session: &str| {
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"session/resume","params":{"sessionId":session,"cwd":"/work"}})
+                .to_string()
+        };
+        runtime.send("agent", resume(1, "s")).await.unwrap();
+        runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s"}}"#.into()).unwrap();
+
+        let mine = runtime.claim("s", "a1", "digest", "win-1", "conn:main".into()).await.unwrap();
+        let attach = mine.attach.expect("a live agent runs s");
+        assert_eq!(attach.agent_id, "agent");
+        assert!(attach.agent_instance_id.starts_with("agent#"), "{}", attach.agent_instance_id);
+        assert_eq!(
+            mine.claim.phase,
+            ClaimPhase::Active { agent_id: "agent".into(), agent_instance_id: attach.agent_instance_id.clone() }
+        );
+        let again = runtime.claim("s", "a1", "digest", "win-1", "conn:main".into()).await.unwrap();
+        assert_eq!(again.claim, mine.claim, "idempotent");
+        assert!(again.attach.is_none());
+        assert_eq!(
+            runtime.claim("s", "a1", "other", "win-1", "conn:main".into()).await.unwrap_err().message,
+            "claim/digest_mismatch"
+        );
+
+        let reserved = runtime.claim("t", "a2", "digest", "win-1", "conn:main".into()).await.unwrap();
+        assert_eq!(reserved.claim.phase, ClaimPhase::Reserved);
+        assert!(reserved.attach.is_none());
+        runtime.send("agent", resume(2, "t")).await.unwrap();
+        runtime.accept_line("agent", r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"t"}}"#.into()).unwrap();
+        assert!(
+            matches!(runtime.claim_status("win-1", "a2").unwrap().phase, ClaimPhase::Active { agent_id, .. } if agent_id == "agent"),
+            "the holder's agent resumed t, so the reserved claim is active"
+        );
+
+        let begun = runtime.delete_begin("s").await.unwrap();
+        assert_eq!(begun.stage, DeletionStage::Unlinking, "the process was stopped and reaped");
+        assert_eq!(runtime.agent_id_for_session("s"), None);
+        assert_eq!(
+            runtime.claim_status("win-1", "a1").unwrap().phase,
+            ClaimPhase::Retired { how: ClaimRetirement::Deleted }
+        );
+        assert!(
+            matches!(runtime.claim_status("win-1", "a2").unwrap().phase, ClaimPhase::Failed { .. }),
+            "t's claim died with the process"
+        );
+        assert_eq!(
+            runtime.claim("s", "a3", "digest", "win-1", "conn:main".into()).await.unwrap_err().message,
+            "claim/deleting"
+        );
+        assert_eq!(runtime.deletions().len(), 1);
+        assert!(runtime.run_states().iter().all(|state| state.session_id != "s"), "the dead agent's entries are gone");
+        assert_eq!(runtime.delete_end("s", DeletionOutcome::Deleted).unwrap(), None);
+        assert!(runtime.deletions().is_empty());
+        assert!(AttentionStore::open(runtime.attention.root()).unwrap().read_deletions().unwrap().is_empty());
+        assert_eq!(
+            runtime.claim("s", "a3", "digest", "win-1", "conn:main".into()).await.unwrap().claim.phase,
+            ClaimPhase::Reserved
+        );
     }
 
     // cat blocks on the held piped stdin, so the process lives until the runtime drops (kill_on_drop)

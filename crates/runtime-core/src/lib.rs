@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::Value;
 
 mod attention;
+mod claims;
 mod framing;
 mod journal;
 pub use framing::{MAX_BUFFERED_BYTES, MAX_MESSAGE_BYTES, ProtocolLines, protocol_lines};
@@ -11,10 +12,12 @@ pub mod process;
 mod runtime;
 
 pub use alwith_runtime_protocol::{
-    AgentMetadata, AttachInfo, FrameDirection, PendingAgentRequest, ResponseError, RunState, RuntimeEvent,
+    AgentMetadata, AttachInfo, ClaimOutcome, ClaimPhase, ClaimRetirement, ClaimStatus, ClaimTarget, DeletionOutcome,
+    DeletionStage, FrameDirection, PendingAgentRequest, ResponseError, RunState, RuntimeEvent, SessionDeletion,
     SessionEventFrame, SessionLifecycleFrame, SessionRunState, SessionTask,
 };
 pub use attention::{AttentionStore, ProcessLease, RUNTIME_RESTARTED};
+pub use claims::{AbortOutcome, ClaimError, ClaimKey, Claims};
 pub use journal::{Journal, JournalOp, SESSION_JOURNAL_MAX_BYTES};
 pub use runtime::{
     AgentSnapshot, PrivateToolDispatch, Runtime, RuntimeEventSink, SESSION_EVENTS_PAGE, default_attention_root,
@@ -304,6 +307,7 @@ impl RuntimeRegistry {
         let pending_agent_requests = self.pending_agent_requests(&agent_id, &pending_ids);
         Some(AttachInfo {
             agent_id,
+            agent_instance_id: String::new(),
             engine: String::new(),
             provider: String::new(),
             provider_revision: None,
@@ -424,6 +428,17 @@ impl RuntimeRegistry {
 
     pub fn run_states(&self) -> Vec<SessionRunState> {
         self.run_states.values().cloned().collect()
+    }
+
+    /// The sessions a live agent runs, and its owner.
+    pub fn agent_sessions(&self, agent_id: &str) -> Option<(String, Vec<String>)> {
+        self.tracks.get(agent_id).map(|track| (track.owner_id.clone(), track.sessions.clone()))
+    }
+
+    /// The session is deleted: its attention entry goes with it. Returns whether anything changed.
+    pub fn forget_session(&mut self, session_id: &str) -> bool {
+        self.known_titles.remove(session_id);
+        self.run_states.remove(session_id).is_some()
     }
 
     pub fn agent_id_for_session(&self, session_id: &str) -> Option<String> {
