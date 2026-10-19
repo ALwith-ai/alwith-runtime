@@ -35,7 +35,8 @@ ALWITH_RUNTIME_TOKEN=secret ALWITH_RUNTIME_ENGINES='{...}' alwith-runtime --list
 
 `--listen ws://` alone reads `ALWITH_RUNTIME_ADDR` (default `127.0.0.1:0`). Optional for both:
 `ALWITH_RUNTIME_JOURNAL` (default the platform cache dir under `alwith/runtime/sessions`),
-`ALWITH_RUNTIME_PARENT_PID` (exit when the parent goes away), `ALWITH_MODULES_DIR` (load modules from
+`ALWITH_RUNTIME_ATTENTION` (run states and agent process leases, kept across restarts; default the
+platform data dir under `alwith/Runtime`), `ALWITH_RUNTIME_PARENT_PID` (exit when the parent goes away), `ALWITH_MODULES_DIR` (load modules from
 there; see `crates/runtime-modules`). Logs go to stderr only; stdout carries nothing but protocol frames.
 
 ## Independent build
