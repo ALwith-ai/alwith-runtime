@@ -202,29 +202,6 @@ pub enum RuntimeCommand {
         session_id: String,
     },
     SessionDeletions,
-    /// Replacement transaction (2.4): record the intent under a live claim.
-    ReplaceBegin {
-        claim_token: String,
-        replacement_id: String,
-        input_digest: String,
-        #[serde(default)]
-        owner: Option<String>,
-    },
-    /// The point of no return: stops and waits for the old process; answers at `stopped`.
-    ReplaceCommit {
-        replacement_id: String,
-        #[serde(default)]
-        owner: Option<String>,
-    },
-    ReplaceStatus {
-        replacement_id: String,
-    },
-    ReplaceAbort {
-        replacement_id: String,
-        target: ClaimTarget,
-        #[serde(default)]
-        owner: Option<String>,
-    },
     /// Explicit execution lease release (alwith_dev execution finished).
     ReleaseExecution {
         execution_id: String,
@@ -723,23 +700,6 @@ pub async fn execute(
         RuntimeCommand::SessionDeleteAbandon { session_id } => Ok(Value::Bool(runtime.delete_abandon(&session_id))),
         RuntimeCommand::SessionDeletions => {
             serde_json::to_value(runtime.deletions()).map_err(|error| ResponseError::runtime(error.to_string()))
-        }
-        RuntimeCommand::ReplaceBegin { claim_token, replacement_id, input_digest, owner } => {
-            let status =
-                runtime.replace_begin(&claim_token, &owner_of(connection, owner), &replacement_id, &input_digest)?;
-            serde_json::to_value(status).map_err(|error| ResponseError::runtime(error.to_string()))
-        }
-        RuntimeCommand::ReplaceCommit { replacement_id, owner } => {
-            let status = runtime.replace_commit(&replacement_id, &owner_of(connection, owner)).await?;
-            serde_json::to_value(status).map_err(|error| ResponseError::runtime(error.to_string()))
-        }
-        RuntimeCommand::ReplaceStatus { replacement_id } => {
-            serde_json::to_value(runtime.replace_status(&replacement_id))
-                .map_err(|error| ResponseError::runtime(error.to_string()))
-        }
-        RuntimeCommand::ReplaceAbort { replacement_id, target, owner } => {
-            let status = runtime.replace_abort(&replacement_id, &owner_of(connection, owner), target)?;
-            serde_json::to_value(status).map_err(|error| ResponseError::runtime(error.to_string()))
         }
         RuntimeCommand::ReleaseSession { session_id, owner } => {
             let owner_id = owner_of(connection, owner);

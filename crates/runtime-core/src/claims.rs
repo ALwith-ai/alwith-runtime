@@ -11,8 +11,7 @@
 use std::collections::HashMap;
 
 use alwith_runtime_protocol::{
-    ClaimPhase, ClaimRetirement, ClaimStatus, DeletionOutcome, DeletionStage, ReplacementStage, SessionDeletion,
-    SessionReplacement,
+    ClaimPhase, ClaimRetirement, ClaimStatus, DeletionOutcome, DeletionStage, SessionDeletion,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -56,16 +55,6 @@ pub enum AbortOutcome {
     Terminal(ClaimStatus),
 }
 
-#[derive(Debug)]
-struct Replacement {
-    status: SessionReplacement,
-    owner_id: String,
-    input_digest: String,
-    /// The instance being replaced: a frame it still emits while being stopped must not publish
-    /// the replacement on it.
-    previous_instance_id: String,
-}
-
 #[derive(Debug, Default)]
 pub struct Claims {
     runtime_instance: String,
@@ -73,7 +62,6 @@ pub struct Claims {
     by_token: HashMap<String, Claim>,
     by_key: HashMap<ClaimKey, String>,
     deleting: HashMap<String, SessionDeletion>,
-    replacements: HashMap<String, Replacement>,
 }
 
 impl Claims {
@@ -94,8 +82,7 @@ impl Claims {
         self.by_token
             .iter()
             .find(|(_, claim)| {
-                claim.status.session_id == session_id
-                    && matches!(claim.status.phase, ClaimPhase::Active { .. } | ClaimPhase::Replacing { .. })
+                claim.status.session_id == session_id && matches!(claim.status.phase, ClaimPhase::Active { .. })
             })
             .map(|(token, _)| token.clone())
     }
@@ -123,7 +110,7 @@ impl Claims {
         }
         if let Some(token) = self.active_token(session_id) {
             let claim = self.by_token.get_mut(&token).expect("active token is recorded");
-            if claim.owner_id == owner_id && matches!(claim.status.phase, ClaimPhase::Active { .. }) {
+            if claim.owner_id == owner_id {
                 // The same holder again: one ownership, shared by both attempts.
                 self.by_key.insert(key, token);
                 return Ok(claim.status.clone());
@@ -154,194 +141,14 @@ impl Claims {
     pub fn activate(
         &mut self, owner_id: &str, session_id: &str, agent_id: &str, agent_instance_id: &str,
     ) -> Option<ClaimStatus> {
-        let (token, phase) = self
-            .by_token
-            .iter()
-            .find(|(_, claim)| {
-                claim.owner_id == owner_id
-                    && claim.status.session_id == session_id
-                    && matches!(claim.status.phase, ClaimPhase::Reserved | ClaimPhase::Replacing { .. })
-            })
-            .map(|(token, claim)| (token.clone(), claim.status.phase.clone()))?;
-        let active =
+        let claim = self.by_token.values_mut().find(|claim| {
+            claim.owner_id == owner_id
+                && claim.status.session_id == session_id
+                && claim.status.phase == ClaimPhase::Reserved
+        })?;
+        claim.status.phase =
             ClaimPhase::Active { agent_id: agent_id.to_string(), agent_instance_id: agent_instance_id.to_string() };
-        match phase {
-            ClaimPhase::Reserved => {
-                let claim = self.by_token.get_mut(&token).expect("found token");
-                claim.status.phase = active;
-                Some(claim.status.clone())
-            }
-            ClaimPhase::Replacing { replacement_id } => {
-                if self
-                    .replacements
-                    .get(&replacement_id)
-                    .is_some_and(|replacement| replacement.previous_instance_id == agent_instance_id)
-                {
-                    // The old process is still draining; only a new instance publishes.
-                    return None;
-                }
-                // The replacement publishes: the old ownership retires, the same attempts carry on
-                // under a new token so nothing minted for the old process can act on the new one.
-                let successor_token = self.mint_token();
-                let old = self.by_token.get_mut(&token).expect("found token");
-                old.status.phase = ClaimPhase::Retired { how: ClaimRetirement::Replaced };
-                let mut status = old.status.clone();
-                status.claim_token = successor_token.clone();
-                status.phase = active;
-                let successor = Claim {
-                    status: status.clone(),
-                    owner_id: old.owner_id.clone(),
-                    input_digest: old.input_digest.clone(),
-                };
-                self.by_token.insert(successor_token.clone(), successor);
-                for held in self.by_key.values_mut().filter(|held| **held == token) {
-                    *held = successor_token.clone();
-                }
-                if let Some(replacement) = self.replacements.get_mut(&replacement_id) {
-                    replacement.status.stage = ReplacementStage::Published { claim: status.clone() };
-                }
-                Some(status)
-            }
-            _ => unreachable!("only reserved and replacing claims are found"),
-        }
-    }
-
-    // ---- Replacement (2.4) ----
-
-    pub fn replacement(&self, replacement_id: &str) -> Option<SessionReplacement> {
-        self.replacements.get(replacement_id).map(|replacement| replacement.status.clone())
-    }
-
-    /// Record the intent to replace the process under a live claim. Idempotent on
-    /// `replacement_id`; the claim is untouched until `replace_commit`.
-    pub fn replace_begin(
-        &mut self, claim_token: &str, owner_id: &str, replacement_id: &str, input_digest: &str,
-    ) -> Result<SessionReplacement, ClaimError> {
-        if let Some(existing) = self.replacements.get(replacement_id) {
-            if existing.input_digest != input_digest {
-                return Err(ClaimError::new(
-                    "replace/digest_mismatch",
-                    format!("replacement {replacement_id} was begun with a different input"),
-                ));
-            }
-            return Ok(existing.status.clone());
-        }
-        let claim = self
-            .by_token
-            .get(claim_token)
-            .ok_or_else(|| ClaimError::new("claim/unknown", format!("no claim {claim_token}")))?;
-        if claim.owner_id != owner_id {
-            return Err(ClaimError::new("claim/not_holder", format!("claim {claim_token} is not held by {owner_id}")));
-        }
-        let ClaimPhase::Active { agent_instance_id, .. } = &claim.status.phase else {
-            return Err(ClaimError::new(
-                "claim/not_active",
-                format!("claim {claim_token} is {:?}", claim.status.phase),
-            ));
-        };
-        let previous_instance_id = agent_instance_id.clone();
-        let status = SessionReplacement {
-            replacement_id: replacement_id.to_string(),
-            session_id: claim.status.session_id.clone(),
-            claim_token: claim_token.to_string(),
-            stage: ReplacementStage::Prepared,
-        };
-        self.replacements.insert(
-            replacement_id.to_string(),
-            Replacement {
-                status: status.clone(),
-                owner_id: owner_id.to_string(),
-                input_digest: input_digest.to_string(),
-                previous_instance_id,
-            },
-        );
-        Ok(status)
-    }
-
-    /// The point of no return: the claim enters `replacing`. The Runtime then stops the old process.
-    /// Idempotent: a committed replacement answers its current stage.
-    pub fn replace_commit(&mut self, replacement_id: &str, owner_id: &str) -> Result<SessionReplacement, ClaimError> {
-        let replacement = self
-            .replacements
-            .get(replacement_id)
-            .ok_or_else(|| ClaimError::new("replace/unknown", format!("no replacement {replacement_id}")))?;
-        if replacement.owner_id != owner_id {
-            return Err(ClaimError::new(
-                "claim/not_holder",
-                format!("replacement {replacement_id} is not {owner_id}'s"),
-            ));
-        }
-        if replacement.status.stage != ReplacementStage::Prepared {
-            return Ok(replacement.status.clone());
-        }
-        let token = replacement.status.claim_token.clone();
-        let claim = self.by_token.get_mut(&token).expect("a prepared replacement names a recorded claim");
-        match &claim.status.phase {
-            ClaimPhase::Active { .. } => {
-                claim.status.phase = ClaimPhase::Replacing { replacement_id: replacement_id.to_string() };
-            }
-            ClaimPhase::Retired { how: ClaimRetirement::Transferred } => {
-                let replacement = self.replacements.get_mut(replacement_id).expect("looked up above");
-                replacement.status.stage = ReplacementStage::Transferred;
-                return Err(ClaimError::new("replace/transferred", format!("claim {token} was taken over")));
-            }
-            phase => {
-                return Err(ClaimError::new("claim/not_active", format!("claim {token} is {phase:?}")));
-            }
-        }
-        Ok(self.replacements.get(replacement_id).expect("looked up above").status.clone())
-    }
-
-    /// The old process is gone (stopped by the Runtime after commit): the holder may start the new one.
-    pub fn replace_stopped(&mut self, replacement_id: &str) -> Option<SessionReplacement> {
-        let replacement = self.replacements.get_mut(replacement_id)?;
-        if replacement.status.stage == ReplacementStage::Prepared {
-            replacement.status.stage = ReplacementStage::Stopped;
-        }
-        Some(replacement.status.clone())
-    }
-
-    /// Withdraw a replacement. Before commit: the intent goes, the old claim stays. After commit and
-    /// before publish: nothing runs the session; the claim retires as `how` and the session is left
-    /// for a new claim. After publish: the successor claim retires as `how`. Already taken over:
-    /// `replace/transferred`.
-    pub fn replace_abort(
-        &mut self, replacement_id: &str, owner_id: &str, how: ClaimRetirement,
-    ) -> Result<SessionReplacement, ClaimError> {
-        let replacement = self
-            .replacements
-            .get(replacement_id)
-            .ok_or_else(|| ClaimError::new("replace/unknown", format!("no replacement {replacement_id}")))?;
-        if replacement.owner_id != owner_id {
-            return Err(ClaimError::new(
-                "claim/not_holder",
-                format!("replacement {replacement_id} is not {owner_id}'s"),
-            ));
-        }
-        let stage = replacement.status.stage.clone();
-        let token = replacement.status.claim_token.clone();
-        match stage {
-            ReplacementStage::Prepared => {}
-            ReplacementStage::Stopped => {
-                let claim = self.by_token.get_mut(&token).expect("a replacement names a recorded claim");
-                if matches!(claim.status.phase, ClaimPhase::Replacing { .. }) {
-                    claim.status.phase = ClaimPhase::Retired { how };
-                }
-            }
-            ReplacementStage::Published { claim } => {
-                self.retire(&claim.claim_token, owner_id, how)?;
-            }
-            ReplacementStage::Transferred => {
-                return Err(ClaimError::new(
-                    "replace/transferred",
-                    format!("replacement {replacement_id} was taken over"),
-                ));
-            }
-            ReplacementStage::Aborted => return Ok(replacement.status.clone()),
-        }
-        let replacement = self.replacements.get_mut(replacement_id).expect("looked up above");
-        replacement.status.stage = ReplacementStage::Aborted;
-        Ok(replacement.status.clone())
+        Some(claim.status.clone())
     }
 
     pub fn abort(&mut self, key: ClaimKey) -> AbortOutcome {
@@ -386,11 +193,6 @@ impl Claims {
                     session_id: claim.status.session_id.clone(),
                     status: claim.status.clone(),
                 }
-            }
-            ClaimPhase::Replacing { .. } => {
-                // Nothing runs the session between commit and publish; withdrawing is just the record.
-                claim.status.phase = ClaimPhase::Aborted;
-                AbortOutcome::Aborted(claim.status.clone())
             }
             ClaimPhase::Retired { how: ClaimRetirement::Transferred } => {
                 AbortOutcome::Transferred(claim.status.clone())
@@ -446,7 +248,7 @@ impl Claims {
         let mut changed = Vec::new();
         for claim in self.by_token.values_mut().filter(|claim| claim.owner_id == owner_id) {
             match claim.status.phase {
-                ClaimPhase::Reserved | ClaimPhase::Replacing { .. } => claim.status.phase = ClaimPhase::Aborted,
+                ClaimPhase::Reserved => claim.status.phase = ClaimPhase::Aborted,
                 ClaimPhase::Active { .. } => {
                     claim.status.phase = ClaimPhase::Retired { how: ClaimRetirement::Released }
                 }
@@ -480,10 +282,7 @@ impl Claims {
     /// Open (or find) the deletion of a session: every live claim on it retires as deleted.
     pub fn delete_begin(&mut self, session_id: &str, now_ms: i64) -> SessionDeletion {
         for claim in self.by_token.values_mut().filter(|claim| claim.status.session_id == session_id) {
-            if matches!(
-                claim.status.phase,
-                ClaimPhase::Active { .. } | ClaimPhase::Reserved | ClaimPhase::Replacing { .. }
-            ) {
+            if matches!(claim.status.phase, ClaimPhase::Active { .. } | ClaimPhase::Reserved) {
                 claim.status.phase = ClaimPhase::Retired { how: ClaimRetirement::Deleted };
             }
         }
@@ -654,90 +453,6 @@ mod tests {
         assert_eq!(claims.delete_end("s", DeletionOutcome::Deleted).unwrap(), None);
         assert_eq!(claims.delete_end("s", DeletionOutcome::Deleted).unwrap_err().code, "delete/unknown");
         assert!(matches!(claims.claim(key("c"), "w1", "s", "d", None).unwrap().phase, ClaimPhase::Reserved));
-    }
-
-    #[test]
-    fn a_replacement_retires_the_old_token_and_publishes_a_successor_for_the_same_attempt() {
-        let mut claims = Claims::new("rt".into());
-        let mine = claims.claim(key("a"), "w1", "s", "d", live()).unwrap();
-        assert_eq!(claims.replace_begin(&mine.claim_token, "w2", "r1", "x").unwrap_err().code, "claim/not_holder");
-        let prepared = claims.replace_begin(&mine.claim_token, "w1", "r1", "x").unwrap();
-        assert_eq!(prepared.stage, ReplacementStage::Prepared);
-        assert_eq!(claims.replace_begin(&mine.claim_token, "w1", "r1", "x").unwrap(), prepared, "idempotent");
-        assert_eq!(
-            claims.replace_begin(&mine.claim_token, "w1", "r1", "y").unwrap_err().code,
-            "replace/digest_mismatch"
-        );
-        assert!(
-            matches!(claims.status(&key("a")).unwrap().phase, ClaimPhase::Active { .. }),
-            "prepare touches nothing"
-        );
-
-        let committed = claims.replace_commit("r1", "w1").unwrap();
-        assert_eq!(committed.stage, ReplacementStage::Prepared, "the stage moves when the process is gone");
-        assert_eq!(claims.status(&key("a")).unwrap().phase, ClaimPhase::Replacing { replacement_id: "r1".into() });
-        assert_eq!(claims.replace_stopped("r1").unwrap().stage, ReplacementStage::Stopped);
-        assert_eq!(
-            claims.replace_commit("r1", "w1").unwrap().stage,
-            ReplacementStage::Stopped,
-            "re-asked: current stage"
-        );
-
-        assert_eq!(
-            claims.activate("w1", "s", "agent", "agent#1"),
-            None,
-            "a late frame of the old instance publishes nothing"
-        );
-        let published = claims.activate("w1", "s", "agent", "agent#2").unwrap();
-        assert_ne!(published.claim_token, mine.claim_token, "a new token for the new process");
-        assert_eq!(
-            published.phase,
-            ClaimPhase::Active { agent_id: "agent".into(), agent_instance_id: "agent#2".into() }
-        );
-        assert_eq!(claims.status(&key("a")).unwrap().claim_token, published.claim_token, "the attempt carries on");
-        assert_eq!(
-            claims.retire(&mine.claim_token, "w1", ClaimRetirement::Released).unwrap_err().code,
-            "claim/not_active",
-            "the old token cannot be revived"
-        );
-        assert_eq!(claims.replacement("r1").unwrap().stage, ReplacementStage::Published { claim: published.clone() });
-        let aborted = claims.replace_abort("r1", "w1", ClaimRetirement::Stopped).unwrap();
-        assert_eq!(aborted.stage, ReplacementStage::Aborted);
-        assert_eq!(claims.status(&key("a")).unwrap().phase, ClaimPhase::Retired { how: ClaimRetirement::Stopped });
-    }
-
-    #[test]
-    fn aborting_a_replacement_before_publish_leaves_the_session_claimable_and_after_takeover_reports_it() {
-        let mut claims = Claims::new("rt".into());
-        let mine = claims.claim(key("a"), "w1", "s", "d", live()).unwrap();
-        claims.replace_begin(&mine.claim_token, "w1", "r1", "x").unwrap();
-        assert_eq!(
-            claims.replace_abort("r1", "w1", ClaimRetirement::Released).unwrap().stage,
-            ReplacementStage::Aborted
-        );
-        assert!(
-            matches!(claims.status(&key("a")).unwrap().phase, ClaimPhase::Active { .. }),
-            "before commit the claim stays"
-        );
-
-        claims.replace_begin(&mine.claim_token, "w1", "r2", "x").unwrap();
-        claims.replace_commit("r2", "w1").unwrap();
-        claims.replace_stopped("r2");
-        assert_eq!(
-            claims.replace_abort("r2", "w1", ClaimRetirement::Released).unwrap().stage,
-            ReplacementStage::Aborted
-        );
-        assert_eq!(claims.status(&key("a")).unwrap().phase, ClaimPhase::Retired { how: ClaimRetirement::Released });
-        assert!(matches!(claims.claim(key("b"), "w1", "s", "d", None).unwrap().phase, ClaimPhase::Reserved));
-
-        let mut other = Claims::new("rt".into());
-        let held = other.claim(key("x"), "w1", "t", "d", live()).unwrap();
-        other.replace_begin(&held.claim_token, "w1", "r3", "x").unwrap();
-        other
-            .claim(ClaimKey { caller_instance_id: "w9".into(), attempt_id: "y".into() }, "w9", "t", "d", live())
-            .unwrap();
-        assert_eq!(other.replace_commit("r3", "w1").unwrap_err().code, "replace/transferred");
-        assert_eq!(other.replace_abort("r3", "w1", ClaimRetirement::Released).unwrap_err().code, "replace/transferred");
     }
 
     #[test]
