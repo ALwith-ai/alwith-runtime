@@ -789,7 +789,7 @@ pub fn require_owned_session(runtime: &Runtime, owner_id: &str, session_id: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alwith_runtime_core::Journal;
+    use alwith_runtime_core::{AttentionStore, Journal};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
 
@@ -846,7 +846,10 @@ mod tests {
     #[tokio::test]
     async fn long_extension_calls_do_not_block_same_connection_cancellation() {
         let root = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(root.path()).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(root.path().join("sessions")).unwrap(),
+            AttentionStore::open(root.path()).unwrap(),
+        ));
         let server = RuntimeServer::new(runtime, Arc::new(EchoLauncher), Arc::new(BlockingExtension), "secret".into());
         let (events, _receiver) = mpsc::channel(8);
         let connection = Arc::new(server.extension.connect("test", events, Arc::new(Notify::new())));
@@ -881,7 +884,10 @@ mod tests {
 
     async fn start() -> (String, tokio::task::JoinHandle<()>) {
         let root = tempfile::tempdir().unwrap().keep();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(root).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(root.join("sessions")).unwrap(),
+            AttentionStore::open(root).unwrap(),
+        ));
         let server = RuntimeServer::new(runtime, Arc::new(EchoLauncher), Arc::new(CountingExtension), "secret".into());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

@@ -26,7 +26,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use alwith_runtime_core::{AgentMetadata, Journal, ResponseError, Runtime};
+use alwith_runtime_core::{AgentMetadata, AttentionStore, Journal, ResponseError, Runtime};
 use alwith_runtime_modules::{ModuleExtension, ModuleHost};
 use alwith_runtime_ws::{AgentLauncher, RuntimeCommand, RuntimeServer, execute};
 use async_trait::async_trait;
@@ -242,7 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(root) => Journal::open(root)?,
         None => Journal::open(alwith_runtime_core::default_journal_root())?,
     };
-    let runtime = Arc::new(Runtime::with_journal(journal));
+    let attention = match env::var_os("ALWITH_RUNTIME_ATTENTION") {
+        Some(root) => AttentionStore::open(root)?,
+        None => AttentionStore::open(alwith_runtime_core::default_attention_root())?,
+    };
+    let runtime = Arc::new(Runtime::with_storage(journal, attention));
     let token = match listen {
         Listen::Stdio => String::new(),
         Listen::Ws(_) => required("ALWITH_RUNTIME_TOKEN"),
@@ -341,7 +345,10 @@ mod tests {
     #[tokio::test]
     async fn arbitrary_engines_and_providers_work_without_any_module_or_sdk() {
         let root = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(Runtime::with_journal(Journal::open(root.path()).unwrap()));
+        let runtime = Arc::new(Runtime::with_storage(
+            Journal::open(root.path().join("sessions")).unwrap(),
+            AttentionStore::open(root.path()).unwrap(),
+        ));
         let launcher = TableLauncher {
             engines: [(
                 "company-agent".into(),
