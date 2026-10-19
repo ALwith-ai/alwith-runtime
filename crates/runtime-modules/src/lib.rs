@@ -27,7 +27,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use alwith_runtime_core::{AttentionStore, ResponseError, Runtime, RuntimeEvent, RuntimeEventSink};
+use alwith_runtime_core::{ResponseError, Runtime, RuntimeEvent, RuntimeEventSink};
 use alwith_runtime_ws::{ConnectionState, Extension};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -719,7 +719,7 @@ impl Extension for ModuleExtension {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alwith_runtime_core::{AgentMetadata, Journal};
+    use alwith_runtime_core::{AgentMetadata, AttentionStore, Journal};
     use alwith_runtime_ws::{AgentLauncher, RuntimeCommand, RuntimeServer, execute};
 
     struct NoLauncher;
