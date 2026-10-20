@@ -1,0 +1,23 @@
+# Formatting is built into Bun (1.4.4+): `bun fmt` reads [fmt] (the former .prettierrc); prettier is no longer installed.
+[fmt]
+printWidth = 120
+semi = false
+singleQuote = false
+trailingComma = "none"
+bracketSameLine = true
+arrowParens = "avoid"
+sortImports = true
+ignorePatterns = [
+  "bun.lock",
+  "**/node_modules/**",
+  "**/dist/**",
+  "**/target/**",
+  "**/licenses/**",
+  "**/bin/**",
+  "**/*.svg",
+  "**/*.md",
+  "**/*.html",
+  "**/package.json",
+  # Cargo manifests belong to cargo fmt and hand editing; bunfig keeps its hand layout too
+  "**/*.toml",
+]
