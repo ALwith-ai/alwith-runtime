@@ -26,7 +26,7 @@ const root = resolve(import.meta.dirname, "..")
 const target = process.argv[2]
 if (!target || !platforms[target])
   throw new Error(`Usage: bun scripts/package-release.ts <${Object.keys(platforms).join("|")}>`)
-const [os, cpu] = platforms[target]!
+const [os, cpu] = platforms[target]
 const exe = os === "win32" ? ".exe" : ""
 const binary = join(root, "target", target, "release", `alwith-runtime${exe}`)
 if (!existsSync(binary)) throw new Error(`Build first: ${binary} is missing`)
@@ -45,7 +45,17 @@ cpSync(join(root, "LICENSE"), join(stage, "LICENSE"))
 // Third-party licenses: collected for the crates actually linked for this platform, every license text
 // included; a crate without a license file is filled in from a known upstream location, and the script
 // fails if that is not possible -- a missing one is a distribution violation and must not pass silently.
-const metadata = await $`cargo metadata --format-version 1 --filter-platform ${target}`.cwd(root).json()
+const metadata = (await $`cargo metadata --format-version 1 --filter-platform ${target}`.cwd(root).json()) as {
+  packages: Array<{
+    name: string
+    version: string
+    source: string | null
+    manifest_path: string
+    license: string | null
+    license_file: string | null
+    repository: string | null
+  }>
+}
 const notices = [
   "# Runtime third-party notices",
   "",
@@ -58,17 +68,7 @@ const known: Record<string, string> = {
   "https://github.com/madsmtm/objc2": "LICENSE.md",
   "https://github.com/specta-rs/specta": "LICENSE"
 }
-const packages = (
-  metadata.packages as Array<{
-    name: string
-    version: string
-    source: string | null
-    manifest_path: string
-    license: string | null
-    license_file: string | null
-    repository: string | null
-  }>
-)
+const packages = metadata.packages
   .filter((pkg) => pkg.source)
   .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
 for (const pkg of packages) {
@@ -81,7 +81,9 @@ for (const pkg of packages) {
     const name = pkg.repository ? known[pkg.repository] : undefined
     if (!name)
       throw new Error(`Missing licence text for ${pkg.name}@${pkg.version} (${pkg.repository ?? "no repository"})`)
-    const revision = JSON.parse(readFileSync(join(directory, ".cargo_vcs_info.json"), "utf8")).git.sha1
+    const revision = (
+      JSON.parse(readFileSync(join(directory, ".cargo_vcs_info.json"), "utf8")) as { git: { sha1: string } }
+    ).git.sha1
     if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error(`Invalid upstream revision for ${pkg.name}`)
     const url = `${pkg.repository!.replace("github.com", "raw.githubusercontent.com")}/${revision}/${name}`
     const response = await fetch(url)

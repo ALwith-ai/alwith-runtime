@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "types": ["bun"],
+    "noEmit": true
+  },
+  "include": ["scripts", "packages"]
+}

@@ -5,7 +5,7 @@ export function assertStaticWindowsCrt(report: string): void {
     throw new Error("Expected an x64 or ARM64 Windows binary from llvm-readobj")
   }
   // --coff-imports includes both Import and DelayImport entries.
-  const dependencies = Array.from(report.matchAll(/^\s*Name: (\S+\.dll)\s*$/gim), (match) => match[1]!)
+  const dependencies = Array.from(report.matchAll(/^\s*Name: (\S+\.dll)\s*$/gim), (match) => match[1])
   if (dependencies.length === 0) throw new Error("No Windows DLL imports found; refusing an unchecked binary")
   const dynamicCrt = dependencies.filter((name) =>
     /^(vcruntime|msvcp|msvcr|concrt|vccorlib|ucrtbase|api-ms-win-crt-|ext-ms-win-crt-).*\.dll$/i.test(name)
