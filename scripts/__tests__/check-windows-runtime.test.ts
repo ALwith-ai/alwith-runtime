@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+
 import { assertStaticWindowsCrt, checkWindowsRuntime } from "../check-windows-runtime"
 
 function importsReport(format: string, imports: string[], delayed: string[] = []): string {

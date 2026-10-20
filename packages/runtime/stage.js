@@ -1,6 +1,6 @@
-import { createRequire } from "node:module"
 import { createHash } from "node:crypto"
 import { chmodSync, cpSync, mkdirSync, readFileSync } from "node:fs"
+import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
 const require = createRequire(import.meta.url)
 const targets = {

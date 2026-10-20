@@ -9,7 +9,9 @@
 // Prerequisite: cargo build --release --locked -p alwith-runtime --target <triple> has already finished.
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
+
 import { $ } from "bun"
+
 import { checkWindowsRuntime } from "./check-windows-runtime"
 
 const platforms: Record<string, [string, string]> = {
