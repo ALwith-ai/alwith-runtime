@@ -8,13 +8,13 @@ function importsReport(format: string, imports: string[], delayed: string[] = []
     `Format: ${format}`,
     "AddressSize: 64bit",
     ...imports.map(
-      name => `Import {\n  Name: ${name}\n  ImportLookupTableRVA: 0x1000\n  ImportAddressTableRVA: 0x2000\n}`
+      (name) => `Import {\n  Name: ${name}\n  ImportLookupTableRVA: 0x1000\n  ImportAddressTableRVA: 0x2000\n}`
     ),
-    ...delayed.map(name => `DelayImport {\n  Name: ${name}\n  Attributes: 0x1\n  ModuleHandle: 0x3000\n}`)
+    ...delayed.map((name) => `DelayImport {\n  Name: ${name}\n  Attributes: 0x1\n  ModuleHandle: 0x3000\n}`)
   ].join("\n")
 }
 
-test.each(["COFF-x86-64", "COFF-ARM64"])("accepts Windows system imports for %s", format => {
+test.each(["COFF-x86-64", "COFF-ARM64"])("accepts Windows system imports for %s", (format) => {
   expect(() =>
     assertStaticWindowsCrt(importsReport(format, ["KERNEL32.dll", "ws2_32.dll", "bcryptprimitives.dll"]))
   ).not.toThrow()
@@ -34,7 +34,7 @@ test.each([
   "ucrtbased.dll",
   "api-ms-win-crt-runtime-l1-1-0.dll",
   "ext-ms-win-crt-runtime-l1-1-0.dll"
-])("rejects dynamic CRT dependency %s", dependency => {
+])("rejects dynamic CRT dependency %s", (dependency) => {
   expect(() => assertStaticWindowsCrt(importsReport("COFF-x86-64", ["KERNEL32.dll", dependency]))).toThrow(dependency)
 })
 
@@ -60,7 +60,7 @@ test("propagates inspection tool failure", () => {
 
 test.each(["", "tool failed", "Format: ELF64-x86-64\n  Name: KERNEL32.dll", "Format: COFF-x86-64"])(
   "rejects unreadable or empty import reports: %s",
-  report => {
+  (report) => {
     expect(() => assertStaticWindowsCrt(report)).toThrow()
   }
 )

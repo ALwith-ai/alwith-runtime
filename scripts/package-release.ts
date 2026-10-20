@@ -69,11 +69,11 @@ const packages = (
     repository: string | null
   }>
 )
-  .filter(pkg => pkg.source)
+  .filter((pkg) => pkg.source)
   .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
 for (const pkg of packages) {
   const directory = dirname(pkg.manifest_path)
-  const files = readdirSync(directory).filter(name => /^(LICENSE|LICENCE|COPYING|NOTICE)([.-]|$)/i.test(name))
+  const files = readdirSync(directory).filter((name) => /^(LICENSE|LICENCE|COPYING|NOTICE)([.-]|$)/i.test(name))
   if (pkg.license_file && !files.includes(pkg.license_file)) files.push(pkg.license_file)
   const dest = join(stage, "licenses", `${pkg.name}-${pkg.version}`)
   mkdirSync(dest, { recursive: true })
