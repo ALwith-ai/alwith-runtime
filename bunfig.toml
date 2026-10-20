@@ -1,11 +1,8 @@
-# Formatting is built into Bun (1.4.4+): `bun fmt` reads [fmt] (the former .prettierrc); prettier is no longer installed.
+# Formatting and linting are built into Bun (1.4.4+); only non-default settings are written. prettier / oxlint / biome are gone.
 [fmt]
 printWidth = 120
 semi = false
-singleQuote = false
 trailingComma = "none"
-bracketSameLine = true
-arrowParens = "avoid"
 sortImports = true
 ignorePatterns = [
   "bun.lock",
@@ -18,6 +15,18 @@ ignorePatterns = [
   "**/*.md",
   "**/*.html",
   "**/package.json",
-  # Cargo manifests belong to cargo fmt and hand editing; bunfig keeps its hand layout too
   "**/*.toml",
+  "package.json",
 ]
+
+[lint]
+typeAware = true
+ignorePatterns = [
+  "**/dist/**",
+  "**/node_modules/**",
+  "**/target/**",
+]
+
+[lint.rules]
+# Import cycles were a hard gate before; the rule is off by default
+"import/no-cycle" = ["error", { allowUnsafeDynamicCyclicDependency = true }]
