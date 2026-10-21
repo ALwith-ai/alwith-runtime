@@ -70,7 +70,7 @@ const known: Record<string, string> = {
 }
 const packages = metadata.packages
   .filter((pkg) => pkg.source)
-  .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
+  .toSorted((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
 for (const pkg of packages) {
   const directory = dirname(pkg.manifest_path)
   const files = readdirSync(directory).filter((name) => /^(LICENSE|LICENCE|COPYING|NOTICE)([.-]|$)/i.test(name))
@@ -104,17 +104,17 @@ for (const pkg of packages) {
     `- ${pkg.name}@${pkg.version}: ${pkg.license ?? "see licence files"}; licenses/${pkg.name}-${pkg.version}/`
   )
 }
-writeFileSync(join(stage, "THIRD_PARTY_NOTICES.md"), notices.join("\n") + "\n")
+writeFileSync(join(stage, "THIRD_PARTY_NOTICES.md"), `${notices.join("\n")}\n`)
 
 const sourceRevision = (await $`git rev-parse HEAD`.cwd(root).text()).trim()
 const sha256 = new Bun.CryptoHasher("sha256").update(readFileSync(join(stage, `alwith-runtime${exe}`))).digest("hex")
 writeFileSync(
   join(stage, "artifact.json"),
-  JSON.stringify({ version, target, binary: `alwith-runtime${exe}`, sha256, sourceRevision }, null, 2) + "\n"
+  `${JSON.stringify({ version, target, binary: `alwith-runtime${exe}`, sha256, sourceRevision }, null, 2)}\n`
 )
 writeFileSync(
   join(stage, "package.json"),
-  JSON.stringify(
+  `${JSON.stringify(
     {
       name: `@alwith/runtime-${os}-${cpu}`,
       version,
@@ -128,6 +128,6 @@ writeFileSync(
     },
     null,
     2
-  ) + "\n"
+  )}\n`
 )
 console.log(`${stage}: @alwith/runtime-${os}-${cpu}@${version}, ${packages.length} third-party crates`)

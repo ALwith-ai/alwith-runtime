@@ -4,9 +4,12 @@
   "scripts": {
     "format": "bun fmt",
     "format:rust": "cargo fmt --all",
-    "format:all": "bun run format:rust && bun fmt"
+    "format:all": "bun run format:rust && bun fmt",
+    "typecheck": "tsc"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.3"
+    "@nyssance/ts7-lint": "^0.1.2",
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
   }
 }
