@@ -5,14 +5,14 @@
     "": {
       "name": "alwith-runtime-workspace",
       "devDependencies": {
-        "@nyssance/ts7-lint": "^0.1.2",
+        "@nyssance/ts7-lint": "^0.1.3",
         "@types/bun": "^1.4.3",
         "typescript": "^7.0.2",
       },
     },
   },
   "packages": {
-    "@nyssance/ts7-lint": ["@nyssance/ts7-lint@0.1.2", "", { "bin": { "ts7-lint": "src/index.ts" } }, "sha512-hPc3fU+gbRHHQwXOIZXlSXWpNEWjxKTqG/FVIib/BIvlf59NfUoYePXnIkKRbGkPEgoJ4zZlyrCLUgz9G1EkOw=="],
+    "@nyssance/ts7-lint": ["@nyssance/ts7-lint@0.1.3", "", { "bin": { "ts7-lint": "src/index.ts" } }, "sha512-i6lTThgMw6JoCgDB1clmlNMMgOJSj2nU62qZjZn6KhG55YYmNwkkZw889Am9YuXAnXNcJDi8qZKC23HpV+lx8Q=="],
 
     "@types/bun": ["@types/bun@1.4.3", "", { "dependencies": { "bun-types": "1.4.3" } }, "sha512-N67Pqy8JXbAY/j0tNraS3V5mubGvc6rrrNDmDCtZLlFzccbUJPDb0tvgUBC5q4m8ybkP93Jcn1QB+RYQ6PvBhw=="],
 
