@@ -93,7 +93,24 @@ impl AttentionStore {
     }
 }
 
+// Lock a stable sidecar: replacing the JSON changes its file identity. Never unlink the
+// lock file, so separate handles and processes coordinate on the same OS lock. Readers
+// participate too, keeping Windows destination handles closed during replacement.
+fn lock_json(path: &Path) -> Result<fs::File, String> {
+    let lock_path = path.with_extension("json.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("open attention lock {}: {error}", lock_path.display()))?;
+    file.lock().map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+    Ok(file)
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let _lock = lock_json(path)?;
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     let parent = path.parent().ok_or_else(|| format!("attention path has no parent: {}", path.display()))?;
     // Each writer owns its temporary file, including across distinct store instances.
@@ -111,6 +128,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 /// `None` when the file does not exist. Anything else that fails to read or parse is an error
 /// naming the file: the Runtime wrote it itself, so that is corruption to look at, not to skip.
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, String> {
+    let _lock = lock_json(path)?;
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -242,7 +260,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2, "no temporary files remain");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 4, "only data and stable lock files remain");
     }
 
     #[test]
@@ -251,7 +269,7 @@ mod tests {
         let store = AttentionStore::open(directory.path()).unwrap();
         fs::create_dir(directory.path().join("run-states.json")).unwrap();
         assert!(store.write_run_states(&[]).unwrap_err().contains("replace"));
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     #[test]
