@@ -8,7 +8,7 @@
 //! was cut short and now needs the user, with the reason on it. Nothing is lowered to `idle`: that
 //! would hide an interruption behind a green light. `done` stays unread, `requires_action` stays.
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -95,12 +95,17 @@ impl AttentionStore {
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file = File::create(&temporary).map_err(|error| format!("create {}: {error}", temporary.display()))?;
-    file.write_all(&bytes).map_err(|error| format!("write {}: {error}", temporary.display()))?;
-    file.sync_all().map_err(|error| format!("sync {}: {error}", temporary.display()))?;
-    drop(file);
-    fs::rename(&temporary, path).map_err(|error| format!("replace {}: {error}", path.display()))
+    let parent = path.parent().ok_or_else(|| format!("attention path has no parent: {}", path.display()))?;
+    // Each writer owns its temporary file, including across distinct store instances.
+    // Keep it beside the destination so persistence is an atomic same-filesystem rename.
+    let mut file = tempfile::Builder::new()
+        .prefix(".attention-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("create temporary file for {}: {error}", path.display()))?;
+    file.write_all(&bytes).map_err(|error| format!("write {}: {error}", path.display()))?;
+    file.as_file().sync_all().map_err(|error| format!("sync {}: {error}", path.display()))?;
+    file.persist(path).map_err(|error| format!("replace {}: {error}", path.display()))?;
+    Ok(())
 }
 
 /// `None` when the file does not exist. Anything else that fails to read or parse is an error
@@ -206,6 +211,47 @@ mod tests {
         store.write_run_states(&[]).unwrap();
         assert!(store.read_run_states().unwrap().is_empty());
         assert!(!directory.path().join("run-states.json.tmp").exists());
+    }
+
+    #[test]
+    fn concurrent_writers_use_independent_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let root = directory.path();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    // Separate handles reproduce collisions beyond a single store object.
+                    let store = AttentionStore::open(root).unwrap();
+                    barrier.wait();
+                    for iteration in 0..32 {
+                        let mut state = session(RunState::Done);
+                        state.title = format!("{worker}:{iteration}").repeat(256);
+                        store.write_run_states(&[state]).unwrap();
+                        assert_eq!(store.read_run_states().unwrap().len(), 1);
+                        store
+                            .write_leases(&[ProcessLease {
+                                agent_id: format!("agent-{worker}"),
+                                process_id: worker + 1,
+                                started_at: 1,
+                            }])
+                            .unwrap();
+                        assert_eq!(store.read_leases().unwrap().len(), 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2, "no temporary files remain");
+    }
+
+    #[test]
+    fn failed_replace_removes_its_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttentionStore::open(directory.path()).unwrap();
+        fs::create_dir(directory.path().join("run-states.json")).unwrap();
+        assert!(store.write_run_states(&[]).unwrap_err().contains("replace"));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

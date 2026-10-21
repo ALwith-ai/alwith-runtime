@@ -19,10 +19,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 specta = { version = "=2.0.0-rc.24", features = ["derive", "serde_json"] }
 sysinfo = "0.39"
+tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]

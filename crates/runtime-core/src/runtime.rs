@@ -218,6 +218,8 @@ pub struct Runtime {
     registry: Mutex<RuntimeRegistry>,
     journal: Journal,
     attention: AttentionStore,
+    // Lock before taking a snapshot, and retain it through persistence and notification.
+    attention_commit: Mutex<()>,
     agents: Mutex<HashMap<String, AgentHandle>>,
     // Creation across generations, sends, receives and exit of one agent are serialized; different agents never wait on each other.
     lanes: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -249,6 +251,7 @@ impl Runtime {
             registry: Mutex::default(),
             journal,
             attention,
+            attention_commit: Mutex::new(()),
             agents: Mutex::default(),
             lanes: Mutex::default(),
             sinks: Mutex::default(),
@@ -283,6 +286,7 @@ impl Runtime {
 
     /// The leases of every agent process currently held, written whenever one starts or is reaped.
     fn persist_leases(&self) {
+        let _commit = self.attention_commit.lock().expect("runtime attention commit lock poisoned");
         let leases = self
             .agents
             .lock()
@@ -1283,6 +1287,7 @@ impl Runtime {
     /// snapshot is persisted, then broadcast. A persistence failure is logged, not fatal -- the
     /// session itself lives in the engine's record, this is the attention over it.
     fn publish_run_states(&self) {
+        let _commit = self.attention_commit.lock().expect("runtime attention commit lock poisoned");
         let sessions = self.registry.lock().expect("runtime registry lock poisoned").commit_run_states();
         if let Err(error) = self.attention.write_run_states(&sessions) {
             log::error!("persist run states: {error}");
@@ -1726,6 +1731,71 @@ for line in sys.stdin:
         assert!(!runtime.mark_read("finished", Some(4)), "an older confirmation does not clear a newer state");
         assert!(runtime.mark_read("finished", Some(5)));
         assert_eq!(runtime.run_states().iter().find(|state| state.session_id == "finished").unwrap().version, 6);
+    }
+
+    #[test]
+    fn concurrent_run_state_publication_matches_persisted_snapshots() {
+        struct PersistedSink {
+            store: AttentionStore,
+            count: AtomicU64,
+        }
+        impl RuntimeEventSink for PersistedSink {
+            fn publish(&self, event: RuntimeEvent) {
+                if let RuntimeEvent::RunStates { sessions } = event {
+                    // Allow another publisher to contend while this notification is in flight.
+                    std::thread::yield_now();
+                    assert_eq!(states_sorted(self.store.read_run_states().unwrap()), states_sorted(sessions));
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::with_storage(
+            Journal::open(directory.path().join("sessions")).unwrap(),
+            AttentionStore::open(directory.path()).unwrap(),
+        );
+        let sink = Arc::new(PersistedSink {
+            store: AttentionStore::open(directory.path()).unwrap(),
+            count: AtomicU64::new(0),
+        });
+        let subscriber: Arc<dyn RuntimeEventSink> = sink.clone();
+        runtime.add_sink(&subscriber);
+        let states = (0..64)
+            .map(|index| SessionRunState {
+                session_id: format!("session-{index}"),
+                state: crate::RunState::Done,
+                reusable_draft: false,
+                owner_id: "main".into(),
+                cwd: "/work".into(),
+                title: format!("Session {index}"),
+                since: 1,
+                tasks: Vec::new(),
+                listening_ports: Vec::new(),
+                execution_id: None,
+                execution_role: None,
+                last_activity_at: 1,
+                version: 1,
+                interruption: None,
+            })
+            .collect();
+        runtime.registry.lock().unwrap().restore_run_states(states, 1);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let runtime = &runtime;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for index in (worker..64).step_by(8) {
+                        assert!(runtime.mark_read(&format!("session-{index}"), Some(1)));
+                    }
+                });
+            }
+        });
+        assert_eq!(sink.count.load(Ordering::Relaxed), 64);
+        let states = runtime.run_states();
+        assert!(states.iter().all(|state| state.state == crate::RunState::Idle && state.version == 2));
+        assert_eq!(states_sorted(runtime.attention.read_run_states().unwrap()), states_sorted(states));
     }
 
     fn states_sorted(mut states: Vec<SessionRunState>) -> Vec<SessionRunState> {
