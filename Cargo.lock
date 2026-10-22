@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "alwith-runtime"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "alwith-runtime-core",
  "alwith-runtime-modules",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "alwith-runtime-core"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "alwith-runtime-protocol",
  "command-group",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "alwith-runtime-modules"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "alwith-runtime-core",
  "alwith-runtime-stdio",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "alwith-runtime-protocol"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "serde",
  "serde_json",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "alwith-runtime-stdio"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "alwith-runtime-core",
  "alwith-runtime-ws",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "alwith-runtime-ws"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "alwith-runtime-core",
  "alwith-runtime-stdio",
@@ -1485,9 +1485,9 @@ dependencies = [
 
 [[package]]
 name = "specta"
-version = "2.0.0-rc.24"
+version = "2.0.0-rc.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f320c7dd82008b6958f43f6257c95319c407d1c17ade43686e50ea520c28bb26"
+checksum = "81633014710ece1c7e8ac99e1bc9ad8d4339a2ccbae89ca2aa1095d4262c86b8"
 dependencies = [
  "rustc_version",
  "serde_json",
@@ -1496,9 +1496,9 @@ dependencies = [
 
 [[package]]
 name = "specta-macros"
-version = "2.0.0-rc.24"
+version = "2.0.0-rc.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "153f185d0051a64d81977bab5012809d5c9d9db8792406a0997352e05494f711"
+checksum = "1fe882a75f48f76ac091ca2c5aaad7abd4dfdedf649c08e865bb0d62b5a2cb92"
 dependencies = [
  "Inflector",
  "proc-macro2",
@@ -1508,9 +1508,9 @@ dependencies = [
 
 [[package]]
 name = "specta-typescript"
-version = "0.0.11"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea586e1709619c9f4cb0c9115ff29c278f331c0450aff266c2913c639708b299"
+checksum = "7a113bb506b00463cfb54c5819e55ec081bc7d52ef463d7726181e9073cd473a"
 dependencies = [
  "specta",
 ]
