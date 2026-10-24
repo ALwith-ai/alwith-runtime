@@ -167,3 +167,18 @@ Run `bun install --frozen-lockfile` to install the repository's formatting tools
 `bun run format:rust` formats the Rust workspace; `bun run format:all` runs both.
 Prettier and its Tailwind plugin match ALwith Desktop's versions; Prettier and Rustfmt settings match Desktop's rules.
 Generated artifacts, dependency directories, licenses and Markdown are excluded from Prettier.
+
+
+## Ownership at dispatch
+
+Application writes capture the process ownership epoch before entering the send
+queue and revalidate it under the same per-agent lane used by takeover. Releasing
+or transferring ownership retires the epoch, including a transfer back to the
+same owner label. A queued request cannot cross that boundary. Stopping checks
+ownership and requests process termination under one lock. Accepted work already
+sent before takeover is not retroactively cancelled; the existing takeover rules
+continue to transfer its pending request ownership.
+
+The `_owned` methods enforce this boundary for the stdio and WebSocket command
+handlers. Unscoped core methods are for trusted Runtime-internal work. This is
+process ownership coordination, not an OS sandbox.

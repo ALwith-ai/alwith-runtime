@@ -168,6 +168,7 @@ struct ProviderUpdate {
 /// A request the Runtime sent to the agent that is still unanswered. `owner_id` is the holder it was sent for: ""
 /// when the Runtime itself asked, and for a prompt once its holder let go, because the turn belongs to the session.
 struct PendingAcp {
+    identity: Arc<()>,
     sender: oneshot::Sender<Result<Value, ResponseError>>,
     owner_id: String,
     method: String,
@@ -175,6 +176,7 @@ struct PendingAcp {
 }
 
 struct AgentHandle {
+    ownership: Arc<()>,
     tool_owner: Option<String>,
     private_tool_ids: HashSet<String>,
     private_values: PrivateValues,
@@ -418,6 +420,7 @@ impl Runtime {
         self.agents.lock().map_err(|error| error.to_string())?.insert(
             agent_id.clone(),
             AgentHandle {
+                ownership: Arc::new(()),
                 private_tool_ids: HashSet::new(),
                 private_values: PrivateValues::command(command),
                 tool_owner: metadata
@@ -463,7 +466,26 @@ impl Runtime {
         Ok(())
     }
 
+    fn ownership_fence(&self, agent_id: &str, owner_id: &str) -> Result<Arc<()>, String> {
+        let agents = self.agents.lock().map_err(|error| error.to_string())?;
+        let handle = agents.get(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
+        if handle.metadata.owner_id != owner_id && !handle.metadata.owner_id.starts_with(&format!("{owner_id}:")) {
+            return Err(format!("agent is not owned by this connection: {agent_id}"));
+        }
+        Ok(Arc::clone(&handle.ownership))
+    }
+
+    /// Revalidate the captured ownership epoch inside the dispatch lane, after every queue wait.
+    pub async fn send_owned(self: &Arc<Self>, agent_id: &str, line: String, owner_id: &str) -> Result<(), String> {
+        let fence = self.ownership_fence(agent_id, owner_id)?;
+        self.send_fenced(agent_id, line, Some(fence)).await
+    }
+
     pub async fn send(self: &Arc<Self>, agent_id: &str, line: String) -> Result<(), String> {
+        self.send_fenced(agent_id, line, None).await
+    }
+
+    async fn send_fenced(self: &Arc<Self>, agent_id: &str, line: String, fence: Option<Arc<()>>) -> Result<(), String> {
         if line.len() > MAX_MESSAGE_BYTES {
             return Err(format!("ACP message exceeds {MAX_MESSAGE_BYTES} bytes"));
         }
@@ -479,7 +501,7 @@ impl Runtime {
         } else {
             None
         };
-        {
+        let process = {
             let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
             let handle = agents.get_mut(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
             if let Some(id) = &provider_request {
@@ -489,17 +511,18 @@ impl Runtime {
                 // Both raw send and ACP requests reserve before their first await.
                 handle.pending_providers.insert(id.clone(), None);
             }
-        }
+            Arc::clone(&handle.stdin)
+        };
         let runtime = Arc::clone(self);
         let agent_id = agent_id.to_string();
         // Delivery and failure cleanup survive cancellation of the requesting connection.
         tokio::spawn(async move {
-            let result = runtime.send_inner(&agent_id, value).await;
+            let result = runtime.send_inner(&agent_id, value, fence.as_ref()).await;
             if result.is_err()
                 && let Some(id) = provider_request
             {
                 let mut agents = runtime.agents.lock().map_err(|error| error.to_string())?;
-                if let Some(handle) = agents.get_mut(&agent_id) {
+                if let Some(handle) = agents.get_mut(&agent_id).filter(|handle| Arc::ptr_eq(&handle.stdin, &process)) {
                     handle.pending_providers.remove(&id);
                     handle.provider_changes.send_replace(());
                 }
@@ -510,13 +533,16 @@ impl Runtime {
         .map_err(|error| format!("Runtime send task failed: {error}"))?
     }
 
-    async fn send_inner(&self, agent_id: &str, value: Value) -> Result<(), String> {
+    async fn send_inner(&self, agent_id: &str, value: Value, fence: Option<&Arc<()>>) -> Result<(), String> {
         self.slow_mode_wait().await;
         let lane = self.lane(agent_id);
         let _operation = lane.lock().await;
         let stdin = {
             let agents = self.agents.lock().map_err(|error| error.to_string())?;
             let handle = agents.get(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
+            if fence.is_some_and(|fence| !Arc::ptr_eq(fence, &handle.ownership)) {
+                return Err(format!("agent ownership changed before dispatch: {agent_id}"));
+            }
             if let Some(error) = &handle.failure {
                 return Err(error.clone());
             }
@@ -654,6 +680,26 @@ impl Runtime {
             sequence: stamp.map(|(_, sequence)| sequence),
         });
         Ok(())
+    }
+
+    /// Authorization and the kill request share one lock; takeover cannot intervene.
+    pub fn stop_owned(&self, agent_id: &str, owner_id: &str) -> Result<(), String> {
+        let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
+        if let Some(handle) = agents.get_mut(agent_id) {
+            let actual = &handle.metadata.owner_id;
+            if !actual.is_empty() && actual != owner_id && !actual.starts_with(&format!("{owner_id}:")) {
+                return Err(format!("agent is not owned by this connection: {agent_id}"));
+            }
+            handle.child.start_kill().map_err(|error| format!("stop agent {agent_id}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn stop_session_owned(&self, session_id: &str, owner_id: &str) -> Result<(), String> {
+        let registry = self.registry.lock().map_err(|error| error.to_string())?;
+        let agent_id =
+            registry.agent_id_for_session(session_id).ok_or_else(|| format!("no agent for session: {session_id}"))?;
+        self.stop_owned(&agent_id, owner_id)
     }
 
     pub fn stop(&self, agent_id: &str) -> Result<(), String> {
@@ -816,6 +862,7 @@ impl Runtime {
             for (agent_id, handle) in agents.iter_mut() {
                 if handle.metadata.owner_id == owner_id {
                     handle.metadata.owner_id.clear();
+                    handle.ownership = Arc::new(());
                 }
                 let abandoned: Vec<String> = handle
                     .pending_acp
@@ -873,6 +920,9 @@ impl Runtime {
                     // A takeover: what the previous holder was still waiting on now belongs to the new one, so the
                     // previous holder letting go later retracts none of it.
                     let previous = std::mem::replace(&mut handle.metadata.owner_id, owner_id.clone());
+                    if previous != owner_id {
+                        handle.ownership = Arc::new(());
+                    }
                     if !previous.is_empty() && previous != owner_id {
                         for pending in handle.pending_acp.values_mut().filter(|pending| pending.owner_id == previous) {
                             pending.owner_id = owner_id.clone();
@@ -908,6 +958,7 @@ impl Runtime {
         }
         if let Some(handle) = self.agents.lock().expect("runtime agents lock poisoned").get_mut(&agent_id) {
             handle.metadata.owner_id.clear();
+            handle.ownership = Arc::new(());
         }
         drop(registry);
         self.publish_run_states();
@@ -1196,9 +1247,27 @@ impl Runtime {
     pub async fn acp_request(
         self: &Arc<Self>, agent_id: &str, method: &str, params: Value, request_id: Option<Value>, owner_id: &str,
     ) -> Result<Value, ResponseError> {
+        self.acp_request_fenced(agent_id, method, params, request_id, owner_id, None).await
+    }
+
+    pub async fn acp_request_owned(
+        self: &Arc<Self>, agent_id: &str, method: &str, params: Value, request_id: Option<Value>, owner_id: &str,
+    ) -> Result<Value, ResponseError> {
+        let fence = self.ownership_fence(agent_id, owner_id)?;
+        self.acp_request_fenced(agent_id, method, params, request_id, owner_id, Some(fence)).await
+    }
+
+    async fn acp_request_fenced(
+        self: &Arc<Self>, agent_id: &str, method: &str, params: Value, request_id: Option<Value>, owner_id: &str,
+        fence: Option<Arc<()>>,
+    ) -> Result<Value, ResponseError> {
+        let identity = Arc::new(());
         let (id, receiver) = {
             let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
             let handle = agents.get_mut(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
+            if fence.as_ref().is_some_and(|fence| !Arc::ptr_eq(fence, &handle.ownership)) {
+                return Err(format!("agent ownership changed before request: {agent_id}").into());
+            }
             if method == "initialize"
                 && let Some(cached) = &handle.initialize_response
             {
@@ -1226,14 +1295,21 @@ impl Runtime {
             let (sender, receiver) = oneshot::channel();
             handle.pending_acp.insert(
                 id.clone(),
-                PendingAcp { sender, owner_id: owner_id.to_string(), method: method.to_string(), id: id_value },
+                PendingAcp {
+                    identity: Arc::clone(&identity),
+                    sender,
+                    owner_id: owner_id.to_string(),
+                    method: method.to_string(),
+                    id: id_value,
+                },
             );
             (id, receiver)
         };
         let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(error) = self.send(agent_id, frame.to_string()).await {
+        if let Err(error) = self.send_fenced(agent_id, frame.to_string(), fence).await {
             if let Ok(mut agents) = self.agents.lock()
                 && let Some(handle) = agents.get_mut(agent_id)
+                && handle.pending_acp.get(&id).is_some_and(|pending| Arc::ptr_eq(&pending.identity, &identity))
             {
                 handle.pending_acp.remove(&id);
             }
@@ -1263,6 +1339,23 @@ impl Runtime {
         self.send(agent_id, frame.to_string()).await.map_err(ResponseError::runtime)
     }
 
+    pub async fn acp_notify_owned(
+        self: &Arc<Self>, agent_id: &str, method: &str, params: Value, owner_id: &str,
+    ) -> Result<(), ResponseError> {
+        let frame = serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        self.send_owned(agent_id, frame.to_string(), owner_id).await.map_err(ResponseError::runtime)
+    }
+
+    pub async fn acp_respond_owned(
+        self: &Arc<Self>, agent_id: &str, id: Value, result: Option<Value>, error: Option<Value>, owner_id: &str,
+    ) -> Result<(), ResponseError> {
+        let frame = match error {
+            Some(error) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+            None => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result.unwrap_or(Value::Null) }),
+        };
+        self.send_owned(agent_id, frame.to_string(), owner_id).await.map_err(ResponseError::runtime)
+    }
+
     /// Handshake once; if it already happened (the app sent `initialize` itself, or the Runtime did on its behalf)
     /// the cached result is used. An app that wants to declare its client capabilities (such as elicitation) calls
     /// `initialize` before its first session operation.
@@ -1281,6 +1374,20 @@ impl Runtime {
             "",
         )
         .await
+    }
+
+    pub async fn ensure_initialized_owned(
+        self: &Arc<Self>, agent_id: &str, client_version: &str, info: Option<Value>, capabilities: Option<Value>,
+        owner_id: &str,
+    ) -> Result<Value, ResponseError> {
+        self.acp_request_owned(
+            agent_id, "initialize",
+            serde_json::json!({
+                "protocolVersion": ACP_PROTOCOL_VERSION,
+                "info": info.unwrap_or_else(|| serde_json::json!({ "name": "alwith-runtime", "version": client_version })),
+                "capabilities": capabilities.unwrap_or_else(|| serde_json::json!({}))
+            }), None, owner_id,
+        ).await
     }
 
     /// Every change goes out and to disk from here: the registry stamps versions on commit, the
@@ -2246,6 +2353,58 @@ for line in sys.stdin:
             &[r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session"}}"#.into()],
             2,
         );
+    }
+
+    #[tokio::test]
+    async fn queued_request_cannot_cross_owner_release() {
+        let runtime = dsh_runtime().await;
+        register_provider_test_session(&runtime);
+        let lane = runtime.lane("agent");
+        let operation = lane.lock().await;
+        let submitting = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .acp_request_owned(
+                        "agent",
+                        "session/prompt",
+                        serde_json::json!({"sessionId":"session"}),
+                        None,
+                        "main",
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !runtime.agents.lock().unwrap().get("agent").unwrap().pending_acp.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.release_session("session", "main"));
+        drop(operation);
+        let result = tokio::time::timeout(Duration::from_secs(3), submitting).await.unwrap().unwrap();
+        assert!(result.unwrap_err().message.contains("ownership changed"));
+        assert!(runtime.agents.lock().unwrap().get("agent").unwrap().pending_acp.is_empty());
+    }
+
+    #[tokio::test]
+    async fn takeover_and_return_do_not_revive_an_old_dispatch_fence() {
+        let runtime = dsh_runtime().await;
+        register_provider_test_session(&runtime);
+        let fence = runtime.ownership_fence("agent", "main").unwrap();
+        runtime.attach("session", "other".into()).await.unwrap();
+        assert!(runtime.stop_owned("agent", "main").is_err());
+        runtime.attach("session", "main".into()).await.unwrap();
+        let frame = serde_json::json!({"jsonrpc":"2.0", "method":"_test/ping", "params":{}}).to_string();
+        assert!(
+            runtime.send_fenced("agent", frame.clone(), Some(fence)).await.unwrap_err().contains("ownership changed")
+        );
+        runtime.send_owned("agent", frame, "main").await.unwrap();
     }
 
     #[tokio::test]

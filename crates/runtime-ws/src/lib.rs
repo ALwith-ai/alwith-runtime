@@ -605,13 +605,12 @@ pub async fn execute(
             Ok(Value::Null)
         }
         RuntimeCommand::Send { agent_id, line, owner } => {
-            require_owned(runtime, &owner_of(connection, owner), &agent_id)?;
-            runtime.send(&agent_id, line).await?;
+            require_owned(runtime, &owner_of(connection, owner.clone()), &agent_id)?;
+            runtime.send_owned(&agent_id, line, &owner_of(connection, owner)).await?;
             Ok(Value::Null)
         }
         RuntimeCommand::Stop { agent_id, owner } => {
-            require_owned_or_orphaned(runtime, &owner_of(connection, owner), &agent_id)?;
-            runtime.stop(&agent_id)?;
+            runtime.stop_owned(&agent_id, &owner_of(connection, owner))?;
             Ok(Value::Null)
         }
         RuntimeCommand::AttachSession { session_id, owner } => {
@@ -625,8 +624,7 @@ pub async fn execute(
             Ok(Value::Null)
         }
         RuntimeCommand::StopSession { session_id, owner } => {
-            require_owned_session(runtime, &owner_of(connection, owner), &session_id)?;
-            runtime.stop_session(&session_id)?;
+            runtime.stop_session_owned(&session_id, &owner_of(connection, owner))?;
             Ok(Value::Null)
         }
         RuntimeCommand::DetachOwner { owner } => {
@@ -694,64 +692,79 @@ pub async fn execute(
         RuntimeCommand::AcpRequest { agent_id, method, params, id, owner } => {
             let owner_id = owner_of(connection, owner);
             require_owned(runtime, &owner_id, &agent_id)?;
-            runtime.acp_request(&agent_id, &method, params, id, &owner_id).await
+            runtime.acp_request_owned(&agent_id, &method, params, id, &owner_id).await
         }
         RuntimeCommand::AcpNotify { agent_id, method, params, owner } => {
-            require_owned(runtime, &owner_of(connection, owner), &agent_id)?;
-            runtime.acp_notify(&agent_id, &method, params).await?;
+            require_owned(runtime, &owner_of(connection, owner.clone()), &agent_id)?;
+            runtime.acp_notify_owned(&agent_id, &method, params, &owner_of(connection, owner)).await?;
             Ok(Value::Null)
         }
         RuntimeCommand::AcpRespond { agent_id, id, result, error, owner } => {
-            require_owned(runtime, &owner_of(connection, owner), &agent_id)?;
-            runtime.acp_respond(&agent_id, id, result, error).await?;
+            require_owned(runtime, &owner_of(connection, owner.clone()), &agent_id)?;
+            runtime.acp_respond_owned(&agent_id, id, result, error, &owner_of(connection, owner)).await?;
             Ok(Value::Null)
         }
         RuntimeCommand::Initialize { agent_id, info, capabilities, owner } => {
-            require_owned(runtime, &owner_of(connection, owner), &agent_id)?;
-            runtime.ensure_initialized(&agent_id, &server.launcher.version(), info, capabilities).await
+            require_owned(runtime, &owner_of(connection, owner.clone()), &agent_id)?;
+            runtime
+                .ensure_initialized_owned(
+                    &agent_id,
+                    &server.launcher.version(),
+                    info,
+                    capabilities,
+                    &owner_of(connection, owner),
+                )
+                .await
         }
         RuntimeCommand::SessionNew { agent_id, cwd, mcp_servers, meta, owner } => {
             let owner_id = owner_of(connection, owner);
             require_owned(runtime, &owner_id, &agent_id)?;
-            runtime.ensure_initialized(&agent_id, &server.launcher.version(), None, None).await?;
+            runtime.ensure_initialized_owned(&agent_id, &server.launcher.version(), None, None, &owner_id).await?;
             let params = with_meta(serde_json::json!({ "cwd": cwd, "mcpServers": mcp_servers }), meta);
-            runtime.acp_request(&agent_id, "session/new", params, None, &owner_id).await
+            runtime.acp_request_owned(&agent_id, "session/new", params, None, &owner_id).await
         }
         RuntimeCommand::SessionLoad { agent_id, session_id, cwd, mcp_servers, meta, owner } => {
             let owner_id = owner_of(connection, owner);
             require_owned(runtime, &owner_id, &agent_id)?;
-            runtime.ensure_initialized(&agent_id, &server.launcher.version(), None, None).await?;
+            runtime.ensure_initialized_owned(&agent_id, &server.launcher.version(), None, None, &owner_id).await?;
             let params =
                 with_meta(serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers }), meta);
-            runtime.acp_request(&agent_id, "session/load", params, None, &owner_id).await
+            runtime.acp_request_owned(&agent_id, "session/load", params, None, &owner_id).await
         }
         RuntimeCommand::SessionResume { agent_id, session_id, cwd, replay_from, meta, owner } => {
             let owner_id = owner_of(connection, owner);
             require_owned(runtime, &owner_id, &agent_id)?;
-            runtime.ensure_initialized(&agent_id, &server.launcher.version(), None, None).await?;
+            runtime.ensure_initialized_owned(&agent_id, &server.launcher.version(), None, None, &owner_id).await?;
             let mut params = serde_json::json!({ "sessionId": session_id, "cwd": cwd });
             if let Some(replay_from) = replay_from {
                 params["replayFrom"] = replay_from;
             }
-            runtime.acp_request(&agent_id, "session/resume", with_meta(params, meta), None, &owner_id).await
+            runtime.acp_request_owned(&agent_id, "session/resume", with_meta(params, meta), None, &owner_id).await
         }
         RuntimeCommand::SessionFork { agent_id, session_id, cwd, mcp_servers, meta, owner } => {
             let owner_id = owner_of(connection, owner);
             require_owned(runtime, &owner_id, &agent_id)?;
-            runtime.ensure_initialized(&agent_id, &server.launcher.version(), None, None).await?;
+            runtime.ensure_initialized_owned(&agent_id, &server.launcher.version(), None, None, &owner_id).await?;
             let params =
                 with_meta(serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers }), meta);
-            runtime.acp_request(&agent_id, "session/fork", params, None, &owner_id).await
+            runtime.acp_request_owned(&agent_id, "session/fork", params, None, &owner_id).await
         }
         RuntimeCommand::Prompt { agent_id, session_id, prompt, meta, owner } => {
             let owner_id = owner_of(connection, owner);
             require_owned(runtime, &owner_id, &agent_id)?;
             let params = with_meta(serde_json::json!({ "sessionId": session_id, "prompt": prompt }), meta);
-            runtime.acp_request(&agent_id, "session/prompt", params, None, &owner_id).await
+            runtime.acp_request_owned(&agent_id, "session/prompt", params, None, &owner_id).await
         }
         RuntimeCommand::Cancel { agent_id, session_id, owner } => {
-            require_owned(runtime, &owner_of(connection, owner), &agent_id)?;
-            runtime.acp_notify(&agent_id, "session/cancel", serde_json::json!({ "sessionId": session_id })).await?;
+            require_owned(runtime, &owner_of(connection, owner.clone()), &agent_id)?;
+            runtime
+                .acp_notify_owned(
+                    &agent_id,
+                    "session/cancel",
+                    serde_json::json!({ "sessionId": session_id }),
+                    &owner_of(connection, owner),
+                )
+                .await?;
             Ok(Value::Null)
         }
     }
