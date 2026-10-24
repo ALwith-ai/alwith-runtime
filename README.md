@@ -163,7 +163,7 @@ so consumers must update to the new release and repackage their app.
 ## Formatting
 
 Run `bun install --frozen-lockfile` to install the repository's formatting tools.
-`bun run format` formats JavaScript, TypeScript, CSS and supported configuration files;
+`bun fmt` formats JavaScript, TypeScript, CSS and supported configuration files;
 `bun run format:rust` formats the Rust workspace; `bun run format:all` runs both.
 Prettier and its Tailwind plugin match ALwith Desktop's versions; Prettier and Rustfmt settings match Desktop's rules.
 Generated artifacts, dependency directories, licenses and Markdown are excluded from Prettier.

@@ -2,7 +2,6 @@
   "name": "alwith-runtime-workspace",
   "private": true,
   "scripts": {
-    "format": "bun fmt",
     "ts7-lint": "ts7-lint",
     "format:rust": "cargo fmt --all",
     "format:all": "bun run format:rust && bun fmt",
