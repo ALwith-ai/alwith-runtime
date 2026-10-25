@@ -88,10 +88,9 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
+          bun-version: latest
       - uses: actions/download-artifact@v4
         with:
           pattern: runtime-*
@@ -100,7 +99,7 @@ jobs:
       - name: The tag version must equal the packages/runtime version, and the five optionalDependencies and five platform packages must match it
         run: |
           version=${GITHUB_REF_NAME#v}
-          node -e '
+          bun -e '
             const pkg = require("./packages/runtime/package.json");
             const want = process.argv[1];
             if (pkg.version !== want) { console.error(`tag v${want} != packages/runtime ${pkg.version}`); process.exit(1) }
@@ -117,12 +116,12 @@ jobs:
       - name: Publish the five platform packages, then the @alwith/runtime main package
         run: |
           publish() {
-            name=$(node -p "require('./package.json').name")
-            version=$(node -p "require('./package.json').version")
-            if npm view "$name@$version" version >/dev/null 2>&1; then
+            name=$(bun -p "require('./package.json').name")
+            version=$(bun -p "require('./package.json').version")
+            if bun x --bun npm@latest view "$name@$version" version >/dev/null 2>&1; then
               echo "$name@$version already on npm, skipping"
             else
-              npm publish --access public
+              bun x --bun npm@latest publish --access public
             fi
           }
           for dir in dist/npm/*/; do (cd "$dir" && publish); done

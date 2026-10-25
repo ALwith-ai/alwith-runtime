@@ -2,14 +2,12 @@
   "name": "alwith-runtime-workspace",
   "private": true,
   "scripts": {
-    "ts7-lint": "ts7-lint",
     "format:rust": "cargo fmt --all",
-    "format:all": "bun run format:rust && bun fmt",
-    "typecheck": "tsc"
+    "format:all": "bun run format:rust && bun fmt"
   },
   "devDependencies": {
     "@nyssance/ts7-lint": "^0.1.3",
-    "@types/bun": "^1.4.3",
+    "@types/bun": "^1.4.4",
     "typescript": "^7.0.2"
   }
 }
