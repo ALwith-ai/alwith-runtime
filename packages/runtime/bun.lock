@@ -11,5 +11,11 @@
       },
     },
   },
-  "packages": {}
+  "packages": {
+    "@alwith/runtime-darwin-arm64": ["@alwith/runtime-darwin-arm64@0.1.21", "", { "os": "darwin", "cpu": "arm64" }, "sha512-Y4Kp3NpH6BCavn+ro40SlxpVUHEkxo6NK2uUhEm1ZECf6gHSEyUdWyUQjAVrI5NMc2IBTxMlusEK1zuVr3daRA=="],
+
+    "@alwith/runtime-linux-x64": ["@alwith/runtime-linux-x64@0.1.21", "", { "os": "linux", "cpu": "x64" }, "sha512-Gf0uNn1q5+bUT/B5OEyA7A0oHe04Ly8LwElWddJ90dfXom/txDxgBRXSpMCL9iL6nweLrD5qLpcgNfNI4emA7A=="],
+
+    "@alwith/runtime-win32-x64": ["@alwith/runtime-win32-x64@0.1.21", "", { "os": "win32", "cpu": "x64" }, "sha512-dEg3EPtuSGQu6j3CtXv9St27oVAmQ8GJxJSA1YWY1xQupDqEog+UW1v7mK53Ur9/lAvEufzmwR6wtd3+1H2Eag=="],
+  }
 }
