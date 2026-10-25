@@ -1,10 +1,10 @@
-# Publish Runtime: pushing a v<version> tag builds once on each of the five platforms and publishes to
-# npm: the @alwith/runtime main package plus five @alwith/runtime-<os>-<cpu> platform packages. This is
+# Publish Runtime: pushing a v<version> tag builds once on each of the three platforms and publishes to
+# npm: the @alwith/runtime main package plus three @alwith/runtime-<os>-<cpu> platform packages. This is
 # the only distribution channel: an app's bun install picks the one for its platform, and at build time
 # stageRuntime() verifies the sha and copies it into the sidecar. No GitHub Release is published and no
-# token is used (npm trusted publishing; on npmjs.com each of the six packages gets one entry:
+# token is used (npm trusted publishing; on npmjs.com each of the four packages gets one entry:
 # Repository alwith-runtime / Workflow release.yml).
-# The tag must equal the Cargo workspace version, and also the packages/runtime version and its five
+# The tag must equal the Cargo workspace version, and also the packages/runtime version and its three
 # optionalDependencies.
 name: release
 
@@ -33,12 +33,8 @@ jobs:
             runner: macos-15
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -74,9 +70,9 @@ jobs:
           path: alwith-runtime/dist/npm
           if-no-files-found: error
 
-  # The five platform packages are published first, then the @alwith/runtime main package (its
+  # The three platform packages are published first, then the @alwith/runtime main package (its
   # optionalDependencies point at them).
-  # npm trusted publishing (OIDC): on npmjs.com each of the six packages gets one entry (Repository
+  # npm trusted publishing (OIDC): on npmjs.com each of the four packages gets one entry (Repository
   # alwith-runtime / Workflow filename release.yml), so no token is stored; no provenance (private
   # repos do not support it). Versions already on npm are skipped, so a run rejected midway can be
   # re-run.
@@ -96,7 +92,7 @@ jobs:
           pattern: runtime-*
           path: dist/npm
           merge-multiple: true
-      - name: The tag version must equal the packages/runtime version, and the five optionalDependencies and five platform packages must match it
+      - name: The tag version must equal the packages/runtime version, and the three optionalDependencies and three platform packages must match it
         run: |
           version=${GITHUB_REF_NAME#v}
           bun -e '
@@ -107,13 +103,13 @@ jobs:
               if (v !== want) { console.error(`${name} pinned to ${v}, expected ${want}`); process.exit(1) }
             }
             const dirs = require("fs").readdirSync("dist/npm");
-            if (dirs.length !== 5) { console.error(`expected 5 platform packages, got ${dirs}`); process.exit(1) }
+            if (dirs.length !== 3) { console.error(`expected 3 platform packages, got ${dirs}`); process.exit(1) }
             for (const dir of dirs) {
               const platform = require(`./dist/npm/${dir}/package.json`);
               if (platform.version !== want) { console.error(`${platform.name} is ${platform.version}`); process.exit(1) }
             }
           ' "$version"
-      - name: Publish the five platform packages, then the @alwith/runtime main package
+      - name: Publish the three platform packages, then the @alwith/runtime main package
         run: |
           publish() {
             name=$(bun -p "require('./package.json').name")

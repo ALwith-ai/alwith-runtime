@@ -5,23 +5,17 @@
     "": {
       "name": "@alwith/runtime",
       "optionalDependencies": {
-        "@alwith/runtime-darwin-arm64": "0.1.19",
-        "@alwith/runtime-linux-arm64": "0.1.19",
-        "@alwith/runtime-linux-x64": "0.1.19",
-        "@alwith/runtime-win32-arm64": "0.1.19",
-        "@alwith/runtime-win32-x64": "0.1.19",
+        "@alwith/runtime-darwin-arm64": "0.1.20",
+        "@alwith/runtime-linux-x64": "0.1.20",
+        "@alwith/runtime-win32-x64": "0.1.20",
       },
     },
   },
   "packages": {
-    "@alwith/runtime-darwin-arm64": ["@alwith/runtime-darwin-arm64@0.1.19", "", { "os": "darwin", "cpu": "arm64" }, "sha512-XF84bAKX65rEZq70CueUpYTtWH2Bqfe++qoFsofah46GEaHsbeB/Y/lmwZQ1Hk1VQ9E395qktsC2TCQdjMs8bg=="],
+    "@alwith/runtime-darwin-arm64": ["@alwith/runtime-darwin-arm64@0.1.20", "", { "os": "darwin", "cpu": "arm64" }, "sha512-X4htvNiOYGis8+G7JjlO+2ydiSkFUBp1GgXYY2zxH+w+P3u/NCrAY7tblWUaGICp7tjAwi26/pl9+u+Yd7xnOw=="],
 
-    "@alwith/runtime-linux-arm64": ["@alwith/runtime-linux-arm64@0.1.19", "", { "os": "linux", "cpu": "arm64" }, "sha512-60C4zYCX4cSxMhTAtJGzWKHrG12xDYoGv/jQirGi1jH616U9CcrbPl/Y50F0H28HsQe631GmUD/KW4OKZwnGDw=="],
+    "@alwith/runtime-linux-x64": ["@alwith/runtime-linux-x64@0.1.20", "", { "os": "linux", "cpu": "x64" }, "sha512-ojPkYmESeYeNNbgOit0udp1OSSW5JX0UP4O7YjLGOwx+K8Tf9YgxCYdDm+0fPdbVUiJatFYtFIRvLqzCrp6gwQ=="],
 
-    "@alwith/runtime-linux-x64": ["@alwith/runtime-linux-x64@0.1.19", "", { "os": "linux", "cpu": "x64" }, "sha512-mjQfC/NLB5bAQ25nC9cdUwga4Cw3sjN516p4yeJEEuG8qOy6UulZ2iA/8RF0PfOvsg2at4SX5HTRslabZlsQ3g=="],
-
-    "@alwith/runtime-win32-arm64": ["@alwith/runtime-win32-arm64@0.1.19", "", { "os": "win32", "cpu": "arm64" }, "sha512-8EgWATDm3ZFib7wOfThzbLfzt/wr+1e3Yi3pwLxL3O9LPcHb9uqOh+USan0fwQDI8KF0uz7Yj0D8U7/s7KJ5xA=="],
-
-    "@alwith/runtime-win32-x64": ["@alwith/runtime-win32-x64@0.1.19", "", { "os": "win32", "cpu": "x64" }, "sha512-eRsSmBKVaCuY/7To8GvJN8gRWs+h535QSeWb3Y0aUa+PIhYJMeexIPUb6hP8NKD6l3ELYISjRP7+vBxPfTgmcA=="],
+    "@alwith/runtime-win32-x64": ["@alwith/runtime-win32-x64@0.1.20", "", { "os": "win32", "cpu": "x64" }, "sha512-schEVRjJzC+xj8gZGkYzhukuceO1uU+EL2yrz4cqe1fO9fF8Th8qFBwd5Xa/mFRasHMLFouccUMQS7Rfih6Gpw=="],
   }
 }
