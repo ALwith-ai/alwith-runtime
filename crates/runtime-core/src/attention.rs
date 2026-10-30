@@ -158,7 +158,7 @@ pub fn recovered(mut state: SessionRunState, now_ms: i64) -> SessionRunState {
 /// The lease for a process this Runtime just started; `None` once the process is already gone.
 pub fn lease_for(agent_id: &str, process_id: u32) -> Option<ProcessLease> {
     let pid = Pid::from_u32(process_id);
-    let mut system = System::new();
+    let mut system = System::new().expect("failed to initialize system process information");
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
     let process = system.process(pid)?;
     Some(ProcessLease { agent_id: agent_id.to_string(), process_id, started_at: process.start_time() })
@@ -171,7 +171,7 @@ pub fn reclaim_orphans(leases: &[ProcessLease]) -> Vec<ProcessLease> {
     if leases.is_empty() {
         return Vec::new();
     }
-    let mut system = System::new();
+    let mut system = System::new().expect("failed to initialize system process information");
     system.refresh_processes(ProcessesToUpdate::All, false);
     let alive = leases
         .iter()

@@ -344,7 +344,13 @@ impl RuntimeServer {
     pub fn new(
         runtime: Arc<Runtime>, launcher: Arc<dyn AgentLauncher>, extension: Arc<dyn Extension>, token: String,
     ) -> Self {
-        Self { runtime, launcher, extension, token: token.into(), system: Arc::new(Mutex::new(System::new())) }
+        Self {
+            runtime,
+            launcher,
+            extension,
+            token: token.into(),
+            system: Arc::new(Mutex::new(System::new().expect("failed to initialize system process information"))),
+        }
     }
 
     /// WebSocket is mounted at the root path, like `codex app-server`; `/readyz` and `/healthz` are

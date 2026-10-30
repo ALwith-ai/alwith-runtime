@@ -28,7 +28,7 @@ pub fn listening_ports_by_root(root_process_ids: &[u32]) -> Result<HashMap<u32, 
 }
 
 pub(crate) fn descendant_process_ids_by_root(root_process_ids: &[u32]) -> HashMap<u32, HashSet<u32>> {
-    let mut system = System::new();
+    let mut system = System::new().expect("failed to initialize system process information");
     system.refresh_processes(ProcessesToUpdate::All, false);
     let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
     for (process_id, process) in system.processes() {

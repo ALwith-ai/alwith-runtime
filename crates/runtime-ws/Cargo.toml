@@ -14,7 +14,7 @@ futures-util = "0.3"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sysinfo = "0.39"
+sysinfo = "0.40"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 
