@@ -23,3 +23,7 @@ Origin: user instruction (2026-10-19).
 - Write commit messages in English only. No Chinese in subjects or bodies, in any repo.
 - Squash churn before pushing: one commit per logical change. Never leave an add-then-remove sequence (a feature commit followed by its revert, or a dependency pinned and re-pinned) in history; rewrite it into the net result.
 - Origin: user instruction (2026-10-20).
+
+## Unified ALwith package versions
+
+All published `@alwith/*` packages, including Runtime and its platform packages, use the `0.5.x` release line. Consumers must follow that line. The transition to `0.5.0` is explicitly authorized; subsequent releases increment only the patch version. Third-party packages keep their own versions. Origin: user instruction (2026-10-30).

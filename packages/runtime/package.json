@@ -1,6 +1,6 @@
 {
   "name": "@alwith/runtime",
-  "version": "0.1.23",
+  "version": "0.5.0",
   "description": "The closed ALwith Runtime process for your platform: npm installs the matching binary, stageRuntime() copies it into your app's sidecars at build time",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -17,9 +17,9 @@
     }
   },
   "optionalDependencies": {
-    "@alwith/runtime-darwin-arm64": "0.1.23",
-    "@alwith/runtime-linux-x64": "0.1.23",
-    "@alwith/runtime-win32-x64": "0.1.23"
+    "@alwith/runtime-darwin-arm64": "0.5.0",
+    "@alwith/runtime-linux-x64": "0.5.0",
+    "@alwith/runtime-win32-x64": "0.5.0"
   },
   "publishConfig": {
     "access": "public",
