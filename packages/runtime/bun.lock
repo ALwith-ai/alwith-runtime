@@ -5,17 +5,17 @@
     "": {
       "name": "@alwith/runtime",
       "optionalDependencies": {
-        "@alwith/runtime-darwin-arm64": "0.1.22",
-        "@alwith/runtime-linux-x64": "0.1.22",
-        "@alwith/runtime-win32-x64": "0.1.22",
+        "@alwith/runtime-darwin-arm64": "0.5.0",
+        "@alwith/runtime-linux-x64": "0.5.0",
+        "@alwith/runtime-win32-x64": "0.5.0",
       },
     },
   },
   "packages": {
-    "@alwith/runtime-darwin-arm64": ["@alwith/runtime-darwin-arm64@0.1.22", "", { "os": "darwin", "cpu": "arm64" }, "sha512-8C+MtzCcwZN8p0I/7V4HqGM2gUcTNOTlb7S8zUi2CBeJ37oThPosywutT6AjOHOCk4agKM0e1bSaaf3OJo9AWA=="],
+    "@alwith/runtime-darwin-arm64": ["@alwith/runtime-darwin-arm64@0.5.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-JFRclEYmP84Dny7XVC4qx9rwvsw7J6JCi2cR1r/l+fhTk7uFPP2Zep556eAn6yVVq1ebOKWD6Rf1y4u1c3q8Fw=="],
 
-    "@alwith/runtime-linux-x64": ["@alwith/runtime-linux-x64@0.1.22", "", { "os": "linux", "cpu": "x64" }, "sha512-6hLTXP+at8jU+gxbkgMWYiykd5xPb2JPaRNWMYZj7E+uC80cuRRUjeBnhlyREdBmCCXb8oKmyL7EhBzyeUNi6w=="],
+    "@alwith/runtime-linux-x64": ["@alwith/runtime-linux-x64@0.5.0", "", { "os": "linux", "cpu": "x64" }, "sha512-Ur7eJ3qmLDksrAtiSw6HGMLEC8QHFQAuU/zPLe16RikPnKxnv+EQNsRmcfgWefRLJC52swP+Oaz4wJewFS+NAw=="],
 
-    "@alwith/runtime-win32-x64": ["@alwith/runtime-win32-x64@0.1.22", "", { "os": "win32", "cpu": "x64" }, "sha512-PzPNBruyzP9vKcI5g43OMahyrUKkKkWZhhLU2ssho56EUIYSz4Tf7vnmdgfLBDmY+0sMR3A3XHjyfywKvi+RbA=="],
+    "@alwith/runtime-win32-x64": ["@alwith/runtime-win32-x64@0.5.0", "", { "os": "win32", "cpu": "x64" }, "sha512-e5uyKe0DdFuvQVtSqynqWSQYgv2KqZ8gcXbbX9VPyT05aWMZ7Avo+8nI0HpPSd1WLzpXtZvf3LDrXcdEHZGyxA=="],
   }
 }
