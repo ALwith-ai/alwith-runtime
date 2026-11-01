@@ -11,7 +11,6 @@ alwith-runtime-core = { path = "../runtime-core" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
-log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sysinfo = "0.40"

@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 alwith-runtime-core = { path = "../runtime-core" }
 alwith-runtime-ws = { path = "../runtime-ws" }
-log = "0.4"
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 
