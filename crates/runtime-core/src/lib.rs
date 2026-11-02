@@ -149,10 +149,7 @@ impl RuntimeRegistry {
         if !self.tracks.contains_key(agent_id) {
             return false;
         }
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => return false,
-        };
+        let Ok(value) = serde_json::from_str::<Value>(line) else { return false };
         let content_changed = self.record_content(FrameDirection::Out, &value, line, now_ms);
         let Some(track) = self.tracks.get_mut(agent_id) else { return false };
         let Some(session_id) = apply_outbound(track, &value) else { return false };
@@ -172,10 +169,7 @@ impl RuntimeRegistry {
 
         let mut changed = false;
         for line in lines {
-            let value: Value = match serde_json::from_str(line) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
+            let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
             changed |= self.record_content(FrameDirection::In, &value, line, now_ms);
             // Close is session-scoped. Only its successful response retires the record;
             // the shared agent and every other session remain owned and available.

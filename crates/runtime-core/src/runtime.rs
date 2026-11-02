@@ -306,7 +306,7 @@ impl Runtime {
     }
 
     pub fn set_tool_dispatch(&self, dispatch: PrivateToolDispatch) {
-        let _ = self.tool_dispatch.set(dispatch);
+        assert!(self.tool_dispatch.set(dispatch).is_ok(), "private tool dispatch is set once");
     }
 
     /// Persist the journal actions the registry just decided and return each persisted frame's `(sessionId, sequence)`
@@ -913,9 +913,7 @@ impl Runtime {
                 }
                 let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
                 let handle = agents.get_mut(&agent_id)?;
-                if !handle.pending_providers.is_empty() {
-                    Err(handle.provider_changes.subscribe())
-                } else {
+                if handle.pending_providers.is_empty() {
                     let mut info = registry.attach(session_id, owner_id.clone())?;
                     // A takeover: what the previous holder was still waiting on now belongs to the new one, so the
                     // previous holder letting go later retracts none of it.
@@ -932,6 +930,8 @@ impl Runtime {
                     info.provider = handle.metadata.provider.clone();
                     info.provider_revision = handle.metadata.provider_revision;
                     Ok(info)
+                } else {
+                    Err(handle.provider_changes.subscribe())
                 }
             };
             let info = match state {
@@ -1135,8 +1135,11 @@ impl Runtime {
                         };
                         // Captured pipe belongs to this process, never a replacement with the same agent ID.
                         let mut input = stdin.lock().await;
-                        let _ = input.write_all(format!("{response}\n").as_bytes()).await;
-                        let _ = input.flush().await;
+                        if let Err(error) =
+                            input.write_all(format!("{response}\n").as_bytes()).await.and(input.flush().await)
+                        {
+                            log::warn!("Runtime: could not answer tool call {task_key}: {error}");
+                        }
                         task_key
                     });
                     tool_calls.insert(key, abort);
@@ -1307,8 +1310,7 @@ impl Runtime {
         };
         let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if let Err(error) = self.send_fenced(agent_id, frame.to_string(), fence).await {
-            if let Ok(mut agents) = self.agents.lock()
-                && let Some(handle) = agents.get_mut(agent_id)
+            if let Some(handle) = self.agents.lock().expect("runtime agents lock poisoned").get_mut(agent_id)
                 && handle.pending_acp.get(&id).is_some_and(|pending| Arc::ptr_eq(&pending.identity, &identity))
             {
                 handle.pending_acp.remove(&id);

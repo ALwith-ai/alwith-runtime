@@ -686,9 +686,9 @@ pub async fn execute(
                         "provider": snapshot.provider,
                         "model": snapshot.model,
                         "connection": snapshot.connection,
-                        "cpu": process.map(sysinfo::Process::cpu_usage).unwrap_or(0.0),
-                        "memMb": process.map(|process| process.memory() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0),
-                        "uptimeSecs": process.map(sysinfo::Process::run_time).unwrap_or(0)
+                        "cpu": process.map_or(0.0, sysinfo::Process::cpu_usage),
+                        "memMb": process.map_or(0.0, |process| process.memory() as f64 / (1024.0 * 1024.0)),
+                        "uptimeSecs": process.map_or(0, sysinfo::Process::run_time)
                     })
                 })
                 .collect::<Vec<_>>();

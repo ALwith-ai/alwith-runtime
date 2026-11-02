@@ -220,7 +220,7 @@ mod tests {
 
     /// Starts a connection: returns (request writer, frame reader, service task). The reader skips event
     /// frames and returns only responses.
-    async fn connect() -> (tokio::io::DuplexStream, BufReader<tokio::io::DuplexStream>, tokio::task::JoinHandle<()>) {
+    fn connect() -> (tokio::io::DuplexStream, BufReader<tokio::io::DuplexStream>, tokio::task::JoinHandle<()>) {
         let (client_in, server_out) = tokio::io::duplex(64 * 1024);
         let (server_in, client_out) = tokio::io::duplex(64 * 1024);
         let task = tokio::spawn(async move {
@@ -248,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn requests_and_responses_are_one_json_per_line() {
-        let (mut writer, mut reader, _task) = connect().await;
+        let (mut writer, mut reader, _task) = connect();
         let pong = call(&mut writer, &mut reader, 1, "ping", Value::Null).await;
         assert_eq!(pong.id, 1);
         assert_eq!(pong.result, Some(Value::String("pong".into())));
@@ -262,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_lines_answer_with_the_original_id() {
-        let (mut writer, mut reader, _task) = connect().await;
+        let (mut writer, mut reader, _task) = connect();
         writer.write_all(b"{\"id\": 9, \"method\": 5}\n").await.unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
@@ -274,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_eof_ends_the_connection_and_kills_agents() {
-        let (mut writer, mut reader, task) = connect().await;
+        let (mut writer, mut reader, task) = connect();
         #[cfg(unix)]
         {
             let started =
@@ -287,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_request_is_answered_then_ends_the_connection() {
-        let (mut writer, mut reader, task) = connect().await;
+        let (mut writer, mut reader, task) = connect();
         let receipt = call(&mut writer, &mut reader, 7, "shutdown", Value::Null).await;
         assert_eq!(receipt.id, 7);
         assert!(receipt.error.is_none());
@@ -328,7 +328,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn agent_frames_arrive_as_events_on_the_same_stream() {
-        let (mut writer, mut reader, _task) = connect().await;
+        let (mut writer, mut reader, _task) = connect();
         let started =
             call(&mut writer, &mut reader, 1, "start", serde_json::json!({ "agentId": "cat", "launch": {} })).await;
         assert!(started.error.is_none(), "{:?}", started.error);

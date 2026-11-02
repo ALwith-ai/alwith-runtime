@@ -296,7 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             module_host.call_module(&resolver, "_runtime/ready", Value::Null),
         )
         .await
-        .map_err(|_| format!("launch resolver module {resolver} did not become ready"))??;
+        .map_err(|elapsed| format!("launch resolver module {resolver} did not become ready: {elapsed}"))??;
     }
     match listen {
         Listen::Stdio => alwith_runtime_stdio::serve_stdio(server, shutdown_signal()).await?,
@@ -318,7 +318,7 @@ mod tests {
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|item| item.to_string()).collect()
+        list.iter().map(ToString::to_string).collect()
     }
 
     #[test]

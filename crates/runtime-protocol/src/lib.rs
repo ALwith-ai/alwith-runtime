@@ -52,10 +52,7 @@ impl ResponseError {
     /// The frame's `error` object -> as is; if it is not that shape, the whole value becomes the
     /// message.
     pub fn parse(error: &Value) -> Self {
-        match serde_json::from_value::<Self>(error.clone()) {
-            Ok(parsed) => parsed,
-            Err(_) => Self::runtime(error.to_string()),
-        }
+        serde_json::from_value::<Self>(error.clone()).unwrap_or_else(|_| Self::runtime(error.to_string()))
     }
 }
 

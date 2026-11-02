@@ -305,7 +305,7 @@ mod tests {
         let own = std::process::id();
         let lease = lease_for("self", own).expect("this process is alive");
         assert_eq!(lease.process_id, own);
-        let stale = ProcessLease { started_at: lease.started_at.wrapping_add(1), ..lease.clone() };
+        let stale = ProcessLease { started_at: lease.started_at.wrapping_add(1), ..lease };
         assert!(reclaim_orphans(&[stale]).is_empty(), "a different start time is a different process");
         let gone = ProcessLease { agent_id: "gone".into(), process_id: u32::MAX - 1, started_at: 0 };
         assert!(reclaim_orphans(&[gone]).is_empty());

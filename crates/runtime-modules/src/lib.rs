@@ -95,17 +95,26 @@ pub fn current_triple() -> String {
 /// Scans a directory (usually the app's `node_modules`) for all packages carrying a manifest.
 pub fn discover(modules_dir: &Path) -> Vec<(PathBuf, ModuleManifest)> {
     let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir(modules_dir) else { return found };
+    let entries = match std::fs::read_dir(modules_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::error!("[modules] {} unreadable: {error}", modules_dir.display());
+            return found;
+        }
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
         if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with('@')) {
-            if let Ok(scoped) = std::fs::read_dir(&path) {
-                for scoped_entry in scoped.flatten() {
-                    push_if_module(&mut found, &scoped_entry.path());
+            match std::fs::read_dir(&path) {
+                Ok(scoped) => {
+                    for scoped_entry in scoped.flatten() {
+                        push_if_module(&mut found, &scoped_entry.path());
+                    }
                 }
+                Err(error) => log::warn!("[modules] {} unreadable: {error}", path.display()),
             }
             continue;
         }
@@ -120,13 +129,17 @@ fn push_if_module(found: &mut Vec<(PathBuf, ModuleManifest)>, dir: &Path) {
     if !manifest_path.is_file() {
         return;
     }
+    // node_modules often holds symlinks (workspace / bun link): resolve the entry against the real
+    // directory, otherwise the relative path misses.
     match std::fs::read_to_string(&manifest_path)
         .map_err(|error| error.to_string())
         .and_then(|text| serde_json::from_str::<ModuleManifest>(&text).map_err(|error| error.to_string()))
-    {
-        // node_modules often holds symlinks (workspace / bun link): resolve the entry against the real
-        // directory, otherwise the relative path misses.
-        Ok(manifest) => found.push((dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()), manifest)),
+        .and_then(|manifest| {
+            dir.canonicalize()
+                .map(|real| (real, manifest))
+                .map_err(|error| format!("resolve {}: {error}", dir.display()))
+        }) {
+        Ok(module) => found.push(module),
         Err(error) => log::warn!("[modules] {} unreadable: {error}", manifest_path.display()),
     }
 }
@@ -135,7 +148,7 @@ fn push_if_module(found: &mut Vec<(PathBuf, ModuleManifest)>, dir: &Path) {
 /// any other form is an error rather than pretending to be satisfied.
 pub fn runtime_satisfies(version: &str, requirement: &str) -> Result<bool, String> {
     fn parse(text: &str) -> Result<(u64, u64, u64), String> {
-        let mut parts = text.trim().split('.').map(|part| part.parse::<u64>());
+        let mut parts = text.trim().split('.').map(str::parse::<u64>);
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => Ok((major, minor, patch)),
             _ => Err(format!("not a X.Y.Z version: {text}")),
@@ -264,14 +277,14 @@ impl ModuleHost {
 
     /// Wires in the executor of module -> Runtime requests. Called once after the RuntimeServer is built.
     pub fn set_dispatch(&self, dispatch: Dispatch) {
-        let _ = self.dispatch.set(dispatch);
+        assert!(self.dispatch.set(dispatch).is_ok(), "module host dispatch is set once");
     }
 
     /// Loads every module in the directory; a single module failing to start is only logged and does not
     /// affect the others.
     pub async fn load_dir(self: &Arc<Self>, modules_dir: &Path) -> Vec<ModuleStatus> {
         for (dir, manifest) in discover(modules_dir) {
-            if let Err(error) = self.spawn(&dir, manifest.clone()).await {
+            if let Err(error) = self.spawn(&dir, manifest.clone()) {
                 log::error!("[modules] {} failed to start: {error}", manifest.name);
             }
         }
@@ -306,7 +319,7 @@ impl ModuleHost {
             .any(|module| module.manifest.persistent && module.alive.load(Ordering::Relaxed))
     }
 
-    pub async fn spawn(self: &Arc<Self>, module_dir: &Path, manifest: ModuleManifest) -> Result<(), String> {
+    pub fn spawn(self: &Arc<Self>, module_dir: &Path, manifest: ModuleManifest) -> Result<(), String> {
         {
             let modules = self.modules.lock().expect("modules lock poisoned");
             if modules.contains_key(&manifest.name) {
@@ -518,8 +531,9 @@ impl ModuleHost {
         line.push('\n');
         let mut stdin = stdin.lock().await;
         let Some(stdin) = stdin.as_mut() else { return };
-        let _ = stdin.write_all(line.as_bytes()).await;
-        let _ = stdin.flush().await;
+        if let Err(error) = stdin.write_all(line.as_bytes()).await.and(stdin.flush().await) {
+            log::warn!("[modules] {module}: could not answer request {id}: {error}");
+        }
     }
 
     /// App -> module request.
@@ -571,8 +585,9 @@ impl RuntimeEventSink for ModuleEventSink {
         tokio::spawn(async move {
             let mut stdin = stdin.lock().await;
             let Some(stdin) = stdin.as_mut() else { return };
-            let _ = stdin.write_all(line.as_bytes()).await;
-            let _ = stdin.flush().await;
+            if let Err(error) = stdin.write_all(line.as_bytes()).await.and(stdin.flush().await) {
+                log::warn!("[modules] could not deliver a runtime event: {error}");
+            }
         });
     }
 }
