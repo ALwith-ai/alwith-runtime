@@ -684,7 +684,7 @@ fn apply_inbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn upsert_run_state(
     states: &mut HashMap<String, SessionRunState>, owner_id: String, session_id: String, cwd: String,
     next_state: RunState, reusable_draft: bool, now_ms: i64, listening_ports: Vec<u16>, known_title: Option<String>,
