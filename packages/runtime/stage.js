@@ -5,7 +5,6 @@ import { dirname, join } from "node:path"
 const require = createRequire(import.meta.url)
 const targets = {
   "aarch64-apple-darwin": "darwin-arm64",
-  "x86_64-unknown-linux-gnu": "linux-x64",
   "x86_64-pc-windows-msvc": "win32-x64"
 }
 export function stageRuntime(target, destination, licenses) {

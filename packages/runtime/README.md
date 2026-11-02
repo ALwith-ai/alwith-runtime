@@ -14,5 +14,5 @@ The binary is verified against the sha256 pinned in the platform package before 
 Runtime's LICENSE and third-party notices land next to your app's other licence files.
 
 Cross builds must install the optional package for the target too: `bun install --os='*' --cpu='*'`.
-Platforms: macOS arm64, Linux x64/arm64, Windows x64/arm64. The protocol the binary speaks is
+Platforms: macOS arm64 and Windows x64. The protocol the binary speaks is
 documented in the `alwith-api` repository (PROTOCOL.md); talk to it with `@alwith/api`.

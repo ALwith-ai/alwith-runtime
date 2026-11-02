@@ -120,7 +120,7 @@ and the client replays with `sessionEvents`.
 
 `alwith-runtime` is distributed as binaries only. Tag the workspace version (`v0.1.0` for
 `version = "0.1.0"` in `Cargo.toml`) and `.github/workflows/release.yml` builds six
-targets (macOS arm64/x64, Linux x64/arm64, Windows x64/arm64) and publishes
+targets (macOS arm64, Windows x64) and publishes
 `alwith-runtime-<rust-triple>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
 
 Assets go to this repository by default. To publish from this private repo to a public
@@ -142,7 +142,7 @@ cargo test --workspace
 
 ## Distribution
 
-The Runtime ships only through npm. Pushing a `v<version>` tag makes `release.yml` build three platforms (macOS arm64, Linux x64, Windows x64) and publish `@alwith/runtime` plus three `@alwith/runtime-<os>-<cpu>` platform packages. An app's `bun install` installs the one for its platform, and at build time `stageRuntime()` (`@alwith/runtime/stage`) verifies the sha before copying it into the sidecar; consumers that do not use npm take the tgz from the registry directly. `scripts/package-release.ts` puts the binary, LICENSE, third-party licence texts and `artifact.json` into each platform package. There is one version line: Cargo workspace = tag = `packages/runtime`. Bump those three before a release; the first version of a new package name is published by hand, after that trusted publishing is fully automatic.
+The Runtime ships only through npm. Pushing a `v<version>` tag makes `release.yml` build two platforms (macOS arm64, Windows x64) and publish `@alwith/runtime` plus two `@alwith/runtime-<os>-<cpu>` platform packages. An app's `bun install` installs the one for its platform, and at build time `stageRuntime()` (`@alwith/runtime/stage`) verifies the sha before copying it into the sidecar; consumers that do not use npm take the tgz from the registry directly. `scripts/package-release.ts` puts the binary, LICENSE, third-party licence texts and `artifact.json` into each platform package. There is one version line: Cargo workspace = tag = `packages/runtime`. Bump those three before a release; the first version of a new package name is published by hand, after that trusted publishing is fully automatic.
 
 ### Windows CRT
 

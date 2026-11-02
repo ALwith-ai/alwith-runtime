@@ -1,7 +1,7 @@
 // Builds the npm platform package for one platform: dist/npm/<os>-<cpu>/, holding the binary,
 // artifact.json (version, target, sha256), LICENSE, THIRD_PARTY_NOTICES.md, licenses/ (the license
 // text of every third-party crate) and package.json.
-// The @alwith/runtime main package (packages/runtime) points at these three platform packages through
+// The @alwith/runtime main package (packages/runtime) points at these two platform packages through
 // optionalDependencies; an app's bun install installs only its own platform's, and at build time
 // stageRuntime() verifies the sha and copies it into the sidecar.
 //
@@ -16,7 +16,6 @@ import { checkWindowsRuntime } from "./check-windows-runtime"
 
 const platforms: Record<string, [string, string]> = {
   "aarch64-apple-darwin": ["darwin", "arm64"],
-  "x86_64-unknown-linux-gnu": ["linux", "x64"],
   "x86_64-pc-windows-msvc": ["win32", "x64"]
 }
 
