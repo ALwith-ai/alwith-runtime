@@ -5,10 +5,14 @@
     "": {
       "name": "@alwith/runtime",
       "optionalDependencies": {
-        "@alwith/runtime-darwin-arm64": "0.5.1",
-        "@alwith/runtime-win32-x64": "0.5.1",
+        "@alwith/runtime-darwin-arm64": "0.6.0",
+        "@alwith/runtime-win32-x64": "0.6.0",
       },
     },
   },
-  "packages": {}
+  "packages": {
+    "@alwith/runtime-darwin-arm64": ["@alwith/runtime-darwin-arm64@0.6.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-1UNDLSoR0HNisAXYSdLETQyWQ//lYdlWqMRO9vInzRupxyeX4PTeeOCT1uxWeo9wGzFeWgJKMP+a33A9bVq7Gw=="],
+
+    "@alwith/runtime-win32-x64": ["@alwith/runtime-win32-x64@0.6.0", "", { "os": "win32", "cpu": "x64" }, "sha512-RbBSQ2UvvrtNyf+CHT7wYuDrs9fjLJgjS1rAjJ6cVDLYMe3/GwzGnIFBpEx4/31GURWVcRniD0GiqWNqOiZg9w=="],
+  }
 }
