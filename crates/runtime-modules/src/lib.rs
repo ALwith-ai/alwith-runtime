@@ -154,7 +154,7 @@ pub fn runtime_satisfies(version: &str, requirement: &str) -> Result<bool, Strin
             _ => Err(format!("not a X.Y.Z version: {text}")),
         }
     }
-    let required = requirement.trim().strip_prefix(">=").unwrap_or(requirement.trim());
+    let required = requirement.trim().trim_prefix(">=");
     Ok(parse(version)? >= parse(required)?)
 }
 
