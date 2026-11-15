@@ -1,7 +1,4 @@
 {
-  "compilerOptions": {
-    "types": ["bun"],
-    "noEmit": true
-  },
+  "extends": "@nyssance/tsconfig/bun.json",
   "include": ["scripts", "packages"]
 }
