@@ -6,7 +6,7 @@
     "format:all": "bun run format:rust && bun fmt"
   },
   "devDependencies": {
-    "@nyssance/tsconfig": "^0.1.0",
+    "@nyssance/tsconfig": "^0.1.2",
     "@types/bun": "^1.4.4"
   }
 }
