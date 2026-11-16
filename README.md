@@ -118,16 +118,12 @@ and the client replays with `sessionEvents`.
 
 ## Release
 
-`alwith-runtime` is distributed as binaries only. Tag the workspace version (`v0.1.0` for
-`version = "0.1.0"` in `Cargo.toml`) and `.github/workflows/release.yml` builds six
-targets (macOS arm64, Windows x64) and publishes
-`alwith-runtime-<rust-triple>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
-
-Assets go to this repository by default. To publish from this private repo to a public
-one, set the repository variable `RELEASE_REPO` (`owner/name`) and the secret
-`RELEASE_TOKEN` (a token with `contents: write` on that repo). Consumers pin the version:
-alwith-u keeps it in `runtime.json` and `scripts/stage.ts` downloads and verifies
-the archive for the target it is building.
+`alwith-runtime` is distributed through npm. Set the same version in the `Cargo.toml` workspace,
+`packages/runtime/package.json` and its two `optionalDependencies`, then push the tag `v<version>`.
+`.github/workflows/release.yml` builds macOS arm64 and Windows x64 and publishes the two
+`@alwith/runtime-<os>-<cpu>` platform packages and the `@alwith/runtime` main package with npm
+trusted publishing and provenance. Applications pin `@alwith/runtime` in `package.json`; their staging
+verifies the platform binary's checksum and copies it into the sidecar.
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0

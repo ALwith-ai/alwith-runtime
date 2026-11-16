@@ -72,9 +72,9 @@ jobs:
   # The two platform packages are published first, then the @alwith/runtime main package (its
   # optionalDependencies point at them).
   # npm trusted publishing (OIDC): on npmjs.com each of the three packages gets one entry (Repository
-  # alwith-runtime / Workflow filename release.yml), so no token is stored; no provenance (private
-  # repos do not support it). Versions already on npm are skipped, so a run rejected midway can be
-  # re-run.
+  # alwith-runtime / Workflow filename release.yml), so no token is stored. Each package carries
+  # provenance linking it to this public repository and run. Versions already on npm are skipped, so
+  # a run rejected midway can be re-run.
   publish:
     needs: build
     runs-on: ubuntu-24.04
@@ -119,7 +119,7 @@ jobs:
             if bun x --bun npm@latest view "$name@$version" version >/dev/null 2>&1; then
               echo "$name@$version already on npm, skipping"
             else
-              bun x --bun npm@latest publish --access public
+              bun x --bun npm@latest publish --access public --provenance
             fi
           }
           for dir in dist/npm/*/; do (cd "$dir" && publish); done
