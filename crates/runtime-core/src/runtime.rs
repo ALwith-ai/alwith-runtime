@@ -16,7 +16,7 @@ use tokio::sync::{oneshot, watch};
 use crate::attention::{self, AttentionStore, ProcessLease};
 use crate::process::AgentProcess;
 use crate::{AttachInfo, Journal, RuntimeRegistry, SessionEventFrame, SessionRunState, is_lifecycle_line};
-use crate::{MAX_MESSAGE_BYTES, protocol_lines};
+use crate::{MAX_MESSAGE_BYTES, OversizedEnvelope, ProtocolFrame, oversized_envelope, protocol_lines};
 
 /// Default journal directory: under the system cache directory, so "Settings → Cache → Clear" reclaims it in one go.
 pub fn default_journal_root() -> std::path::PathBuf {
@@ -1034,6 +1034,45 @@ impl Runtime {
         Ok(if answered_runtime_request { None } else { Some(AcceptedLine { line, stamp }) })
     }
 
+    /// The line an agent frame contributes. A message over the limit is not delivered, and it ends
+    /// neither the agent nor its other sessions: a response becomes an error response to the request
+    /// it answers, and an agent request is answered with that error.
+    fn agent_frame_line(&self, agent_id: &str, frame: ProtocolFrame) -> Option<String> {
+        let head = match frame {
+            ProtocolFrame::Line(line) => return Some(line),
+            ProtocolFrame::Oversized { head } => head,
+        };
+        let message = format!("agent message exceeds the {MAX_MESSAGE_BYTES}-byte limit and was discarded");
+        let error = serde_json::json!({ "code": -32603, "message": message });
+        match oversized_envelope(&head) {
+            OversizedEnvelope { id: Some(id), method: false } => {
+                log::warn!("Runtime: {agent_id}: response {id}: {message}");
+                Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }).to_string())
+            }
+            OversizedEnvelope { id: Some(id), method: true } => {
+                log::warn!("Runtime: {agent_id}: request {id}: {message}");
+                let stdin = self
+                    .agents
+                    .lock()
+                    .expect("runtime agents lock poisoned")
+                    .get(agent_id)
+                    .map(|handle| Arc::clone(&handle.stdin));
+                if let Some(stdin) = stdin {
+                    let answer = serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error });
+                    tokio::spawn(async move {
+                        let mut input = stdin.lock().await;
+                        let _ = input.write_all(format!("{answer}\n").as_bytes()).await.and(input.flush().await);
+                    });
+                }
+                None
+            }
+            OversizedEnvelope { id: None, .. } => {
+                log::warn!("Runtime: {agent_id}: notification or unaddressed message: {message}");
+                None
+            }
+        }
+    }
+
     async fn pump_stdout(self: Arc<Self>, agent_id: String, stdout: tokio::process::ChildStdout) {
         let mut reader = protocol_lines(stdout);
         let lane = self.lane(&agent_id);
@@ -1045,10 +1084,13 @@ impl Runtime {
                     if let Some(Ok(id)) = completed { tool_calls.remove(&id); }
                     continue;
                 }
-                next = reader.next_line() => next,
+                next = reader.next_frame() => next,
             };
             let first = match next {
-                Ok(Some(line)) => line,
+                Ok(Some(frame)) => match self.agent_frame_line(&agent_id, frame) {
+                    Some(line) => line,
+                    None => continue,
+                },
                 Ok(None) => break,
                 Err(error) => {
                     let _operation = lane.lock().await;
@@ -1061,8 +1103,9 @@ impl Runtime {
             let deadline = tokio::time::Instant::now() + OUTPUT_BATCH_WINDOW;
             let mut reached_end = false;
             loop {
-                match tokio::time::timeout_at(deadline, reader.next_line()).await {
-                    Ok(Ok(Some(line))) => {
+                match tokio::time::timeout_at(deadline, reader.next_frame()).await {
+                    Ok(Ok(Some(frame))) => {
+                        let Some(line) = self.agent_frame_line(&agent_id, frame) else { continue };
                         batch_bytes += line.len();
                         batch.push(line);
                         if batch_bytes >= MAX_MESSAGE_BYTES {
@@ -1680,6 +1723,53 @@ time.sleep(.1)
                 runtime.stop("tool-agent").unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_agent_message_fails_only_its_request() {
+        let runtime = Arc::new(test_runtime());
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import json,sys
+big='x'*(33*1024*1024)
+for line in sys.stdin:
+    frame=json.loads(line)
+    rid=frame.get('id')
+    if frame.get('method')=='test/big':
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':rid,'result':{'data':big}})+'\n'); sys.stdout.flush()
+    elif frame.get('method')=='test/ask':
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':'agent-1','method':'test/question','params':{'data':big}})+'\n'); sys.stdout.flush()
+        answer=json.loads(sys.stdin.readline())
+        print(json.dumps({'jsonrpc':'2.0','id':rid,'result':answer}),flush=True)
+    elif frame.get('method')=='test/small':
+        print(json.dumps({'jsonrpc':'2.0','id':rid,'result':'ok'}),flush=True)
+"#,
+        ]);
+        let mut meta = metadata("codex");
+        meta.owner_id = "window:1".into();
+        runtime.start("agent".into(), meta, &mut command).await.unwrap();
+        let request = |method: &'static str, id: &'static str| {
+            let runtime = Arc::clone(&runtime);
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    runtime.acp_request("agent", method, Value::Null, Some(serde_json::json!(id)), "window:1"),
+                )
+                .await
+                .expect("the request is answered")
+            }
+        };
+
+        let error = request("test/big", "big-1").await.unwrap_err();
+        assert!(error.message.contains("exceeds"), "{error:?}");
+        // The agent's own oversized request is answered with the error instead of reaching a client.
+        let answer = request("test/ask", "ask-1").await.unwrap();
+        assert_eq!(answer["id"], "agent-1");
+        assert!(answer["error"]["message"].as_str().unwrap().contains("exceeds"), "{answer}");
+        assert_eq!(request("test/small", "small-1").await.unwrap(), "ok");
+        assert!(runtime.agents.lock().unwrap().get("agent").is_some_and(|handle| handle.failure.is_none()));
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ name = "alwith-runtime-core"
 version = "0.6.0"
 dependencies = [
  "alwith-runtime-protocol",
+ "bytes",
  "command-group",
  "dirs",
  "futures-util",

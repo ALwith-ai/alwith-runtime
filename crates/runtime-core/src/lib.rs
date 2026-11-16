@@ -5,7 +5,10 @@ use serde_json::Value;
 mod attention;
 mod framing;
 mod journal;
-pub use framing::{MAX_BUFFERED_BYTES, MAX_MESSAGE_BYTES, ProtocolLines, protocol_lines};
+pub use framing::{
+    MAX_BUFFERED_BYTES, MAX_MESSAGE_BYTES, OversizedEnvelope, ProtocolFrame, ProtocolLines, oversized_envelope,
+    protocol_lines,
+};
 mod port_scanner;
 pub mod process;
 mod runtime;
