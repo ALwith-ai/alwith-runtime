@@ -1,4 +1,4 @@
-use alwith_runtime_protocol::{AgentMetadata, ResponseError, RuntimeEvent};
+use alwith_runtime_protocol::{AgentMetadata, FrameDirection, ResponseError, RuntimeEvent};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -177,7 +177,8 @@ struct AgentHandle {
     failure: Option<String>,
     initialize_request_id: Option<Value>,
     initialize_response: Option<Value>,
-    /// ACP requests the Runtime sent (its own carry ids like `rt-<n>`), waiting for the agent's response.
+    /// ACP requests the Runtime sent (its own carry ids like `rt-<n>`), waiting for the agent's response. Keyed by
+    /// the raw JSON form of the id, so `9` and `"9"` stay different requests.
     pending_acp: HashMap<String, PendingAcp>,
     /// This process as the attention store knows it (`None` once it was gone before it could be read).
     lease: Option<ProcessLease>,
@@ -782,11 +783,11 @@ impl Runtime {
     }
 
     /// Session frames after `after_sequence`, at most `limit`; late joiners catch up with it.
-    /// Answered `session/request_permission` frames are left out, since replaying one would get it answered twice.
+    /// Answered agent requests are left out, since replaying one would get it answered twice.
     pub fn session_events(
         &self, session_id: &str, after_sequence: Option<u64>, limit: usize,
     ) -> Vec<SessionEventFrame> {
-        let pending = self.registry.lock().expect("runtime registry lock poisoned").pending_permission_ids(session_id);
+        let pending = self.registry.lock().expect("runtime registry lock poisoned").pending_request_ids(session_id);
         let frames = match self.journal.read_since(session_id, after_sequence, limit) {
             Ok(frames) => frames,
             Err(error) => {
@@ -794,7 +795,7 @@ impl Runtime {
                 return Vec::new();
             }
         };
-        filter_answered_permissions(frames, &pending)
+        filter_answered_requests(frames, &pending)
     }
 
     pub fn mark_read(&self, session_id: &str, version: Option<u64>) -> bool {
@@ -970,16 +971,16 @@ impl Runtime {
                 handle.provider_changes.send_replace(());
             }
             if let Some(response) = value.as_ref().filter(|value| value.get("method").is_none())
-                && let Some(id) = response.get("id").and_then(Value::as_str)
+                && let Some(id) = response.get("id").map(ToString::to_string)
             {
-                if let Some(pending) = handle.pending_acp.remove(id) {
+                if let Some(pending) = handle.pending_acp.remove(&id) {
                     let outcome = match response.get("error") {
                         Some(error) if !error.is_null() => Err(ResponseError::parse(error)),
                         _ => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
                     };
                     let _ = pending.sender.send(outcome);
                     answered_runtime_request = true;
-                } else if handle.retracted_acp.remove(id) {
+                } else if handle.retracted_acp.remove(&id) {
                     // The answer the protocol owes a retracted request: nobody is waiting for it.
                     answered_runtime_request = true;
                 }
@@ -1203,7 +1204,7 @@ impl Runtime {
         fence: Option<Arc<()>>,
     ) -> Result<Value, ResponseError> {
         let identity = Arc::new(());
-        let (id, receiver) = {
+        let (id, id_value, receiver) = {
             let mut agents = self.agents.lock().map_err(|error| error.to_string())?;
             let handle = agents.get_mut(agent_id).ok_or_else(|| format!("no agent process {agent_id}"))?;
             if fence.as_ref().is_some_and(|fence| !Arc::ptr_eq(fence, &handle.ownership)) {
@@ -1214,9 +1215,8 @@ impl Runtime {
             {
                 return Ok(cached.clone());
             }
-            let (id, id_value) = match request_id {
-                Some(Value::String(id)) => (id.clone(), Value::String(id)),
-                Some(Value::Number(id)) => (id.to_string(), Value::Number(id)),
+            let id_value = match request_id {
+                Some(id @ (Value::String(_) | Value::Number(_))) => id,
                 Some(other) => {
                     return Err(ResponseError::invalid_params(format!(
                         "request id must be a string or number, got {other}"
@@ -1225,9 +1225,10 @@ impl Runtime {
                 None => {
                     let id = format!("{ACP_REQUEST_ID_PREFIX}{}", handle.next_acp_id);
                     handle.next_acp_id += 1;
-                    (id.clone(), Value::String(id))
+                    Value::String(id)
                 }
             };
+            let id = id_value.to_string();
             if handle.pending_acp.contains_key(&id) {
                 return Err(ResponseError::invalid_params(format!(
                     "request id {id} is still pending on agent {agent_id}"
@@ -1241,12 +1242,13 @@ impl Runtime {
                     sender,
                     owner_id: owner_id.to_string(),
                     method: method.to_string(),
-                    id: id_value,
+                    id: id_value.clone(),
                 },
             );
-            (id, receiver)
+            (id, id_value, receiver)
         };
-        let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        // The agent sees the id exactly as the client chose it, so a later `$/cancel_request` names the same request.
+        let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id_value, "method": method, "params": params });
         if let Err(error) = self.send_fenced(agent_id, frame.to_string(), fence).await {
             if let Some(handle) = self.agents.lock().expect("runtime agents lock poisoned").get_mut(agent_id)
                 && handle.pending_acp.get(&id).is_some_and(|pending| Arc::ptr_eq(&pending.identity, &identity))
@@ -1426,16 +1428,20 @@ impl Runtime {
     }
 }
 
-/// Keep only permission requests that are still unanswered; other frames stay as they are.
-fn filter_answered_permissions(frames: Vec<SessionEventFrame>, pending_ids: &[String]) -> Vec<SessionEventFrame> {
+/// Keep only agent requests that are still unanswered; other frames stay as they are.
+fn filter_answered_requests(frames: Vec<SessionEventFrame>, pending_ids: &[String]) -> Vec<SessionEventFrame> {
     frames
         .into_iter()
         .filter(|frame| {
-            let Ok(value) = serde_json::from_str::<Value>(&frame.line) else { return true };
-            if value.get("method").and_then(Value::as_str) != Some("session/request_permission") {
+            if frame.direction != FrameDirection::In {
                 return true;
             }
-            value.get("id").map(ToString::to_string).is_some_and(|id| pending_ids.contains(&id))
+            let Ok(value) = serde_json::from_str::<Value>(&frame.line) else { return true };
+            if value.get("method").is_none() {
+                return true;
+            }
+            let Some(id) = value.get("id") else { return true };
+            pending_ids.contains(&id.to_string())
         })
         .collect()
 }
@@ -1505,6 +1511,36 @@ for line in sys.stdin:
         assert!(answer["error"]["message"].as_str().unwrap().contains("exceeds"), "{answer}");
         assert_eq!(request("test/small", "small-1").await.unwrap(), "ok");
         assert!(runtime.agents.lock().unwrap().get("agent").is_some_and(|handle| handle.failure.is_none()));
+    }
+
+    #[tokio::test]
+    async fn request_ids_reach_the_agent_as_the_client_chose_them() {
+        let runtime = Arc::new(test_runtime());
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import json,sys
+for line in sys.stdin:
+    frame=json.loads(line)
+    if 'id' in frame and 'method' in frame:
+        print(json.dumps({'jsonrpc':'2.0','id':frame['id'],'result':{'id':frame['id']}}),flush=True)
+"#,
+        ]);
+        let mut meta = metadata("codex");
+        meta.owner_id = "window:1".into();
+        runtime.start("agent".into(), meta, &mut command).await.unwrap();
+        let request = |id: Value| {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime.acp_request("agent", "test/echo", serde_json::json!({}), Some(id), "window:1").await
+            })
+        };
+        // A number and the string of the same digits are two requests, each answered under its own id.
+        let number = request(serde_json::json!(5));
+        let string = request(serde_json::json!("5"));
+        assert_eq!(number.await.unwrap().unwrap(), serde_json::json!({"id": 5}));
+        assert_eq!(string.await.unwrap().unwrap(), serde_json::json!({"id": "5"}));
     }
 
     #[tokio::test]

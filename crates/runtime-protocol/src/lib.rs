@@ -82,8 +82,8 @@ impl From<ResponseError> for String {
     }
 }
 
-/// Agent requests still unanswered at attach time (`session/request_permission` etc.); the new
-/// owner answers them with `acpRespond` using the same `id`.
+/// An agent request still unanswered at attach time (permissions, elicitations, `fs/*`, `mcp/message`...); the new
+/// owner answers it with `acpRespond` using the same `id`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct PendingAgentRequest {
     #[specta(type = specta_typescript::Unknown)]
@@ -174,8 +174,7 @@ pub struct AttachInfo {
     pub provider: String,
     /// Provider configuration acknowledged by this process; absent for unmanaged launches.
     pub provider_revision: Option<u64>,
-    /// Agent requests still unanswered, for the new owner to answer. Sourced from the inbound
-    /// replay buffer, which may have been flushed in extreme cases.
+    /// Every agent request still unanswered, in arrival order, for the new owner to answer.
     pub pending_agent_requests: Vec<PendingAgentRequest>,
 }
 

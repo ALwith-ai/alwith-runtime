@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -24,8 +24,6 @@ pub use runtime::{
     default_journal_root,
 };
 
-const AGENT_REPLAY_CAPACITY: usize = 1_000;
-
 /// Lifecycle frames: prompt, permission requests, tool state transitions. Carries no AI body text;
 /// lets the observer and cross-window takeover rebuild the fact stream.
 pub fn is_lifecycle_line(value: &Value) -> bool {
@@ -43,6 +41,12 @@ enum OutboundRequest {
 }
 
 #[derive(Debug)]
+struct PendingRequest {
+    session_id: Option<String>,
+    request: PendingAgentRequest,
+}
+
+#[derive(Debug)]
 struct AgentTrack {
     owner_id: String,
     outbound: HashMap<String, OutboundRequest>,
@@ -55,7 +59,9 @@ struct AgentTrack {
     used_sessions: HashSet<String>,
     /// State reported by the agent via `state_update` frames, latest one per sessionId.
     reported_states: HashMap<String, RunState>,
-    pending_permissions: HashMap<String, String>,
+    /// Requests the agent sent that no client has answered yet, in arrival order, keyed by the raw JSON form of
+    /// their id (`9` and `"9"` differ). A new holder takes them over on attach.
+    pending_requests: Vec<(String, PendingRequest)>,
     working_directories: HashMap<String, String>,
     current_session_id: Option<String>,
     listening_ports: Vec<u16>,
@@ -72,11 +78,17 @@ impl AgentTrack {
             prompt_inflight: HashMap::new(),
             used_sessions: HashSet::new(),
             reported_states: HashMap::new(),
-            pending_permissions: HashMap::new(),
+            pending_requests: Vec::new(),
             working_directories: HashMap::new(),
             current_session_id: None,
             listening_ports: Vec::new(),
         }
+    }
+
+    /// Drops the pending request with this raw id, returning its session.
+    fn answer(&mut self, id: &str) -> Option<Option<String>> {
+        let index = self.pending_requests.iter().position(|(pending, _)| pending == id)?;
+        Some(self.pending_requests.remove(index).1.session_id)
     }
 
     fn activate_session(&mut self, session_id: &str) {
@@ -98,7 +110,9 @@ impl AgentTrack {
         if let Some(reported) = self.reported_states.get(session_id) {
             return *reported;
         }
-        if self.pending_permissions.values().any(|pending| pending == session_id) {
+        if self.pending_requests.iter().any(|(_, pending)| {
+            pending.session_id.as_deref() == Some(session_id) && pending.request.method == "session/request_permission"
+        }) {
             RunState::RequiresAction
         } else if self.prompt_inflight.get(session_id).copied().unwrap_or(0) > 0 {
             RunState::Running
@@ -127,7 +141,6 @@ pub struct RuntimeRegistry {
     /// from this copy, not with activity (`last_activity_at`, ports, tasks) in the same state --
     /// otherwise a reader's confirmation of `done` could be refused by a tick it never saw.
     published: HashMap<String, SessionRunState>,
-    inbound_replay: HashMap<String, VecDeque<String>>,
     /// Journal actions decided while processing frames; the runtime takes them with
     /// `take_journal_ops` after the same batch and persists them.
     journal_ops: Vec<JournalOp>,
@@ -139,7 +152,6 @@ impl RuntimeRegistry {
     /// so two processes with the same name do not exist. The return value is the sessions cleared
     /// as a side effect when this record was created (in theory empty).
     pub fn begin_agent(&mut self, agent_id: String, owner_id: String) -> Vec<String> {
-        self.inbound_replay.remove(&agent_id);
         let previous = self.tracks.insert(agent_id, AgentTrack::new(owner_id));
         let removed_sessions = previous.map_or_else(Vec::new, |track| track.sessions);
         self.remove_sessions(&removed_sessions);
@@ -162,14 +174,6 @@ impl RuntimeRegistry {
     }
 
     pub fn record_inbound_batch(&mut self, agent_id: &str, lines: &[String], now_ms: i64) -> bool {
-        let replay = self.inbound_replay.entry(agent_id.to_string()).or_default();
-        for line in lines {
-            push_bounded(replay, line.clone(), AGENT_REPLAY_CAPACITY);
-            while replay.iter().map(String::len).sum::<usize>() > MAX_BUFFERED_BYTES {
-                replay.pop_front();
-            }
-        }
-
         let mut changed = false;
         for line in lines {
             let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
@@ -190,7 +194,7 @@ impl RuntimeRegistry {
                     track.closed_sessions.insert(session_id.clone());
                     track.prompt_inflight.remove(&session_id);
                     track.reported_states.remove(&session_id);
-                    track.pending_permissions.retain(|_, session| session != &session_id);
+                    track.pending_requests.retain(|(_, pending)| pending.session_id.as_ref() != Some(&session_id));
                     track.working_directories.remove(&session_id);
                     if track.current_session_id.as_ref() == Some(&session_id) {
                         track.current_session_id = None;
@@ -277,12 +281,11 @@ impl RuntimeRegistry {
             return false;
         };
         let sessions = track.sessions;
-        self.inbound_replay.remove(agent_id);
         self.remove_sessions(&sessions)
     }
 
     pub fn attach(&mut self, session_id: &str, owner_id: String) -> Option<AttachInfo> {
-        let (agent_id, sessions, pending_ids) = self.tracks.iter_mut().find_map(|(agent_id, track)| {
+        let (agent_id, sessions, pending_agent_requests) = self.tracks.iter_mut().find_map(|(agent_id, track)| {
             if !track.sessions.iter().any(|tracked| tracked == session_id) {
                 return None;
             }
@@ -290,7 +293,7 @@ impl RuntimeRegistry {
             Some((
                 agent_id.clone(),
                 track.sessions.clone(),
-                track.pending_permissions.keys().cloned().collect::<Vec<_>>(),
+                track.pending_requests.iter().map(|(_, pending)| pending.request.clone()).collect::<Vec<_>>(),
             ))
         })?;
         for tracked_session in sessions {
@@ -298,7 +301,6 @@ impl RuntimeRegistry {
                 state.owner_id = owner_id.clone();
             }
         }
-        let pending_agent_requests = self.pending_agent_requests(&agent_id, &pending_ids);
         Some(AttachInfo {
             agent_id,
             engine: String::new(),
@@ -455,15 +457,14 @@ impl RuntimeRegistry {
         self.tracks.get_mut(agent_id).expect("reserved agent is tracked").reserved_sessions.remove(session_id);
     }
 
-    /// Request ids (raw JSON form, e.g. `9` or `"abc"`) of this session's
-    /// `session/request_permission` requests that are still unanswered.
+    /// Ids (raw JSON form, e.g. `9` or `"abc"`) of this session's agent requests that are still unanswered.
     /// When replaying the journal keep only these requests: an answered one must not be replayed
     /// either, or it would be answered twice.
-    pub fn pending_permission_ids(&self, session_id: &str) -> Vec<String> {
+    pub fn pending_request_ids(&self, session_id: &str) -> Vec<String> {
         self.tracks
             .values()
-            .flat_map(|track| track.pending_permissions.iter())
-            .filter(|(_, pending)| pending.as_str() == session_id)
+            .flat_map(|track| track.pending_requests.iter())
+            .filter(|(_, pending)| pending.session_id.as_deref() == Some(session_id))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -513,26 +514,6 @@ impl RuntimeRegistry {
         self.run_states.len() != before
     }
 
-    fn pending_agent_requests(&self, agent_id: &str, pending_ids: &[String]) -> Vec<PendingAgentRequest> {
-        self.inbound_replay
-            .get(agent_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|line| {
-                let value = serde_json::from_str::<Value>(line).ok()?;
-                let method = value.get("method").and_then(Value::as_str)?;
-                let id = value.get("id")?;
-                let pending = method == "session/request_permission"
-                    && pending_ids.iter().any(|pending| pending == &id.to_string());
-                pending.then(|| PendingAgentRequest {
-                    id: id.clone(),
-                    method: method.to_string(),
-                    params: value.get("params").cloned().unwrap_or(Value::Null),
-                })
-            })
-            .collect()
-    }
-
     /// Decide whether this frame enters the session journal, and refresh `lastActivityAt`.
     /// Persisting is done by the runtime.
     fn record_content(&mut self, direction: FrameDirection, value: &Value, line: &str, now_ms: i64) -> bool {
@@ -573,13 +554,6 @@ impl RuntimeRegistry {
     }
 }
 
-fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, capacity: usize) {
-    if queue.len() >= capacity {
-        queue.pop_front();
-    }
-    queue.push_back(value);
-}
-
 fn apply_outbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
     let id = value.get("id").map(ToString::to_string)?;
     match value.get("method").and_then(Value::as_str) {
@@ -618,7 +592,7 @@ fn apply_outbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
             None
         }
         Some(_) => None,
-        None => track.pending_permissions.remove(&id),
+        None => track.answer(&id).flatten(),
     }
 }
 
@@ -634,24 +608,38 @@ fn apply_outbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
 /// / not a permission) is a no-op.
 fn apply_cancel_request(track: &mut AgentTrack, value: &Value) -> Option<String> {
     let request_id = value.pointer("/params/requestId")?.to_string();
-    track.pending_permissions.remove(&request_id)
+    track.answer(&request_id).flatten()
 }
 
 fn apply_inbound(track: &mut AgentTrack, value: &Value) -> Option<String> {
     let id = value.get("id").map(ToString::to_string)?;
     match value.get("method").and_then(Value::as_str) {
-        Some("session/request_permission") => {
-            let session_id = value.pointer("/params/sessionId").and_then(Value::as_str)?;
-            if track.closed_sessions.contains(session_id) {
+        Some(method) => {
+            let session_id = value.pointer("/params/sessionId").and_then(Value::as_str);
+            if session_id.is_some_and(|session_id| track.closed_sessions.contains(session_id)) {
                 return None;
             }
-            if !track.sessions.iter().any(|tracked| tracked == session_id) {
+            let permission = method == "session/request_permission";
+            if permission
+                && let Some(session_id) = session_id
+                && !track.sessions.iter().any(|tracked| tracked == session_id)
+            {
                 track.sessions.push(session_id.to_string());
             }
-            track.pending_permissions.insert(id, session_id.to_string());
-            Some(session_id.to_string())
+            track.pending_requests.push((
+                id.clone(),
+                PendingRequest {
+                    session_id: session_id.map(String::from),
+                    request: PendingAgentRequest {
+                        id: value.get("id").cloned().expect("request id was just read"),
+                        method: method.to_string(),
+                        params: value.get("params").cloned().unwrap_or(Value::Null),
+                    },
+                },
+            ));
+            // Only a permission request holds the session for the user; others are answered by the client itself.
+            session_id.filter(|_| permission).map(String::from)
         }
-        Some(_) => None,
         None => match track.outbound.remove(&id)? {
             OutboundRequest::Prompt { session_id } => {
                 if track.closed_sessions.contains(&session_id) {
@@ -844,7 +832,7 @@ mod tests {
         assert!(registry.record_inbound_batch("a", &[r#"{"id":8,"result":{}}"#.into()], 6));
         assert_eq!(registry.agent_id_for_session("one"), None);
         assert_eq!(registry.agent_id_for_session("two").as_deref(), Some("a"));
-        assert!(registry.pending_permission_ids("one").is_empty());
+        assert!(registry.pending_request_ids("one").is_empty());
         let states = registry.run_states();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].session_id, "two");
@@ -882,7 +870,7 @@ mod tests {
             5,
         );
         assert_eq!(registry.run_states(), before);
-        assert_eq!(registry.pending_permission_ids("one"), vec!["7"]);
+        assert_eq!(registry.pending_request_ids("one"), vec!["7"]);
         assert_eq!(registry.agent_id_for_session("one").as_deref(), Some("a"));
     }
 
@@ -1178,8 +1166,40 @@ mod tests {
         assert!(registry.take_journal_ops().is_empty());
     }
 
+    /// Every unanswered agent request is handed over, not only permissions; only a permission holds the session
+    /// in `requires_action`.
     #[test]
-    fn pending_permission_ids_track_answers_and_cancellations() {
+    fn attach_hands_over_every_unanswered_agent_request() {
+        let mut registry = RuntimeRegistry::default();
+        registry.begin_agent("agent-1".into(), "main".into());
+        registry.record_outbound(
+            "agent-1",
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/project"}}"#,
+            1,
+        );
+        registry.record_inbound_batch(
+            "agent-1",
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-1"}}"#.into(),
+                r#"{"jsonrpc":"2.0","id":"form-1","method":"elicitation/create","params":{"sessionId":"session-1","message":"Pick"}}"#.into(),
+                r#"{"jsonrpc":"2.0","id":9,"method":"fs/read_text_file","params":{"sessionId":"session-1","path":"/a"}}"#.into(),
+            ],
+            2,
+        );
+        assert_eq!(registry.run_states()[0].state, RunState::Idle);
+        let attach = registry.attach("session-1", "window:2".into()).expect("active session");
+        let methods: Vec<_> = attach.pending_agent_requests.iter().map(|request| request.method.as_str()).collect();
+        assert_eq!(methods, ["elicitation/create", "fs/read_text_file"]);
+        assert_eq!(attach.pending_agent_requests[0].id, serde_json::json!("form-1"));
+
+        registry.record_outbound("agent-1", r#"{"jsonrpc":"2.0","id":"form-1","result":{"action":"cancel"}}"#, 3);
+        assert_eq!(registry.pending_request_ids("session-1"), vec!["9"]);
+        let attach = registry.attach("session-1", "window:3".into()).expect("active session");
+        assert_eq!(attach.pending_agent_requests.len(), 1);
+    }
+
+    #[test]
+    fn pending_request_ids_track_answers_and_cancellations() {
         let mut registry = RuntimeRegistry::default();
         registry.begin_agent("agent-1".into(), "main".into());
         registry.record_inbound_batch(
@@ -1190,7 +1210,7 @@ mod tests {
             ],
             1,
         );
-        let mut pending = registry.pending_permission_ids("session-1");
+        let mut pending = registry.pending_request_ids("session-1");
         pending.sort();
         assert_eq!(pending, vec!["7", "8"]);
         assert_eq!(appended_sessions(&registry.take_journal_ops()).len(), 2);
@@ -1200,7 +1220,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}"#,
             2,
         );
-        assert_eq!(registry.pending_permission_ids("session-1"), vec!["8"]);
+        assert_eq!(registry.pending_request_ids("session-1"), vec!["8"]);
         // A permission response is not session content and does not enter the journal.
         assert!(registry.take_journal_ops().is_empty());
 
@@ -1209,7 +1229,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":8,"result":{"outcome":{"outcome":"cancelled"}}}"#,
             3,
         );
-        assert!(registry.pending_permission_ids("session-1").is_empty());
+        assert!(registry.pending_request_ids("session-1").is_empty());
     }
 
     #[test]
