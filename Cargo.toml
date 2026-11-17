@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/runtime-protocol", "crates/runtime-core", "crates/runtime-ws", "crates/runtime-stdio", "crates/runtime-modules", "apps/runtime"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 license = "UNLICENSED"
 publish = false
