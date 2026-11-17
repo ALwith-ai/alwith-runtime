@@ -253,7 +253,7 @@ pub struct ModuleHost {
 
 impl ModuleHost {
     pub fn new(runtime: Arc<Runtime>, runtime_version: impl Into<String>) -> Arc<Self> {
-        let host = Arc::new(Self {
+        Arc::new(Self {
             runtime,
             runtime_version: runtime_version.into(),
             modules: Mutex::new(HashMap::new()),
@@ -262,17 +262,7 @@ impl ModuleHost {
             next_call: AtomicU64::new(1),
             calls: Mutex::new(HashMap::new()),
             dispatch: OnceLock::new(),
-        });
-        let weak = Arc::downgrade(&host);
-        host.runtime.set_tool_dispatch(Arc::new(move |module, agent_id, params| {
-            let weak = weak.clone();
-            Box::pin(async move {
-                let host = weak.upgrade().ok_or_else(|| ResponseError::connection_lost("module host stopped"))?;
-                host.call_module(&module, "_runtime/toolCall", serde_json::json!({"agentId":agent_id,"params":params}))
-                    .await
-            })
-        }));
-        host
+        })
     }
 
     /// Wires in the executor of module -> Runtime requests. Called once after the RuntimeServer is built.

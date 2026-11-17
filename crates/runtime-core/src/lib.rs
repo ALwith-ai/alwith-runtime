@@ -20,7 +20,7 @@ pub use alwith_runtime_protocol::{
 pub use attention::{AttentionStore, ProcessLease, RUNTIME_RESTARTED};
 pub use journal::{Journal, JournalOp, SESSION_JOURNAL_MAX_BYTES};
 pub use runtime::{
-    AgentSnapshot, PrivateToolDispatch, Runtime, RuntimeEventSink, SESSION_EVENTS_PAGE, default_attention_root,
+    AgentSnapshot, Runtime, RuntimeEventSink, SESSION_EVENTS_PAGE, default_attention_root,
     default_journal_root,
 };
 

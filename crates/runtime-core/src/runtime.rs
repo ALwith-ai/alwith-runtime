@@ -1,10 +1,8 @@
 use alwith_runtime_protocol::{AgentMetadata, ResponseError, RuntimeEvent};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -35,11 +33,6 @@ pub const SESSION_EVENTS_PAGE: usize = 2_000;
 const OUTPUT_BATCH_WINDOW: Duration = Duration::from_millis(16);
 const PORT_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Private module tool traffic never enters the public event bus or replay journal.
-pub type PrivateToolDispatch = Arc<
-    dyn Fn(String, String, Value) -> Pin<Box<dyn Future<Output = Result<Value, ResponseError>> + Send>> + Send + Sync,
->;
-const TOOL_CALL_METHOD: &str = "_alwith/tool/call";
 
 // Credentials go to the engine, never to observers or replay diagnostics.
 fn public_request_line(value: &Value) -> String {
@@ -177,8 +170,6 @@ struct PendingAcp {
 
 struct AgentHandle {
     ownership: Arc<()>,
-    tool_owner: Option<String>,
-    private_tool_ids: HashSet<String>,
     private_values: PrivateValues,
     stdin: Arc<AsyncMutex<ChildStdin>>,
     child: AgentProcess,
@@ -216,7 +207,6 @@ fn journal_stamp(stamps: Vec<(String, u64)>) -> Option<(String, u64)> {
 }
 
 pub struct Runtime {
-    tool_dispatch: OnceLock<PrivateToolDispatch>,
     registry: Mutex<RuntimeRegistry>,
     journal: Journal,
     attention: AttentionStore,
@@ -249,7 +239,6 @@ impl Runtime {
     /// its agent processes are reclaimed and its sessions come back, a running one as interrupted.
     pub fn with_storage(journal: Journal, attention: AttentionStore) -> Self {
         let runtime = Self {
-            tool_dispatch: OnceLock::new(),
             registry: Mutex::default(),
             journal,
             attention,
@@ -303,10 +292,6 @@ impl Runtime {
 
     pub fn journal(&self) -> &Journal {
         &self.journal
-    }
-
-    pub fn set_tool_dispatch(&self, dispatch: PrivateToolDispatch) {
-        assert!(self.tool_dispatch.set(dispatch).is_ok(), "private tool dispatch is set once");
     }
 
     /// Persist the journal actions the registry just decided and return each persisted frame's `(sessionId, sequence)`
@@ -421,12 +406,7 @@ impl Runtime {
             agent_id.clone(),
             AgentHandle {
                 ownership: Arc::new(()),
-                private_tool_ids: HashSet::new(),
                 private_values: PrivateValues::command(command),
-                tool_owner: metadata
-                    .owner_id
-                    .strip_prefix("module:")
-                    .map(|owner| owner.split(':').next().unwrap_or(owner).to_string()),
                 stdin: Arc::new(AsyncMutex::new(stdin)),
                 child,
                 metadata,
@@ -548,14 +528,6 @@ impl Runtime {
             }
             Arc::clone(&handle.stdin)
         };
-        if value.get("method").is_none()
-            && let Some(id) = value.get("id")
-        {
-            let agents = self.agents.lock().map_err(|error| error.to_string())?;
-            if agents.get(agent_id).expect("agent under lane").private_tool_ids.contains(&id.to_string()) {
-                return Err("module-owned tool replies cannot be supplied by application connections".into());
-            }
-        }
         // ACP v2 handshakes once per connection; when a new owner (reload, attach) sends `initialize` again the Runtime
         // replays the original response from cache instead of bothering the engine.
         let method = value.get("method").and_then(Value::as_str);
@@ -1076,17 +1048,8 @@ impl Runtime {
     async fn pump_stdout(self: Arc<Self>, agent_id: String, stdout: tokio::process::ChildStdout) {
         let mut reader = protocol_lines(stdout);
         let lane = self.lane(&agent_id);
-        let mut tool_tasks = tokio::task::JoinSet::new();
-        let mut tool_calls = HashMap::<String, tokio::task::AbortHandle>::new();
         loop {
-            let next = tokio::select! {
-                completed = tool_tasks.join_next(), if !tool_tasks.is_empty() => {
-                    if let Some(Ok(id)) = completed { tool_calls.remove(&id); }
-                    continue;
-                }
-                next = reader.next_frame() => next,
-            };
-            let first = match next {
+            let first = match reader.next_frame().await {
                 Ok(Some(frame)) => match self.agent_frame_line(&agent_id, frame) {
                     Some(line) => line,
                     None => continue,
@@ -1130,73 +1093,7 @@ impl Runtime {
             if !self.agents.lock().expect("runtime agents lock poisoned").contains_key(&agent_id) {
                 break;
             }
-            let mut public_batch = Vec::new();
-            for line in batch {
-                let value = serde_json::from_str::<Value>(&line).ok();
-                if let Some(frame) = value.as_ref().filter(|v| v["method"] == TOOL_CALL_METHOD) {
-                    let Some(id) = frame.get("id").filter(|id| id.is_string() || id.is_number()).cloned() else {
-                        continue;
-                    };
-                    let key = id.to_string();
-                    // ACP request IDs cannot be reused while pending. Do not repeat a side effect.
-                    if tool_calls.contains_key(&key) {
-                        continue;
-                    }
-                    let owner = {
-                        let agents = self.agents.lock().expect("runtime agents lock poisoned");
-                        agents.get(&agent_id).expect("agent under lane").tool_owner.clone()
-                    };
-                    // Tools declared by an application connection (an agent started by a page, not by a
-                    // module) run in that application: the call travels to the client as an ordinary agent
-                    // request and the client answers it, exactly like a permission request.
-                    let Some(owner) = owner else {
-                        public_batch.push(line);
-                        continue;
-                    };
-                    let stdin = {
-                        let mut agents = self.agents.lock().expect("runtime agents lock poisoned");
-                        let handle = agents.get_mut(&agent_id).expect("agent under lane");
-                        handle.private_tool_ids.insert(key.clone());
-                        Arc::clone(&handle.stdin)
-                    };
-                    let dispatch = self.tool_dispatch.get().cloned();
-                    let params = frame.get("params").cloned().unwrap_or(Value::Null);
-                    let caller = agent_id.clone();
-                    let task_key = key.clone();
-                    let abort = tool_tasks.spawn(async move {
-                        let result = match dispatch {
-                            Some(dispatch) => {
-                                tokio::time::timeout(Duration::from_secs(1800), dispatch(owner, caller, params))
-                                    .await
-                                    .unwrap_or_else(|_| Err(ResponseError::runtime("client tool timed out")))
-                            }
-                            None => Err(ResponseError::method_not_found(TOOL_CALL_METHOD)),
-                        };
-                        let response = match result {
-                            Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
-                            Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":error}),
-                        };
-                        // Captured pipe belongs to this process, never a replacement with the same agent ID.
-                        let mut input = stdin.lock().await;
-                        if let Err(error) =
-                            input.write_all(format!("{response}\n").as_bytes()).await.and(input.flush().await)
-                        {
-                            log::warn!("Runtime: could not answer tool call {task_key}: {error}");
-                        }
-                        task_key
-                    });
-                    tool_calls.insert(key, abort);
-                    continue;
-                }
-                if let Some(frame) = value.as_ref().filter(|v| v["method"] == "$/cancel_request")
-                    && let Some(id) = frame.pointer("/params/requestId")
-                    && let Some(task) = tool_calls.remove(&id.to_string())
-                {
-                    task.abort();
-                    continue;
-                }
-                public_batch.push(line);
-            }
+            let public_batch = batch;
             self.publish(RuntimeEvent::Wire {
                 agent_id: agent_id.clone(),
                 outbound: false,
@@ -1229,8 +1126,6 @@ impl Runtime {
                 break;
             }
         }
-        tool_tasks.abort_all();
-        while tool_tasks.join_next().await.is_some() {}
         let _operation = lane.lock().await;
         // The old process was already torn down by the replacement; its Exit must not reach the new process's subscribers.
         let changed = self.registry.lock().expect("runtime registry lock poisoned").finish_agent(&agent_id);
@@ -1563,166 +1458,6 @@ mod tests {
         assert!(!message.contains("launch-private-key"));
         assert!(!message.contains("another-private-key"));
         assert!(serde_json::from_str::<Value>(&message).is_ok());
-    }
-
-    #[tokio::test]
-    async fn tool_callbacks_are_private_and_bound_to_the_spawn_owner() {
-        let runtime = Arc::new(test_runtime());
-        let callback_started = Arc::new(tokio::sync::Notify::new());
-        let release_callback = Arc::new(tokio::sync::Notify::new());
-        let started = Arc::clone(&callback_started);
-        let release = Arc::clone(&release_callback);
-        runtime.set_tool_dispatch(Arc::new(move |owner, agent, params| {
-            let started = Arc::clone(&started);
-            let release = Arc::clone(&release);
-            Box::pin(async move {
-                started.notify_one();
-                release.notified().await;
-                assert_eq!(owner, "board");
-                assert_eq!(agent, "tool-agent");
-                assert_eq!(params["name"], "private-read");
-                Ok(serde_json::json!({"success":true,"contentItems":[{"type":"text","text":"secret-tool-result"}]}))
-            })
-        }));
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
-        runtime.add_sink(&sink);
-        let mut command = Command::new("python3");
-        command.args([
-            "-c",
-            r#"
-import json,sys
-print(json.dumps({'jsonrpc':'2.0','id':9,'method':'_alwith/tool/call','params':{'name':'private-read'}}),flush=True)
-reply=json.loads(sys.stdin.readline())
-assert reply['id']==9 and reply['result']['contentItems'][0]['text']=='secret-tool-result'
-print(json.dumps({'method':'test/finished','params':{}}),flush=True)
-"#,
-        ]);
-        let mut meta = metadata("codex");
-        meta.owner_id = "module:board:chat".into();
-        runtime.start("tool-agent".into(), meta, &mut command).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), callback_started.notified()).await.unwrap();
-        let spoof = runtime
-            .send("tool-agent", r#"{"jsonrpc":"2.0","id":9,"result":{"success":true,"contentItems":[]}}"#.into())
-            .await;
-        assert!(spoof.unwrap_err().contains("module-owned tool replies"));
-        release_callback.notify_one();
-        let mut finished = false;
-        loop {
-            let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
-            let encoded = serde_json::to_string(&event).unwrap();
-            assert!(
-                !encoded.contains("private-read") && !encoded.contains("secret-tool-result"),
-                "private frame escaped: {encoded}"
-            );
-            if let RuntimeEvent::AcpNotification { method, .. } = &event {
-                finished |= method == "test/finished";
-            }
-            if matches!(event, RuntimeEvent::Exit { .. }) {
-                break;
-            }
-        }
-        assert!(finished);
-    }
-
-    /// An agent started by an application connection has no module tool owner: its `_alwith/tool/call`
-    /// reaches that application as an ordinary agent request, and the application's reply is accepted.
-    #[tokio::test]
-    async fn tool_calls_of_application_owned_agents_are_forwarded_to_the_client() {
-        let runtime = Arc::new(test_runtime());
-        runtime.set_tool_dispatch(Arc::new(|_, _, _| {
-            Box::pin(async { panic!("module dispatch must not run for an application-owned agent") })
-        }));
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ChannelSink { sender });
-        runtime.add_sink(&sink);
-        let mut command = Command::new("python3");
-        command.args([
-            "-c",
-            r#"
-import json,sys
-print(json.dumps({'jsonrpc':'2.0','id':9,'method':'_alwith/tool/call','params':{'name':'client-read','arguments':{}}}),flush=True)
-reply=json.loads(sys.stdin.readline())
-assert reply['id']==9 and reply['result']['contentItems'][0]['text']=='page-tool-result', reply
-print(json.dumps({'method':'test/finished','params':{}}),flush=True)
-"#,
-        ]);
-        runtime.start("page-agent".into(), metadata("codex"), &mut command).await.unwrap();
-        let mut forwarded = false;
-        let mut finished = false;
-        loop {
-            let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
-            match &event {
-                RuntimeEvent::AcpAgentRequest { agent_id, id, method, params, .. } if method == TOOL_CALL_METHOD => {
-                    assert_eq!(agent_id, "page-agent");
-                    assert_eq!(params["name"], "client-read");
-                    forwarded = true;
-                    let reply = serde_json::json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {"success": true, "contentItems": [{"type": "text", "text": "page-tool-result"}]}
-                    });
-                    runtime.send("page-agent", reply.to_string()).await.unwrap();
-                }
-                RuntimeEvent::AcpNotification { method, .. } if method == "test/finished" => finished = true,
-                RuntimeEvent::Exit { .. } => break,
-                _ => {}
-            }
-        }
-        assert!(forwarded, "tool call never reached the client");
-        assert!(finished, "agent did not accept the client's tool result");
-    }
-
-    #[tokio::test]
-    async fn tool_cancellation_and_process_exit_drop_owned_dispatches() {
-        for cancel in [true, false] {
-            let runtime = Arc::new(test_runtime());
-            let dropped = Arc::new(tokio::sync::Notify::new());
-            let started = Arc::new(tokio::sync::Notify::new());
-            let drop_signal = Arc::clone(&dropped);
-            let start_signal = Arc::clone(&started);
-            runtime.set_tool_dispatch(Arc::new(move |_, _, _| {
-                let dropped = Arc::clone(&drop_signal);
-                let started = Arc::clone(&start_signal);
-                Box::pin(async move {
-                    struct Guard(Arc<tokio::sync::Notify>);
-                    impl Drop for Guard {
-                        fn drop(&mut self) {
-                            self.0.notify_one();
-                        }
-                    }
-                    let _guard = Guard(dropped);
-                    started.notify_one();
-                    std::future::pending().await
-                })
-            }));
-            let mut command = Command::new("python3");
-            command.args([
-                "-c",
-                if cancel {
-                    r#"
-import json,sys,time
-print(json.dumps({'id':9,'method':'_alwith/tool/call','params':{}}),flush=True)
-time.sleep(.1)
-print(json.dumps({'method':'$/cancel_request','params':{'requestId':9}}),flush=True)
-sys.stdin.readline()
-"#
-                } else {
-                    r#"
-import json,time
-print(json.dumps({'id':9,'method':'_alwith/tool/call','params':{}}),flush=True)
-time.sleep(.1)
-"#
-                },
-            ]);
-            let mut meta = metadata("codex");
-            meta.owner_id = "module:board".into();
-            runtime.start("tool-agent".into(), meta, &mut command).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), started.notified()).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), dropped.notified()).await.unwrap();
-            if cancel {
-                runtime.stop("tool-agent").unwrap();
-            }
-        }
     }
 
     #[tokio::test]
