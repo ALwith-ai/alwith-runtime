@@ -2,6 +2,7 @@
   "name": "alwith-runtime-workspace",
   "private": true,
   "scripts": {
+    "test:scripts": "bun test ./scripts/__tests__",
     "format:rust": "cargo fmt --all",
     "format:all": "bun run format:rust && bun fmt"
   },
