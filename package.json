@@ -8,6 +8,6 @@
   },
   "devDependencies": {
     "@nyssance/tsconfig": "^0.1.2",
-    "@types/bun": "^1.4.4"
+    "@types/bun": "^1.4.5"
   }
 }
