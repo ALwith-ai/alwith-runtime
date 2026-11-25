@@ -27,3 +27,9 @@ Origin: user instruction (2026-10-19).
 ## Unified ALwith package versions
 
 All published `@alwith/*` packages, including Runtime and its platform packages, use the `0.5.x` release line. Consumers must follow that line. The transition to `0.5.0` is explicitly authorized; subsequent releases increment only the patch version. Third-party packages keep their own versions. Origin: user instruction (2026-10-30).
+
+## Rust formatting: stable only, never nightly
+
+- Format Rust with stable `cargo fmt` only. `rustfmt.toml` keeps options that only nightly applies; on stable they are ignored with a warning, which is known and accepted.
+- Never run `cargo +nightly`, `rustfmt +nightly` or `rustup toolchain install nightly`, and never install a nightly toolchain to make those warnings go away.
+- Origin: user instruction (2026-07-25 in alwith-desktop; repeated here 2026-11-25 after a session auto-installed nightly through `cargo +nightly fmt`).
